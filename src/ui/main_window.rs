@@ -1672,7 +1672,7 @@ impl MainWindow {
                                 .flex_shrink_0()
                                 .child(
                                     action_button(
-                                        format!("discard-{}", path.display()),
+                                        change_row_action_id("discard", &path, representation),
                                         "Descartar",
                                         true,
                                     )
@@ -1690,7 +1690,7 @@ impl MainWindow {
                                 )
                                 .child(
                                     action_button(
-                                        format!("stage-toggle-{}", path.display()),
+                                        change_row_action_id("stage-toggle", &path, representation),
                                         if is_staged { "Unstage" } else { "Stage" },
                                         true,
                                     )
@@ -2131,6 +2131,16 @@ fn normalized_path_key(path: &Path) -> String {
         .to_lowercase()
 }
 
+fn change_row_action_id(action: &str, path: &Path, representation: ChangeRepresentation) -> String {
+    let representation = match representation {
+        ChangeRepresentation::Conflict => "conflict",
+        ChangeRepresentation::Staged => "staged",
+        ChangeRepresentation::Worktree => "worktree",
+        ChangeRepresentation::Untracked => "untracked",
+    };
+    format!("{action}-{representation}-{}", path.display())
+}
+
 fn operation_running_message(kind: OperationKind) -> &'static str {
     match kind {
         OperationKind::Refresh => "Actualizando estado…",
@@ -2229,5 +2239,18 @@ mod tests {
         };
 
         assert_eq!(group.height_px(), file.height_px());
+    }
+
+    #[test]
+    fn staged_and_worktree_rows_have_distinct_action_ids() {
+        let path = Path::new("src/main.rs");
+
+        for action in ["discard", "stage-toggle"] {
+            assert_ne!(
+                change_row_action_id(action, path, ChangeRepresentation::Staged),
+                change_row_action_id(action, path, ChangeRepresentation::Worktree),
+                "las filas staged y worktree no pueden compartir el id de {action}"
+            );
+        }
     }
 }
