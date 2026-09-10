@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -83,12 +83,15 @@ pub struct RepositorySnapshot {
 pub struct RepositorySession {
     pub id: RepositoryId,
     pub root_path: PathBuf,
-    pub snapshot: RepositorySnapshot,
+    pub snapshot: Arc<RepositorySnapshot>,
     pub selected_view: RepositoryView,
     pub selected_change: Option<ChangeSelection>,
     pub selected_commit: Option<CommitId>,
     pub operation_state: OperationState,
     pub refresh_generation: u64,
+    pub history_generation: u64,
+    pub history_loaded: bool,
+    pub history_loading: bool,
 }
 
 impl RepositorySession {
@@ -98,12 +101,15 @@ impl RepositorySession {
         Self {
             id: RepositoryId::new(),
             root_path,
-            snapshot: RepositorySnapshot::default(),
+            snapshot: Arc::new(RepositorySnapshot::default()),
             selected_view: RepositoryView::default(),
             selected_change: None,
             selected_commit: None,
             operation_state: OperationState::default(),
             refresh_generation: 0,
+            history_generation: 0,
+            history_loaded: false,
+            history_loading: false,
         }
     }
 }

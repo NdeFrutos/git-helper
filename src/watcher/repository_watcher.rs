@@ -2,6 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -13,6 +14,22 @@ use thiserror::Error;
 use tracing::warn;
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(250);
+
+/// Efectos de una ráfaga de cambios que la UI debe invalidar.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RepositoryChange {
+    pub git_config_changed: bool,
+    pub history_changed: bool,
+    pub ignore_rules_changed: bool,
+}
+
+impl RepositoryChange {
+    fn merge(&mut self, other: Self) {
+        self.git_config_changed |= other.git_config_changed;
+        self.history_changed |= other.history_changed;
+        self.ignore_rules_changed |= other.ignore_rules_changed;
+    }
+}
 
 /// Descarta resultados anteriores al último refresh solicitado.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -47,10 +64,16 @@ pub enum WatcherError {
     },
 }
 
+enum WorkerMessage {
+    Event(notify::Result<Event>),
+    Stop,
+}
+
 /// Mantiene vivos el watcher y su worker de debounce.
 pub struct RepositoryWatcher {
     _watcher: RecommendedWatcher,
-    stop_sender: mpsc::Sender<()>,
+    worker_sender: mpsc::Sender<WorkerMessage>,
+    stopping: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -59,12 +82,18 @@ impl RepositoryWatcher {
     pub fn start(
         repository_root: &Path,
         git_directory: &Path,
-        on_refresh_requested: Arc<dyn Fn() + Send + Sync>,
+        ignored_paths: Vec<PathBuf>,
+        on_refresh_requested: Arc<dyn Fn(RepositoryChange) + Send + Sync>,
     ) -> Result<Self, WatcherError> {
-        let (event_sender, event_receiver) = mpsc::channel();
-        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (worker_sender, worker_receiver) = mpsc::channel();
+        let event_sender = worker_sender.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let callback_stopping = Arc::clone(&stopping);
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            if let Err(send_error) = event_sender.send(result) {
+            if callback_stopping.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(send_error) = event_sender.send(WorkerMessage::Event(result)) {
                 warn!(error = %send_error, "No se pudo reenviar un evento del watcher");
             }
         })
@@ -85,34 +114,45 @@ impl RepositoryWatcher {
                 })?;
         }
 
+        let repository_root = repository_root.to_path_buf();
+        let git_directory = git_directory.to_path_buf();
+        let worker_stopping = Arc::clone(&stopping);
         let worker = thread::spawn(move || {
-            let mut pending_since: Option<Instant> = None;
+            let mut pending: Option<(Instant, RepositoryChange)> = None;
             loop {
-                if stop_receiver.try_recv().is_ok() {
-                    break;
-                }
-                let timeout = pending_since.map_or(Duration::from_secs(1), |started| {
+                let timeout = pending.map_or(Duration::from_mins(1), |(started, _)| {
                     DEBOUNCE_DURATION.saturating_sub(started.elapsed())
                 });
-                match event_receiver.recv_timeout(timeout) {
-                    Ok(Ok(_event)) => pending_since = Some(Instant::now()),
-                    Ok(Err(watcher_error)) => {
+                match worker_receiver.recv_timeout(timeout) {
+                    Ok(WorkerMessage::Event(_)) if worker_stopping.load(Ordering::Acquire) => break,
+                    Ok(WorkerMessage::Event(Ok(event))) => {
+                        if let Some(change) =
+                            classify_event(&event, &repository_root, &git_directory, &ignored_paths)
+                        {
+                            let accumulated = pending.map_or(change, |(_, mut accumulated)| {
+                                accumulated.merge(change);
+                                accumulated
+                            });
+                            pending = Some((Instant::now(), accumulated));
+                        }
+                    }
+                    Ok(WorkerMessage::Event(Err(watcher_error))) => {
                         warn!(error = %watcher_error, "El watcher notificó un error");
-                        pending_since = Some(Instant::now());
                     }
-                    Err(RecvTimeoutError::Timeout) if pending_since.is_some() => {
-                        pending_since = None;
-                        on_refresh_requested();
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some((_, change)) = pending.take() {
+                            on_refresh_requested(change);
+                        }
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(WorkerMessage::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
 
         Ok(Self {
             _watcher: watcher,
-            stop_sender,
+            worker_sender,
+            stopping,
             worker: Some(worker),
         })
     }
@@ -120,7 +160,8 @@ impl RepositoryWatcher {
 
 impl Drop for RepositoryWatcher {
     fn drop(&mut self) {
-        let _ = self.stop_sender.send(());
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.worker_sender.send(WorkerMessage::Stop);
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
@@ -129,9 +170,80 @@ impl Drop for RepositoryWatcher {
     }
 }
 
+fn classify_event(
+    event: &Event,
+    repository_root: &Path,
+    git_directory: &Path,
+    ignored_paths: &[PathBuf],
+) -> Option<RepositoryChange> {
+    let mut result: Option<RepositoryChange> = None;
+    for path in &event.paths {
+        if let Some(change) = classify_path(path, repository_root, git_directory, ignored_paths) {
+            result
+                .get_or_insert_with(RepositoryChange::default)
+                .merge(change);
+        }
+    }
+    result
+}
+
+fn classify_path(
+    path: &Path,
+    repository_root: &Path,
+    git_directory: &Path,
+    ignored_paths: &[PathBuf],
+) -> Option<RepositoryChange> {
+    if let Ok(relative) = path.strip_prefix(git_directory) {
+        let is_exact = |candidate: &str| relative == Path::new(candidate);
+        if is_exact("config") {
+            return Some(RepositoryChange {
+                git_config_changed: true,
+                ..RepositoryChange::default()
+            });
+        }
+        if is_exact("info/exclude") {
+            return Some(RepositoryChange {
+                ignore_rules_changed: true,
+                ..RepositoryChange::default()
+            });
+        }
+        if is_exact("HEAD")
+            || is_exact("packed-refs")
+            || is_exact("MERGE_HEAD")
+            || is_exact("REBASE_HEAD")
+            || is_exact("CHERRY_PICK_HEAD")
+            || relative.starts_with("refs")
+        {
+            return Some(RepositoryChange {
+                history_changed: true,
+                ..RepositoryChange::default()
+            });
+        }
+        return is_exact("index").then_some(RepositoryChange::default());
+    }
+
+    if !path.starts_with(repository_root)
+        || ignored_paths
+            .iter()
+            .any(|ignored| path == ignored || path.starts_with(ignored))
+    {
+        return None;
+    }
+
+    let ignore_rules_changed = path
+        .file_name()
+        .is_some_and(|file_name| file_name == ".gitignore");
+    Some(RepositoryChange {
+        ignore_rules_changed,
+        ..RepositoryChange::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::GenerationGate;
+    use std::path::Path;
+
+    use super::{GenerationGate, classify_path};
 
     #[test]
     fn rejects_stale_generations() {
@@ -141,5 +253,31 @@ mod tests {
 
         assert!(!gate.accepts(first));
         assert!(gate.accepts(second));
+    }
+
+    #[test]
+    fn filters_git_noise_and_ignored_trees() {
+        let root = Path::new(r"C:\repo");
+        let git = root.join(".git");
+        let ignored = vec![root.join("target")];
+
+        assert!(classify_path(&git.join("objects/aa/object"), root, &git, &ignored).is_none());
+        assert!(classify_path(&root.join("target/debug/app.exe"), root, &git, &ignored).is_none());
+        assert!(classify_path(&git.join("index"), root, &git, &ignored).is_some());
+        assert!(classify_path(&root.join("src/lib.rs"), root, &git, &ignored).is_some());
+    }
+
+    #[test]
+    fn identifies_cache_invalidation_events() {
+        let root = Path::new(r"C:\repo");
+        let git = root.join(".git");
+
+        let config = classify_path(&git.join("config"), root, &git, &[]).unwrap();
+        let history = classify_path(&git.join("refs/heads/main"), root, &git, &[]).unwrap();
+        let ignores = classify_path(&root.join(".gitignore"), root, &git, &[]).unwrap();
+
+        assert!(config.git_config_changed);
+        assert!(history.history_changed);
+        assert!(ignores.ignore_rules_changed);
     }
 }

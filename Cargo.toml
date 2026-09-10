@@ -35,8 +35,28 @@ uuid = { version = "1.16.0", features = ["serde", "v4"] }
 winresource = "0.1.19"
 
 [profile.release]
+codegen-units = 1
 lto = "thin"
 strip = "symbols"
+
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+
+[profile.dev.package.taffy]
+opt-level = 3
+
+[profile.dev.package.rustybuzz]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3
+
+[profile.dev.package.swash]
+opt-level = 3
+
+[profile.dev.package.cosmic-text]
+opt-level = 3
 
 [lints.rust]
 unsafe_code = "forbid"

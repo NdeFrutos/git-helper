@@ -148,6 +148,8 @@ impl ProcessRunner for SystemProcessRunner {
             })
         });
 
+        let mut poll_interval = Duration::from_micros(150);
+        let maximum_poll_interval = Duration::from_millis(25);
         let status = loop {
             if cancellation.is_cancelled() {
                 terminate_child(&mut child)?;
@@ -172,7 +174,8 @@ impl ProcessRunner for SystemProcessRunner {
             if let Some(status) = child.try_wait().map_err(ProcessError::Wait)? {
                 break status;
             }
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(poll_interval);
+            poll_interval = poll_interval.saturating_mul(2).min(maximum_poll_interval);
         };
 
         let (stdout, stderr) = join_workers(stdout_worker, stderr_worker, stdin_worker)?;

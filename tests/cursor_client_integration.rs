@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use git_helper::{
@@ -55,7 +56,7 @@ fn successful_output(stdout: &str) -> ProcessOutput {
 }
 
 #[test]
-fn validates_and_generates_in_restricted_ask_mode() {
+fn validates_and_generates_without_interactive_prompts_or_long_waits() {
     let runner = Arc::new(FakeProcessRunner::with_outputs(vec![
         successful_output("agent 2.0"),
         successful_output(r#"{"authenticated":true}"#),
@@ -96,10 +97,12 @@ fn validates_and_generates_in_restricted_ask_mode() {
             "-p",
             "--mode",
             "ask",
+            "--sandbox",
+            "disabled",
+            "--trust",
+            "--disable-project-configs",
             "--model",
-            "composer-2.5",
-            "--workspace",
-            r"C:\repositorio con espacios",
+            "composer-2.5-fast",
             "--output-format",
             "json",
         ]
@@ -114,10 +117,14 @@ fn validates_and_generates_in_restricted_ask_mode() {
             .iter()
             .any(|name| name == "CURSOR_API_KEY")
     );
-    assert!(!arguments.iter().any(|argument| {
-        matches!(
-            argument.as_str(),
-            "--force" | "--yolo" | "--trust" | "--api-key"
-        )
-    }));
+    assert!(generation.timeout <= Duration::from_mins(1));
+    assert_ne!(
+        generation.current_directory.as_deref(),
+        Some(Path::new(r"C:\repositorio con espacios"))
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| { matches!(argument.as_str(), "--force" | "--yolo" | "--api-key") })
+    );
 }

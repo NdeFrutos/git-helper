@@ -12,6 +12,8 @@ pub enum CursorError {
     },
     #[error("falló el proceso de Cursor CLI: {0}")]
     Process(#[from] ProcessError),
+    #[error("no se pudo preparar el entorno aislado para Cursor: {0}")]
+    IsolatedWorkspace(#[source] std::io::Error),
     #[error("Cursor CLI rechazó la solicitud: {stderr}")]
     CommandFailed {
         exit_code: Option<i32>,

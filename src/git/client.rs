@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
+    thread,
     time::Duration,
 };
 
@@ -26,6 +28,7 @@ const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_mins(15);
 pub struct GitClient {
     executable: PathBuf,
     runner: Arc<dyn ProcessRunner>,
+    remote_cache: Arc<Mutex<HashMap<PathBuf, Vec<Remote>>>>,
 }
 
 impl Default for GitClient {
@@ -41,13 +44,18 @@ impl GitClient {
         Self {
             executable,
             runner: Arc::new(SystemProcessRunner),
+            remote_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Crea un cliente con ejecución inyectada para pruebas.
     #[must_use]
     pub fn with_runner(executable: PathBuf, runner: Arc<dyn ProcessRunner>) -> Self {
-        Self { executable, runner }
+        Self {
+            executable,
+            runner,
+            remote_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Comprueba que Git está disponible y devuelve su versión.
@@ -57,9 +65,9 @@ impl GitClient {
                 "git-version",
                 vec![OsString::from("--version")],
                 None,
-                None,
                 LOCAL_OPERATION_TIMEOUT,
                 cancellation,
+                true,
             )
             .map_err(|source| GitError::NotInstalled { source })?;
         let output = require_success(output)?;
@@ -72,7 +80,7 @@ impl GitClient {
         selected_path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitError> {
-        let output = self.run_git(
+        let output = self.run_git_read_only(
             "git-discover-repository",
             selected_path,
             ["rev-parse", "--show-toplevel"],
@@ -94,7 +102,7 @@ impl GitClient {
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, GitError> {
-        let output = self.run_git(
+        let output = self.run_git_read_only(
             "git-directory",
             repository_root,
             ["rev-parse", "--absolute-git-dir"],
@@ -108,17 +116,52 @@ impl GitClient {
         )?))
     }
 
-    /// Lee status, remotes e historial como un snapshot coherente para la UI.
+    /// Lee status y remotes como un snapshot ligero para la UI.
     pub fn snapshot(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RepositorySnapshot, GitError> {
+        let (status, remotes) = thread::scope(|scope| {
+            let remotes_worker = scope.spawn(|| self.remotes(repository_root, cancellation));
+            let status = self.status(repository_root, cancellation);
+            let remotes = remotes_worker
+                .join()
+                .map_err(|_| GitError::WorkerPanicked {
+                    operation: "git remote",
+                })?;
+            Ok::<_, GitError>((status?, remotes?))
+        })?;
+        let upstream = resolve_upstream(&status, &remotes);
+
+        Ok(RepositorySnapshot {
+            head: status.head,
+            upstream,
+            remotes,
+            changes: status.changes,
+            commits: Vec::new(),
+            has_more_commits: false,
+        })
+    }
+
+    /// Lee el snapshot y una primera página de historial de forma concurrente.
+    pub fn snapshot_with_history(
         &self,
         repository_root: &Path,
         history_limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, GitError> {
-        let status = self.status(repository_root, cancellation)?;
-        let remotes = self.remotes(repository_root, cancellation)?;
-        let upstream = resolve_upstream(&status, &remotes);
-        let commits = self.history(repository_root, history_limit + 1, 0, cancellation)?;
+        let (snapshot, commits) = thread::scope(|scope| {
+            let history_worker =
+                scope.spawn(|| self.history(repository_root, history_limit + 1, 0, cancellation));
+            let snapshot = self.snapshot(repository_root, cancellation);
+            let commits = history_worker
+                .join()
+                .map_err(|_| GitError::WorkerPanicked {
+                    operation: "git log",
+                })?;
+            Ok::<_, GitError>((snapshot?, commits?))
+        })?;
         let has_more_commits = commits.len() > history_limit;
         let commits = commits
             .into_iter()
@@ -127,12 +170,9 @@ impl GitClient {
             .collect();
 
         Ok(RepositorySnapshot {
-            head: status.head,
-            upstream,
-            remotes,
-            changes: status.changes,
             commits,
             has_more_commits,
+            ..snapshot
         })
     }
 
@@ -142,7 +182,7 @@ impl GitClient {
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<crate::domain::StatusSnapshot, GitError> {
-        let output = self.run_git(
+        let output = self.run_git_read_only(
             "git-status",
             repository_root,
             [
@@ -165,7 +205,16 @@ impl GitClient {
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Vec<Remote>, GitError> {
-        let output = self.run_git(
+        if let Some(remotes) = self
+            .remote_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(repository_root)
+            .cloned()
+        {
+            return Ok(remotes);
+        }
+        let output = self.run_git_read_only(
             "git-remotes",
             repository_root,
             ["remote"],
@@ -177,14 +226,63 @@ impl GitClient {
         let text = std::str::from_utf8(&output.stdout).map_err(|_| GitError::InvalidUtf8 {
             context: "git remote",
         })?;
-        Ok(text
+        let remotes = text
             .lines()
             .map(str::trim_end)
             .filter(|name| !name.is_empty())
             .map(|name| Remote {
                 name: name.to_owned(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        self.remote_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(repository_root.to_path_buf(), remotes.clone());
+        Ok(remotes)
+    }
+
+    /// Invalida los remotes cacheados cuando cambia la configuración local.
+    pub fn invalidate_remotes(&self, repository_root: &Path) {
+        self.remote_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(repository_root);
+    }
+
+    /// Enumera rutas ignoradas para que el watcher descarte árboles ruidosos.
+    pub fn ignored_paths(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PathBuf>, GitError> {
+        let output = self.run_git_read_only(
+            "git-ignored-paths",
+            repository_root,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        let output = require_success(output)?;
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                std::str::from_utf8(path)
+                    .map(|path| repository_root.join(path.trim_end_matches('/')))
+                    .map_err(|_| GitError::InvalidUtf8 {
+                        context: "git ls-files --ignored",
+                    })
+            })
+            .collect()
     }
 
     /// Carga una página de historial, incluyendo detalles para la selección.
@@ -195,9 +293,6 @@ impl GitClient {
         offset: usize,
         cancellation: &CancellationToken,
     ) -> Result<Vec<CommitDetails>, GitError> {
-        if !self.has_head(repository_root, cancellation)? {
-            return Ok(Vec::new());
-        }
         let arguments = vec![
             OsString::from("log"),
             OsString::from("--all"),
@@ -208,7 +303,7 @@ impl GitClient {
             OsString::from(format!("--max-count={limit}")),
             OsString::from(format!("--skip={offset}")),
         ];
-        let output = self.run_git_os(
+        let output = self.run_git_os_read_only(
             "git-history",
             repository_root,
             arguments,
@@ -216,7 +311,13 @@ impl GitClient {
             LOCAL_OPERATION_TIMEOUT,
             cancellation,
         )?;
-        parse_log(&require_success(output)?.stdout)
+        if output.status.success() {
+            parse_log(&output.stdout)
+        } else if is_empty_history_error(&output.stderr) {
+            Ok(Vec::new())
+        } else {
+            Err(command_failed(&output))
+        }
     }
 
     /// Carga un commit concreto por su hash validado.
@@ -233,7 +334,7 @@ impl GitClient {
                 value: commit_id.to_owned(),
             });
         }
-        let output = self.run_git_os(
+        let output = self.run_git_os_read_only(
             "git-commit-details",
             repository_root,
             vec![
@@ -309,7 +410,7 @@ impl GitClient {
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<bool, GitError> {
-        let output = self.run_git(
+        let output = self.run_git_read_only(
             "git-has-head",
             repository_root,
             ["rev-parse", "--verify", "--quiet", "HEAD"],
@@ -542,7 +643,7 @@ impl GitClient {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self.run_git(
+        let output = self.run_git_read_only(
             label,
             repository_root,
             arguments,
@@ -604,6 +705,32 @@ impl GitClient {
         )
     }
 
+    fn run_git_read_only<I, S>(
+        &self,
+        label: &'static str,
+        repository_root: &Path,
+        arguments: I,
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_git_os_read_only(
+            label,
+            repository_root,
+            arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect(),
+            stdin,
+            timeout,
+            cancellation,
+        )
+    }
+
     fn run_git_os(
         &self,
         label: &'static str,
@@ -617,7 +744,24 @@ impl GitClient {
         full_arguments.push(OsString::from("-C"));
         full_arguments.push(repository_root.as_os_str().to_os_string());
         full_arguments.extend(arguments);
-        self.run_process(label, full_arguments, None, stdin, timeout, cancellation)
+        self.run_process(label, full_arguments, stdin, timeout, cancellation, false)
+            .map_err(GitError::Process)
+    }
+
+    fn run_git_os_read_only(
+        &self,
+        label: &'static str,
+        repository_root: &Path,
+        arguments: Vec<OsString>,
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitError> {
+        let mut full_arguments = Vec::with_capacity(arguments.len() + 2);
+        full_arguments.push(OsString::from("-C"));
+        full_arguments.push(repository_root.as_os_str().to_os_string());
+        full_arguments.extend(arguments);
+        self.run_process(label, full_arguments, stdin, timeout, cancellation, true)
             .map_err(GitError::Process)
     }
 
@@ -625,19 +769,23 @@ impl GitClient {
         &self,
         label: &'static str,
         arguments: Vec<OsString>,
-        current_directory: Option<PathBuf>,
         stdin: Option<Vec<u8>>,
         timeout: Duration,
         cancellation: &CancellationToken,
+        read_only: bool,
     ) -> Result<ProcessOutput, ProcessError> {
+        let mut environment = vec![(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"))];
+        if read_only {
+            environment.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
+        }
         self.runner.run(
             ProcessRequest {
                 label,
                 program: self.executable.clone(),
                 arguments,
-                environment: vec![(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"))],
+                environment,
                 removed_environment: Vec::new(),
-                current_directory,
+                current_directory: None,
                 stdin,
                 timeout,
             },
@@ -650,11 +798,22 @@ fn require_success(output: ProcessOutput) -> Result<ProcessOutput, GitError> {
     if output.status.success() {
         Ok(output)
     } else {
-        Err(GitError::CommandFailed {
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+        Err(command_failed(&output))
     }
+}
+
+fn command_failed(output: &ProcessOutput) -> GitError {
+    GitError::CommandFailed {
+        exit_code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    }
+}
+
+fn is_empty_history_error(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    stderr.contains("does not have any commits")
+        || stderr.contains("no commits yet")
+        || stderr.contains("bad default revision")
 }
 
 fn decode_trimmed_stdout(
@@ -664,4 +823,186 @@ fn decode_trimmed_stdout(
     let text =
         std::str::from_utf8(&output.stdout).map_err(|_| GitError::InvalidUtf8 { context })?;
     Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsStr,
+        path::{Path, PathBuf},
+        process::ExitStatus,
+        sync::{Arc, Mutex, PoisonError},
+    };
+
+    use crate::process::{
+        CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    };
+
+    use super::GitClient;
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl RecordingRunner {
+        fn requests(&self) -> Vec<ProcessRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ProcessRunner for RecordingRunner {
+        fn run(
+            &self,
+            request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            let stdout = match request.label {
+                "git-status" => b"# branch.oid (initial)\0# branch.head main\0".to_vec(),
+                "git-remotes" => b"origin\n".to_vec(),
+                _ => Vec::new(),
+            };
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request);
+            Ok(ProcessOutput {
+                status: success_status(),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn snapshot_omits_history_and_reuses_cached_remotes() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let cancellation = CancellationToken::default();
+
+        let first = client
+            .snapshot(Path::new("repo"), &cancellation)
+            .expect("debe crear el primer snapshot");
+        let second = client
+            .snapshot(Path::new("repo"), &cancellation)
+            .expect("debe reutilizar la caché");
+        let requests = runner.requests();
+
+        assert!(first.commits.is_empty());
+        assert!(second.commits.is_empty());
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.label == "git-status")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.label == "git-remotes")
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.label != "git-history")
+        );
+    }
+
+    #[test]
+    fn invalidating_remotes_forces_a_reload() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let cancellation = CancellationToken::default();
+        let root = Path::new("repo");
+
+        client.remotes(root, &cancellation).unwrap();
+        client.remotes(root, &cancellation).unwrap();
+        client.invalidate_remotes(root);
+        client.remotes(root, &cancellation).unwrap();
+
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| request.label == "git-remotes")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn history_snapshot_requests_each_independent_git_read_once() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        client
+            .snapshot_with_history(Path::new("repo"), 200, &CancellationToken::default())
+            .unwrap();
+        let requests = runner.requests();
+
+        for label in ["git-status", "git-remotes", "git-history"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.label == label)
+                    .count(),
+                1,
+                "{label} debe ejecutarse exactamente una vez"
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.label != "git-has-head")
+        );
+    }
+
+    #[test]
+    fn optional_locks_are_disabled_only_for_read_only_commands() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let cancellation = CancellationToken::default();
+
+        client.status(Path::new("repo"), &cancellation).unwrap();
+        client.stage_all(Path::new("repo"), &cancellation).unwrap();
+        let requests = runner.requests();
+        let status = requests
+            .iter()
+            .find(|request| request.label == "git-status")
+            .unwrap();
+        let stage = requests
+            .iter()
+            .find(|request| request.label == "git-stage-all")
+            .unwrap();
+
+        assert!(has_environment(status, "GIT_OPTIONAL_LOCKS", "0"));
+        assert!(!has_environment(stage, "GIT_OPTIONAL_LOCKS", "0"));
+    }
+
+    fn has_environment(request: &ProcessRequest, name: &str, value: &str) -> bool {
+        request
+            .environment
+            .iter()
+            .any(|(key, candidate)| key == OsStr::new(name) && candidate == OsStr::new(value))
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
+    }
 }

@@ -82,8 +82,12 @@ fn handles_unborn_unstage_without_removing_worktree_file() {
     let status = client
         .status(temporary.path(), &cancellation)
         .expect("debe leer status");
+    let history = client
+        .history(temporary.path(), 200, 0, &cancellation)
+        .expect("un repositorio unborn debe tener historial vacío");
 
     assert!(file_path.exists());
+    assert!(history.is_empty());
     assert_eq!(status.changes[0].index_status, ChangeKind::Unmodified);
     assert_eq!(status.changes[0].worktree_status, ChangeKind::Untracked);
 }
@@ -202,7 +206,7 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
     );
 
     let first_snapshot = client
-        .snapshot(&first, 200, &cancellation)
+        .snapshot(&first, &cancellation)
         .expect("debe leer snapshot");
     let first_push = plan_push(
         &first_snapshot.head,
@@ -244,7 +248,7 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
     require_git(&second, &["push"]);
 
     let first_snapshot = client
-        .snapshot(&first, 200, &cancellation)
+        .snapshot(&first, &cancellation)
         .expect("debe refrescar snapshot");
     let pull = plan_pull(first_snapshot.upstream.as_ref()).expect("debe planificar pull");
     client

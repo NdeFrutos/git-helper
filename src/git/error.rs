@@ -39,6 +39,8 @@ pub enum GitError {
     InvalidReferenceName { value: String },
     #[error("el mensaje de commit está vacío")]
     EmptyCommitMessage,
+    #[error("un worker interno de Git terminó inesperadamente durante {operation}")]
+    WorkerPanicked { operation: &'static str },
     #[error("la rama actual no tiene upstream")]
     MissingUpstream,
     #[error("se debe seleccionar uno de los remotes disponibles")]

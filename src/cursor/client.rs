@@ -15,8 +15,8 @@ use crate::process::{
 use super::{CursorError, parse_cursor_result};
 
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
-const GENERATION_TIMEOUT: Duration = Duration::from_mins(10);
-const COMMIT_MESSAGE_MODEL: &str = "composer-2.5";
+const GENERATION_TIMEOUT: Duration = Duration::from_mins(1);
+const COMMIT_MESSAGE_MODEL: &str = "composer-2.5-fast";
 
 /// Estado de autenticación interpretado de forma tolerante.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +37,8 @@ pub struct CursorAvailability {
 #[derive(Clone)]
 pub struct CursorClient {
     executable: PathBuf,
+    argument_prefix: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
     runner: Arc<dyn ProcessRunner>,
 }
 
@@ -50,8 +52,12 @@ impl CursorClient {
     /// Crea un cliente de producción desde PATH o una ruta configurada.
     #[must_use]
     pub fn new(executable: PathBuf) -> Self {
+        let (executable, argument_prefix) = prepare_executable(executable);
+        let environment = cursor_environment(&executable);
         Self {
             executable,
+            argument_prefix,
+            environment,
             runner: Arc::new(SystemProcessRunner),
         }
     }
@@ -59,7 +65,14 @@ impl CursorClient {
     /// Crea un cliente con proceso inyectable para pruebas offline.
     #[must_use]
     pub fn with_runner(executable: PathBuf, runner: Arc<dyn ProcessRunner>) -> Self {
-        Self { executable, runner }
+        let (executable, argument_prefix) = prepare_executable(executable);
+        let environment = cursor_environment(&executable);
+        Self {
+            executable,
+            argument_prefix,
+            environment,
+            runner,
+        }
     }
 
     /// Valida versión y consulta autenticación cuando el CLI lo admite.
@@ -107,24 +120,30 @@ impl CursorClient {
     /// Genera una propuesta; nunca ejecuta Git ni crea un commit.
     pub fn generate_commit_message(
         &self,
-        repository_root: &Path,
+        _repository_root: &Path,
         prompt: String,
         cancellation: &CancellationToken,
     ) -> Result<String, CursorError> {
+        // El prompt ya contiene todo el contexto staged. Ejecutar el agente en un
+        // directorio vacío evita que cargue reglas o ficheros adicionales del repo;
+        // `--trust` solo se aplica a este workspace efímero y permite el modo headless.
+        let isolated_workspace = tempfile::tempdir().map_err(CursorError::IsolatedWorkspace)?;
         let output = self.run(
             "cursor-generate-commit-message",
             vec![
                 OsString::from("-p"),
                 OsString::from("--mode"),
                 OsString::from("ask"),
+                OsString::from("--sandbox"),
+                OsString::from("disabled"),
+                OsString::from("--trust"),
+                OsString::from("--disable-project-configs"),
                 OsString::from("--model"),
                 OsString::from(COMMIT_MESSAGE_MODEL),
-                OsString::from("--workspace"),
-                repository_root.as_os_str().to_os_string(),
                 OsString::from("--output-format"),
                 OsString::from("json"),
             ],
-            Some(repository_root.to_path_buf()),
+            Some(isolated_workspace.path().to_path_buf()),
             Some(prompt.into_bytes()),
             GENERATION_TIMEOUT,
             cancellation,
@@ -141,12 +160,14 @@ impl CursorClient {
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        let mut full_arguments = self.argument_prefix.clone();
+        full_arguments.extend(arguments);
         self.runner.run(
             ProcessRequest {
                 label,
                 program: self.executable.clone(),
-                arguments,
-                environment: Vec::new(),
+                arguments: full_arguments,
+                environment: self.environment.clone(),
                 removed_environment: vec![
                     OsString::from("CURSOR_API_KEY"),
                     OsString::from("CURSOR_API_TOKEN"),
@@ -158,6 +179,44 @@ impl CursorClient {
             cancellation,
         )
     }
+}
+
+fn prepare_executable(executable: PathBuf) -> (PathBuf, Vec<OsString>) {
+    let Some(directory) = executable.parent() else {
+        return (executable, Vec::new());
+    };
+    if executable
+        .extension()
+        .is_none_or(|extension| extension != "cmd")
+    {
+        return (executable, Vec::new());
+    }
+    let node = directory.join("node.exe");
+    let entrypoint = directory.join("index.js");
+    if node.is_file() && entrypoint.is_file() {
+        (node, vec![entrypoint.into_os_string()])
+    } else if let Some(versioned_launcher) = super::executable::latest_version_entrypoint(directory)
+    {
+        prepare_executable(versioned_launcher)
+    } else {
+        (executable, Vec::new())
+    }
+}
+
+fn cursor_environment(executable: &Path) -> Vec<(OsString, OsString)> {
+    if executable.file_name().is_none_or(|name| name != "node.exe")
+        || std::env::var_os("NODE_COMPILE_CACHE").is_some()
+    {
+        return Vec::new();
+    }
+    std::env::var_os("LOCALAPPDATA").map_or_else(Vec::new, |local_app_data| {
+        vec![(
+            OsString::from("NODE_COMPILE_CACHE"),
+            PathBuf::from(local_app_data)
+                .join("cursor-compile-cache")
+                .into_os_string(),
+        )]
+    })
 }
 
 fn require_success(output: ProcessOutput) -> Result<ProcessOutput, CursorError> {
@@ -210,7 +269,27 @@ fn find_authentication(value: &Value) -> Option<CursorAuthentication> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorAuthentication, parse_authentication};
+    use super::{CursorAuthentication, parse_authentication, prepare_executable};
+
+    #[test]
+    fn invokes_the_versioned_node_process_directly() {
+        let installation = tempfile::tempdir().expect("debe crear la instalación simulada");
+        let version = installation.path().join("versions").join("2026.09.02-bbbb");
+        std::fs::create_dir_all(&version).expect("debe crear la versión simulada");
+        let launcher = installation.path().join("agent.cmd");
+        let node = version.join("node.exe");
+        let entrypoint = version.join("index.js");
+        std::fs::write(&launcher, b"").expect("debe crear el launcher");
+        std::fs::write(version.join("cursor-agent.cmd"), b"")
+            .expect("debe crear el launcher versionado");
+        std::fs::write(&node, b"").expect("debe crear node");
+        std::fs::write(&entrypoint, b"").expect("debe crear el entrypoint");
+
+        let (program, prefix) = prepare_executable(launcher);
+
+        assert_eq!(program, node);
+        assert_eq!(prefix, vec![entrypoint.into_os_string()]);
+    }
 
     #[test]
     fn parses_nested_authentication_status() {

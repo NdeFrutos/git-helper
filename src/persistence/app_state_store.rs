@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -95,12 +96,15 @@ impl PersistedAppState {
             .map(|repository| RepositorySession {
                 id: repository.id,
                 root_path: repository.root_path,
-                snapshot: RepositorySnapshot::default(),
+                snapshot: Arc::new(RepositorySnapshot::default()),
                 selected_view: repository.selected_view,
                 selected_change: None,
                 selected_commit: None,
                 operation_state: OperationState::default(),
                 refresh_generation: 0,
+                history_generation: 0,
+                history_loaded: false,
+                history_loading: false,
             })
             .collect();
         AppState {
