@@ -35,7 +35,8 @@ use super::{
 };
 
 const INITIAL_HISTORY_LIMIT: usize = 200;
-const CHANGE_LIST_ROW_HEIGHT_PX: f32 = 40.0;
+const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 40;
+const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 40;
 
 #[derive(Clone)]
 enum ChangeListRow {
@@ -53,8 +54,11 @@ enum ChangeListRow {
 }
 
 impl ChangeListRow {
-    const fn height_px(&self) -> f32 {
-        CHANGE_LIST_ROW_HEIGHT_PX
+    const fn height_px(&self) -> u16 {
+        match self {
+            Self::Group { .. } => CHANGE_GROUP_ROW_HEIGHT_PX,
+            Self::File { .. } => CHANGE_FILE_ROW_HEIGHT_PX,
+        }
     }
 }
 
@@ -1553,7 +1557,7 @@ impl MainWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let row_height = px(row.height_px());
+        let row_height = px(f32::from(row.height_px()));
         match row {
             ChangeListRow::Group {
                 title,
