@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Cargo checks
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
+          # Do not include github.ref: the default branch cache is available
+          # to pull requests and release/tag workflows through this key.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+  warm-release-cache:
+    name: Warm release cache
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Cargo release
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
+          # This is intentionally the same key and path used by releases.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Install cargo-wix
+        shell: pwsh
+        run: |
+          $cargoWix = Join-Path $env:USERPROFILE ".cargo\bin\cargo-wix.exe"
+          if (-not (Test-Path -LiteralPath $cargoWix -PathType Leaf)) {
+            cargo install cargo-wix --version 0.3.9 --locked
+          }
