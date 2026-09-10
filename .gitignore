@@ -1,0 +1,12 @@
+/target/
+/dist/
+*.pdb
+*.rs.bk
+
+# Configuración local del editor
+.idea/
+.vscode/
+
+# Estado y logs locales de la aplicación
+state.json
+logs/

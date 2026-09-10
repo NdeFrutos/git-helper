@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# El linker LLVM forma parte del toolchain fijado y permite builds reproducibles sin depender del PATH de Visual Studio.
+linker = "rust-lld.exe"

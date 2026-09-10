@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión de Cargo.toml que se publicará (por ejemplo, 0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        id: release
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "push") {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "v$env:INPUT_VERSION"
+          }
+
+          if ($tag -notmatch '^v(?<major>0|[1-9]\d*)\.(?<minor>0|[1-9]\d*)\.(?<patch>0|[1-9]\d*)$') {
+            throw "La release debe usar una versión semántica estable, por ejemplo v0.2.0."
+          }
+
+          $version = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
+          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw
+          if ($manifest -notmatch '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$') {
+            throw "No se pudo leer package.version de Cargo.toml."
+          }
+          if ($Matches.cargoVersion -ne $version) {
+            throw "La etiqueta $tag no coincide con Cargo.toml ($($Matches.cargoVersion))."
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build MSI
+        run: cargo wix --nocapture
+
+      - name: Prepare release assets
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          $msiPath = "target\wix\git-helper-$env:RELEASE_VERSION-x86_64.msi"
+          if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) {
+            throw "cargo-wix no generó el MSI esperado: $msiPath"
+          }
+
+          $msiName = "git-helper-$env:RELEASE_VERSION-windows-x86_64.msi"
+          Copy-Item -LiteralPath $msiPath -Destination "dist\$msiName"
+
+          $portable = "dist\portable"
+          New-Item -ItemType Directory -Path $portable -Force | Out-Null
+          Copy-Item -LiteralPath "target\release\git-helper.exe" -Destination $portable
+          Copy-Item -LiteralPath "LICENSE" -Destination $portable
+          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $portable
+
+          $zipName = "git-helper-$env:RELEASE_VERSION-windows-x86_64-portable.zip"
+          Compress-Archive -Path "$portable\*" -DestinationPath "dist\$zipName"
+          Remove-Item -LiteralPath $portable -Recurse
+
+          $checksumFiles = @($msiName, $zipName)
+          $checksums = foreach ($file in $checksumFiles) {
+            $hash = (Get-FileHash -LiteralPath "dist\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file"
+          }
+          Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Value $checksums -Encoding utf8NoBOM
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: git-helper-${{ steps.release.outputs.version }}-windows-x86_64
+          path: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
+            throw "La release $env:RELEASE_TAG ya existe."
+          }
+
+          $assets = Get-ChildItem -LiteralPath "dist" -File |
+            Where-Object { $_.Extension -in ".msi", ".zip", ".txt" } |
+            ForEach-Object { $_.FullName }
+          gh release create $env:RELEASE_TAG @assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "Git Helper $env:RELEASE_TAG" `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub no pudo crear la release $env:RELEASE_TAG."
+          }
