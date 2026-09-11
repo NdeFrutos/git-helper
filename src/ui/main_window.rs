@@ -2117,11 +2117,7 @@ impl MainWindow {
 
     fn render_toolbar(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
         let repository_id = repository.id;
-        let branch = match &repository.snapshot.head {
-            HeadState::Branch { name, .. } => name.clone(),
-            HeadState::Detached { .. } => "HEAD separado".to_owned(),
-            HeadState::Unborn => "Sin commit inicial".to_owned(),
-        };
+        let branch = head_label(&repository.snapshot.head);
         let upstream = repository.snapshot.upstream.as_ref().map(|upstream| {
             format!(
                 "{}  ↑{} ↓{}",
@@ -3134,6 +3130,15 @@ fn repository_has_commits(head: &HeadState) -> bool {
     }
 }
 
+fn head_label(head: &HeadState) -> String {
+    match head {
+        HeadState::Branch { name, oid: Some(_) } => name.clone(),
+        HeadState::Branch { name, oid: None } => format!("{name} (sin commits)"),
+        HeadState::Detached { .. } => "HEAD separado".to_owned(),
+        HeadState::Unborn => "Sin commit inicial".to_owned(),
+    }
+}
+
 fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
     match head {
         HeadState::Branch {
@@ -3686,6 +3691,24 @@ mod tests {
             Some(("deadbeef".to_owned(), "deadbeef".to_owned()))
         );
         assert_eq!(history_target_for_head(&HeadState::Unborn), None);
+    }
+
+    #[test]
+    fn labels_an_unborn_branch_without_hiding_its_name() {
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: None,
+            }),
+            "main (sin commits)"
+        );
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("abc".to_owned()),
+            }),
+            "main"
+        );
     }
 
     #[test]

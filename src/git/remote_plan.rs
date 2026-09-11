@@ -70,8 +70,10 @@ pub fn plan_push(
     selected_remote: Option<&str>,
 ) -> Result<RemoteOperationPlan, GitError> {
     let branch_name = match head {
-        HeadState::Branch { name, .. } => name,
-        HeadState::Detached { .. } | HeadState::Unborn => return Err(GitError::DetachedHead),
+        HeadState::Branch { name, oid: Some(_) } => name,
+        HeadState::Branch { oid: None, .. } | HeadState::Detached { .. } | HeadState::Unborn => {
+            return Err(GitError::DetachedHead);
+        }
     };
     if upstream.is_some() {
         return Ok(RemoteOperationPlan::Push);
@@ -129,7 +131,7 @@ fn require_existing_remote<'a>(
 mod tests {
     use crate::domain::{HeadState, Remote, RemoteOperationPlan, StatusSnapshot};
 
-    use super::{plan_fetch, plan_push, resolve_upstream};
+    use super::{GitError, plan_fetch, plan_push, resolve_upstream};
 
     #[test]
     fn resolves_remote_names_that_contain_slashes() {
@@ -187,5 +189,21 @@ mod tests {
                 branch_name: "feature/demo".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn rejects_push_from_an_unborn_branch() {
+        let remotes = [Remote {
+            name: "origin".to_owned(),
+        }];
+        let head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: None,
+        };
+
+        assert!(matches!(
+            plan_push(&head, None, &remotes, None),
+            Err(GitError::DetachedHead)
+        ));
     }
 }
