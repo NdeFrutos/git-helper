@@ -992,13 +992,12 @@ impl MainWindow {
         };
         let repository_id = repository.id;
         repository.selected_view = view;
-        let has_selection = repository.selected_commit.is_some();
         self.save_state(cx);
         if view == RepositoryView::History {
             self.ensure_history_loaded(repository_id, cx);
-        } else if !has_selection {
-            // Un error sin selección viva ya no se puede reintentar ni
-            // interpretar al volver: no debe sobrevivir al cambio de vista.
+        } else {
+            // Al salir de Historial los errores de detalle ya no son accionables
+            // ni fiables: evita mostrar mensajes obsoletos al volver.
             self.history_detail_errors.remove(&repository_id);
         }
         cx.notify();
@@ -1037,8 +1036,7 @@ impl MainWindow {
         {
             return;
         }
-        let Some((reference, expected_oid)) = history_target_for_head(&repository.snapshot.head)
-        else {
+        let Some((reference, expected_oid)) = history_reload_target(repository) else {
             repository.history_loaded = true;
             return;
         };
@@ -1047,21 +1045,20 @@ impl MainWindow {
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
         repository.error = None;
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.history_reference = Some(reference.clone());
-        snapshot.history_oid = Some(expected_oid.clone());
+        let head = repository.snapshot.head.clone();
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.history_for_oid(
+                    load_history_page(
+                        &git_client,
                         &root_path,
+                        &head,
                         &reference,
                         &expected_oid,
-                        INITIAL_HISTORY_LIMIT + 1,
-                        0,
+                        INITIAL_HISTORY_LIMIT,
                         &CancellationToken::default(),
                     )
                 })
@@ -3357,6 +3354,66 @@ fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
     }
 }
 
+/// Objetivo de recarga cuando el historial visible quedó invalidado.
+///
+/// Respeta referencias fijadas con nombre; un OID suelto o HEAD desacoplado
+/// sigue al commit actual en lugar de quedar anclado.
+fn history_reload_target(repository: &RepositorySession) -> Option<(String, String)> {
+    if let Some(reference) = repository
+        .snapshot
+        .history_reference
+        .as_ref()
+        .filter(|reference| reference.starts_with("refs/"))
+        .cloned()
+    {
+        return repository
+            .snapshot
+            .history_oid
+            .clone()
+            .map(|oid| (reference, oid));
+    }
+    history_target_for_head(&repository.snapshot.head)
+}
+
+fn load_history_page(
+    git_client: &GitClient,
+    root_path: &Path,
+    head: &HeadState,
+    reference: &str,
+    expected_oid: &str,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<HistoryPage, GitError> {
+    let load = |reference: &str, expected_oid: &str| -> Result<HistoryPage, GitError> {
+        if reference.starts_with("refs/") {
+            git_client.history_for_ref(root_path, reference, history_limit + 1, 0, cancellation)
+        } else {
+            git_client.history_for_oid(
+                root_path,
+                reference,
+                expected_oid,
+                history_limit + 1,
+                0,
+                cancellation,
+            )
+        }
+    };
+    match load(reference, expected_oid) {
+        Ok(page) => Ok(page),
+        Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. })
+            if reference.starts_with("refs/") =>
+        {
+            let Some((fallback_reference, fallback_oid)) = history_target_for_head(head) else {
+                return Err(GitError::ReferenceNotFound {
+                    value: reference.to_owned(),
+                });
+            };
+            load(&fallback_reference, &fallback_oid)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Lee el snapshot y el historial de la referencia fijada por la vista.
 ///
 /// La fijación solo se respeta si es una referencia con nombre. Un OID suelto
@@ -4003,6 +4060,38 @@ mod tests {
             Some(("deadbeef".to_owned(), "deadbeef".to_owned()))
         );
         assert_eq!(history_target_for_head(&HeadState::Unborn), None);
+    }
+
+    #[test]
+    fn history_reload_target_honours_a_pinned_branch() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        Arc::make_mut(&mut repository.snapshot).head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: Some("abc123".to_owned()),
+        };
+        Arc::make_mut(&mut repository.snapshot).history_reference =
+            Some("refs/heads/feature".to_owned());
+        Arc::make_mut(&mut repository.snapshot).history_oid = Some("def456".to_owned());
+
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("refs/heads/feature".to_owned(), "def456".to_owned()))
+        );
+    }
+
+    #[test]
+    fn history_reload_target_ignores_a_detached_oid_pin() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        Arc::make_mut(&mut repository.snapshot).head = HeadState::Detached {
+            oid: "new-head".to_owned(),
+        };
+        Arc::make_mut(&mut repository.snapshot).history_reference = Some("old-head".to_owned());
+        Arc::make_mut(&mut repository.snapshot).history_oid = Some("old-head".to_owned());
+
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("new-head".to_owned(), "new-head".to_owned()))
+        );
     }
 
     fn summary(id: &str) -> CommitSummary {
