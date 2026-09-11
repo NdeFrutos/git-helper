@@ -10,6 +10,6 @@ pub use remote::{Remote, RemoteOperationPlan, UpstreamState};
 pub use repository::{
     AppSettings, AppState, ChangeCounters, HistorySnapshot, MutationState, OperationKind,
     RefreshCoordinator, RefreshState, RepositoryId, RepositorySession, RepositoryView,
-    ThemePreference, WorkingTreeSnapshot,
+    SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
 };
 pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};

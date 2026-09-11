@@ -42,6 +42,7 @@ pub enum OperationKind {
     Unstage,
     Discard,
     Commit,
+    Clone,
     Fetch,
     Pull,
     Push,
@@ -383,12 +384,21 @@ mod tests {
     }
 }
 
+/// Par SSH URL → ruta local persistido para reabrir clones recientes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshCloneMapping {
+    pub ssh_url_normalized: String,
+    pub local_path: PathBuf,
+}
+
 /// Preferencias persistentes independientes de los repositorios.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemePreference,
     pub cursor_cli_path: Option<PathBuf>,
     pub cursor_context_consent: bool,
+    #[serde(default)]
+    pub default_clone_directory: Option<PathBuf>,
 }
 
 /// Preferencia de tema visual.
@@ -406,5 +416,6 @@ pub struct AppState {
     pub repositories: Vec<RepositorySession>,
     pub active_repository_id: Option<RepositoryId>,
     pub recent_repositories: Vec<PathBuf>,
+    pub ssh_clone_mappings: Vec<SshCloneMapping>,
     pub settings: AppSettings,
 }

@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
-    parse_branch_refs, parse_log, parse_status, resolve_upstream,
+    classify_remote_failure, parse_branch_refs, parse_log, parse_status, resolve_upstream,
     validate_existing_path_inside_repository, validate_relative_path,
 };
 
@@ -866,6 +866,98 @@ impl GitClient {
         )
     }
 
+    /// Clona un repositorio remoto en la ruta destino indicada.
+    pub fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        validate_clone_argument(url)?;
+        validate_clone_argument(&destination.to_string_lossy())?;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let staging_directory = if destination.exists() {
+            None
+        } else {
+            let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+            Some(
+                tempfile::Builder::new()
+                    .prefix(".git-helper-clone-")
+                    .tempdir_in(parent)
+                    .map_err(|source| GitError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?,
+            )
+        };
+        let clone_destination = staging_directory
+            .as_ref()
+            .map_or(destination, tempfile::TempDir::path);
+        let result = self.run_process(
+            "git-clone",
+            vec![
+                OsString::from("clone"),
+                // `--` evita que una URL o un destino con guion inicial se lean como opción de git.
+                OsString::from("--"),
+                OsString::from(url),
+                clone_destination.as_os_str().to_os_string(),
+            ],
+            None,
+            REMOTE_OPERATION_TIMEOUT,
+            cancellation,
+            false,
+        );
+        let outcome = match result {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(classify_remote_failure(
+                &String::from_utf8_lossy(&output.stderr),
+                output.status.code(),
+            )),
+            Err(error) => Err(GitError::from(error)),
+        };
+        if outcome.is_ok()
+            && let Some(staging_directory) = staging_directory.as_ref()
+        {
+            // Publica el clon terminado solo si el destino sigue libre. El temporal es
+            // propiedad exclusiva de esta operación y se limpia al fallar o cancelarse.
+            std::fs::rename(staging_directory.path(), destination).map_err(|source| {
+                GitError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        outcome
+    }
+
+    /// Lee la URL configurada para un remote concreto sin consultar la red.
+    pub fn remote_url(
+        &self,
+        repository_root: &Path,
+        remote_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitError> {
+        let output = self.run_git_read_only(
+            "git-remote-url",
+            repository_root,
+            ["remote", "get-url", remote_name],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::RemoteNotConfigured {
+                remote: remote_name.to_owned(),
+            });
+        }
+        decode_trimmed_stdout(&output, "git remote get-url")
+    }
+
     /// Ejecuta exclusivamente planes remotos creados por la capa tipada.
     pub fn execute_remote(
         &self,
@@ -1169,6 +1261,18 @@ fn validate_history_ref(reference: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Rechaza URLs y destinos que git podría interpretar como opciones aunque exista `--`.
+fn validate_clone_argument(value: &str) -> Result<(), GitError> {
+    if value.is_empty() || value.starts_with('-') || value.contains('\0') {
+        return Err(GitError::InvalidSshUrl {
+            message: format!(
+                "Argumento de clonado no admitido porque git lo interpretaría como opción: {value}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_oid(oid: &str) -> Result<String, GitError> {
     if !(4..=64).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(GitError::InvalidReferenceName {
@@ -1196,6 +1300,25 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    struct ConcurrentDestinationRunner {
+        destination: PathBuf,
+    }
+
+    impl ProcessRunner for ConcurrentDestinationRunner {
+        fn run(
+            &self,
+            _request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            std::fs::create_dir_all(&self.destination).expect("debe crear el destino concurrente");
+            std::fs::write(self.destination.join("datos-ajenos.txt"), b"conservar")
+                .expect("debe escribir los datos concurrentes");
+            Err(ProcessError::Spawn(std::io::Error::other(
+                "fallo de clone simulado",
+            )))
+        }
     }
 
     impl RecordingRunner {
@@ -1239,6 +1362,30 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+    }
+
+    #[test]
+    fn failed_clone_does_not_delete_a_destination_created_concurrently() {
+        let temporary = tempfile::tempdir().expect("debe crear el temporal");
+        let destination = temporary.path().join("working-copy");
+        let runner = Arc::new(ConcurrentDestinationRunner {
+            destination: destination.clone(),
+        });
+        let client = GitClient::with_runner(PathBuf::from("git"), runner);
+
+        client
+            .clone_repository(
+                "git@example.com:org/repo.git",
+                &destination,
+                &CancellationToken::default(),
+            )
+            .expect_err("el clone simulado debe fallar");
+
+        assert_eq!(
+            std::fs::read(destination.join("datos-ajenos.txt"))
+                .expect("los datos concurrentes deben sobrevivir"),
+            b"conservar"
+        );
     }
 
     #[test]

@@ -8,8 +8,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     actions::{
-        CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+        CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
+        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
+        ShowHistory,
     },
     cli::InstanceServer,
     ui::{CommitInput, MainWindow},
@@ -39,6 +40,7 @@ pub fn run(startup: AppStartup) {
         CommitInput::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenRepository, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-o", CloneRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-w", CloseActiveRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-tab", NextRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-tab", PreviousRepository, Some("GitHelper")),

@@ -84,7 +84,7 @@ La reutilización se organizará así:
 
 ### 3.2 Fuera del MVP
 
-- Clonar o inicializar repositorios.
+- Inicializar repositorios vacíos desde cero.
 - Crear, eliminar, fusionar o hacer checkout de ramas.
 - Rebase, cherry-pick, revert, stash y reset.
 - Edición de archivos.
@@ -96,6 +96,27 @@ La reutilización se organizará así:
 - Integración con GitHub, GitLab, Bitbucket o Azure DevOps.
 
 Estas funciones no deben añadirse durante el MVP salvo que sean necesarias para su arquitectura interna.
+
+### 3.3 Clonado por SSH (SSH-01)
+
+Git Helper admite obtener repositorios remotos accesibles mediante SSH sin un clonado manual previo fuera de la aplicación.
+
+Flujo:
+
+1. El usuario elige **Clonar repositorio** (`Ctrl+Shift+O`) e introduce una URL SSH (`git@host:org/repo.git` o `ssh://user@host/path/repo.git`).
+2. La aplicación valida el formato antes de tocar la red y rechaza esquemas no SSH (`https://`, `file://`, etc.).
+3. Se propone un destino bajo `%LOCALAPPDATA%\GitHelper\repos\<nombre>`. Con el selector nativo se elige la carpeta contenedora y el clon se crea dentro, en `<carpeta>\<nombre>`.
+4. Si el destino ya contiene un repositorio Git —no un subdirectorio de otro— con el mismo `origin` canónico, se ofrece abrirlo sin sobrescribir. Un destino ocupado por otro contenido o por otro `origin` se rechaza con un mensaje explícito.
+5. En caso contrario se ejecuta `git clone <url> <destino>` con progreso, cancelación y errores SSH accionables.
+6. Tras un clonado correcto se abre el repositorio en una pestaña y se persiste el par `(ssh_url_normalizada, ruta_local)` en `state.json`.
+
+Requisitos y limitaciones:
+
+- Git Helper usa el stack SSH del sistema (`GIT_SSH`, `~/.ssh/config`, `ssh-agent`); no almacena claves ni contraseñas.
+- Los errores frecuentes (host desconocido, clave ausente, timeout, host key changed) se resumen en la UI con indicaciones prácticas.
+- La URL se normaliza a `ssh://host[:puerto]/ruta` para comparar remotes: el puerto no estándar y el caso de la ruta forman parte de la identidad del repositorio.
+- Un clonado cancelado o fallido borra el destino que haya creado, de modo que el siguiente intento parte de cero.
+- HTTPS, editor de `~/.ssh/config`, gestión visual de claves y trabajo remoto sin clon local quedan fuera de alcance.
 
 ## 4. Experiencia de usuario
 
@@ -135,7 +156,9 @@ Al iniciar sin repositorios abiertos se mostrará:
 
 - Título y explicación breve.
 - Botón `Abrir repositorio`.
+- Botón `Clonar repositorio` para URLs SSH.
 - Lista opcional de repositorios recientes que sigan existiendo.
+- Lista opcional de clones SSH recientes cuya ruta local siga existiendo.
 
 El selector de carpeta debe ser nativo de Windows. Una carpeta es válida si:
 
@@ -340,6 +363,7 @@ referencias simbólicas se excluyen del inventario. Las referencias remotas repr
 | Atajo | Acción |
 |---|---|
 | `Ctrl+O` | Abrir repositorio |
+| `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar pestaña activa |
 | `Ctrl+Tab` | Siguiente repositorio |
 | `Ctrl+Shift+Tab` | Repositorio anterior |
@@ -606,10 +630,12 @@ Se persistirá:
 - Tema seleccionado.
 - Ruta configurada de Cursor CLI, si la hubiera.
 - Consentimiento informado para enviar contexto staged a Cursor.
+- Pares `(ssh_url_normalizada, ruta_local)` de clones SSH recientes.
+- Carpeta de clonado por defecto configurable.
 
 No se persistirán:
 
-- Credenciales.
+- Credenciales ni claves SSH.
 - Salida de comandos.
 - Contenido de archivos o contexto enviado a Cursor.
 - Mensajes de commit después de un commit correcto.
