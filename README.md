@@ -131,6 +131,8 @@ cargo test --all-targets --locked
 ```
 
 La generación reproducible del MSI se documenta en [docs/packaging.md](docs/packaging.md).
+La comprobación ligera de rendimiento del panel está en
+[docs/performance-check.md](docs/performance-check.md).
 
 ## Releases
 

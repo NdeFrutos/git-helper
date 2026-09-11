@@ -1485,6 +1485,24 @@ mod tests {
     }
 
     #[test]
+    fn lightweight_snapshot_skips_history_commands() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        let snapshot = client
+            .snapshot(Path::new("repo"), &CancellationToken::default())
+            .unwrap();
+
+        assert!(snapshot.changes.is_empty());
+        assert!(
+            runner
+                .requests()
+                .iter()
+                .all(|request| !request.label.starts_with("git-history"))
+        );
+    }
+
+    #[test]
     fn optional_locks_are_disabled_only_for_read_only_commands() {
         let runner = Arc::new(RecordingRunner::default());
         let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());

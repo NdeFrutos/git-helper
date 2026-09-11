@@ -1,11 +1,35 @@
 # Auditoría de rendimiento — Git Helper
 
-Fecha: 2026-09-10 · Rama: `main` @ `714a7ba` · Autor: auditoría automatizada
-Estado: **informe solamente, no se ha modificado ni una línea de código de la aplicación.**
+| Campo | Valor |
+|---|---|
+| Informe original | 2026-09-10 · `714a7ba` · auditoría automatizada |
+| Baseline medido | `714a7ba` — cifras de §3 **no** aplican al código actual |
+| Revisión de seguimiento | Ver SHA en [performance-check.md](performance-check.md) / `perf-report.json` |
+| Procedimiento reproducible | [performance-check.md](performance-check.md) · `scripts/perf/` · `examples/bench.rs` |
+
+Estado del informe original: hallazgos de código; las correcciones se implementaron en issues
+PERF-02 y relacionadas. La tabla siguiente resume el estado **al cierre de PERF-01**.
+
+### Estado de hallazgos (seguimiento)
+
+| Hallazgo | Prioridad | Estado | Notas |
+|---|---|---|---|
+| §4.1 Snapshot serializa procesos e incluye historial | CRÍTICO | **Resuelto** | Historial diferido; `status`/`remotes`/`branches` en paralelo; sin `has_head` previo al log |
+| §4.2 Watcher autoalimentado y sin filtrado | CRÍTICO | **Resuelto** | `GIT_OPTIONAL_LOCKS=0` en lecturas; filtrado de rutas; omitir `notify()` si snapshot igual |
+| §4.3 Hover re-renderiza ventana completa | ALTO | **Parcial** | `Arc<RepositorySnapshot>` y caché de filas; entidades GPUI separadas pendientes |
+| §4.4 Sondeo fijo 25 ms en procesos | MEDIO | **Resuelto** | Backoff adaptativo en `process.rs` |
+| §4.5 Cerrar pestaña bloquea UI ~1 s | ALTO | **Resuelto** | Canal unificado `WorkerMessage::Stop` |
+| §4.6 `fsync` sincrónico al cambiar pestaña | MEDIO | **Parcial** | Guardado en background con debounce; `sync_all()` persiste en `save()` |
+| §4.7 Disco antes del primer pixel | MEDIO | **Parcial** | `load()`/`is_dir()` en background; `detect_version` en paralelo, no bloquea snapshots |
+| §4.8 Fuga de suscripciones de commit | BAJO | **Resuelto** | `HashMap<RepositoryId, Subscription>` limpiado en `close_repository` |
+| §4.9 Tecla en commit re-renderiza todo | BAJO | **Mitigado** | Depende de §4.3; render más barato con `Arc` |
+
+**Pendiente de reproducción en Windows:** validar p95 de pestañas, scroll con 2.000 cambios y
+procesos idle con el procedimiento de [performance-check.md](performance-check.md).
 
 ---
 
-## 1. Veredicto
+## 1. Veredicto (baseline `714a7ba`)
 
 El problema **no es Rust ni GPUI**. Es que la aplicación gasta casi todo su tiempo esperando a
 procesos `git.exe`, y los lanza de forma secuencial, redundante y en bucle.
@@ -453,45 +477,20 @@ Git Helper. Guarda un fichero:
 
 ## 7. Reproducir las mediciones
 
-Los ficheros temporales que usé ya están borrados. Para rehacerlas, `examples/bench.rs` en el
-proyecto (requiere añadir `examples/` temporalmente):
+El procedimiento vigente está en [performance-check.md](performance-check.md). Resumen:
 
-```rust
-use std::{path::PathBuf, time::Instant};
-use git_helper::{git::GitClient, process::CancellationToken};
-
-fn t<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    let start = Instant::now();
-    let value = f();
-    println!("  {label:<26} {:>7.1} ms", start.elapsed().as_secs_f64() * 1000.0);
-    value
-}
-
-fn main() {
-    let root = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| ".".to_owned()))
-        .canonicalize().unwrap();
-    let client = GitClient::default();
-    let token = CancellationToken::default();
-    let _ = client.detect_version(&token);
-    println!("-- coste puro de lanzar un proceso --");
-    for _ in 0..5 { t("git --version", || client.detect_version(&token).unwrap()); }
-    println!("-- componentes del snapshot --");
-    for _ in 0..2 {
-        t("status", || client.status(&root, &token).unwrap());
-        t("remotes", || client.remotes(&root, &token).unwrap());
-        t("has_head", || client.has_head(&root, &token).unwrap());
-        t("history(201)", || client.history(&root, 201, 0, &token).unwrap());
-    }
-    println!("-- snapshot completo = coste de un refresco --");
-    for _ in 0..3 { t("snapshot", || client.snapshot(&root, 200, &token).unwrap()); }
-}
+```powershell
+.\scripts\perf\Run-PerfCheck.ps1 -OutputRoot .\perf-results
 ```
 
-```sh
-cargo build --release --example bench && ./target/release/examples/bench.exe .
+Benchmark headless (capa Git, p50/p95, sobrecoste stage vs CLI):
+
+```powershell
+cargo build --release --locked --example bench
+.\target\release\examples\bench.exe .\perf-fixtures\clean --iterations 40 --json
 ```
 
-Y la comprobación del bucle del watcher, que es la más importante y la más rápida:
+Comprobación del bucle del watcher (sigue siendo válida tras `GIT_OPTIONAL_LOCKS=0`):
 
 ```sh
 touch src/lib.rs; stat -c '%y' .git/index

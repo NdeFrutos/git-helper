@@ -463,7 +463,41 @@ impl MainWindow {
             .ok();
         })
         .detach();
+
+        self.open_perf_repository_hook(cx);
     }
+
+    /// Abre automáticamente el repositorio indicado en `GH_PERF_OPEN_REPO`.
+    ///
+    /// Solo existe en binarios construidos con la feature `perf-hooks`, para que
+    /// la variable de entorno no pueda alterar el arranque del binario publicado.
+    #[cfg(feature = "perf-hooks")]
+    fn open_perf_repository_hook(&mut self, cx: &mut Context<Self>) {
+        let Some(perf_repository) = std::env::var_os("GH_PERF_OPEN_REPO") else {
+            return;
+        };
+        let repository_path = PathBuf::from(perf_repository);
+        let git_client = self.git_client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.discover_repository(&repository_path, &CancellationToken::default())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Ok(root_path) = result {
+                    // El gancho abre siempre una ruta local del fixture: no hay URL SSH.
+                    this.finish_open_repository(root_path, None, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    #[cfg(not(feature = "perf-hooks"))]
+    fn open_perf_repository_hook(&mut self, _cx: &mut Context<Self>) {}
 
     fn active_repository(&self) -> Option<&RepositorySession> {
         let active_id = self.state.active_repository_id?;
