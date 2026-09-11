@@ -21,8 +21,8 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
-        FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
-        RepositorySession, RepositorySnapshot, RepositoryView,
+        FileChange, HeadState, HistorySnapshot, MutationState, OperationKind, RefreshState,
+        RepositoryId, RepositorySession, RepositoryView, WorkingTreeSnapshot,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
     persistence::{AppStateStore, PersistedAppState},
@@ -40,6 +40,7 @@ use super::{
 };
 
 const INITIAL_HISTORY_LIMIT: usize = 200;
+const MAX_CACHED_COMMIT_DETAILS: usize = 32;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
 const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 40;
 const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 40;
@@ -104,6 +105,46 @@ struct PreparedRefresh {
     cancellation: CancellationToken,
 }
 
+enum RefreshPayload {
+    WorkingTree(WorkingTreeSnapshot),
+    WithHistory {
+        working_tree: WorkingTreeSnapshot,
+        history: HistorySnapshot,
+    },
+}
+
+/// Caché acotada de detalles de commit por repositorio.
+#[derive(Clone, Debug, Default)]
+struct CommitDetailsCache {
+    entries: HashMap<String, CommitDetails>,
+    order: Vec<String>,
+}
+
+impl CommitDetailsCache {
+    fn get(&self, commit_id: &str) -> Option<&CommitDetails> {
+        self.entries.get(commit_id)
+    }
+
+    fn insert(&mut self, details: CommitDetails) {
+        let commit_id = details.summary.id.clone();
+        if self.entries.contains_key(&commit_id) {
+            self.entries.insert(commit_id.clone(), details);
+            self.order.retain(|existing| existing != &commit_id);
+            self.order.push(commit_id);
+            return;
+        }
+        while self.entries.len() >= MAX_CACHED_COMMIT_DETAILS {
+            let Some(oldest) = self.order.first().cloned() else {
+                break;
+            };
+            self.order.remove(0);
+            self.entries.remove(&oldest);
+        }
+        self.order.push(commit_id.clone());
+        self.entries.insert(commit_id, details);
+    }
+}
+
 enum GenerationPreparationError {
     StagedChanged,
     Message(String),
@@ -125,7 +166,7 @@ pub struct MainWindow {
     cursor_client: CursorClient,
     state_store: Option<AppStateStore>,
     commit_inputs: HashMap<RepositoryId, Entity<CommitInput>>,
-    selected_commit_details: HashMap<RepositoryId, CommitDetails>,
+    commit_details_cache: HashMap<RepositoryId, CommitDetailsCache>,
     commit_input_subscriptions: HashMap<RepositoryId, Subscription>,
     window_subscriptions: Vec<Subscription>,
     active_refresh_cancellations: HashMap<RepositoryId, CancellationToken>,
@@ -161,7 +202,7 @@ impl MainWindow {
             cursor_client: CursorClient::new(PathBuf::from("agent")),
             state_store,
             commit_inputs: HashMap::new(),
-            selected_commit_details: HashMap::new(),
+            commit_details_cache: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -440,7 +481,7 @@ impl MainWindow {
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
-        self.selected_commit_details.remove(&repository_id);
+        self.commit_details_cache.remove(&repository_id);
         self.repository_watchers.remove(&repository_id);
         self.pending_refreshes.remove(&repository_id);
         if self.global_refresh_in_flight == Some(repository_id) {
@@ -559,19 +600,21 @@ impl MainWindow {
             let result = cx
                 .background_spawn(async move {
                     if include_history {
-                        git_client.snapshot_with_history(
-                            &root_path,
-                            INITIAL_HISTORY_LIMIT,
-                            &cancellation,
-                        )
+                        git_client
+                            .snapshot_with_history(&root_path, INITIAL_HISTORY_LIMIT, &cancellation)
+                            .map(|(working_tree, history)| RefreshPayload::WithHistory {
+                                working_tree,
+                                history,
+                            })
                     } else {
-                        git_client.snapshot(&root_path, &cancellation)
+                        git_client
+                            .snapshot(&root_path, &cancellation)
+                            .map(RefreshPayload::WorkingTree)
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let outcome =
-                    this.finish_refresh(repository_id, generation, include_history, result);
+                let outcome = this.finish_refresh(repository_id, generation, result);
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
@@ -774,8 +817,7 @@ impl MainWindow {
         &mut self,
         repository_id: RepositoryId,
         generation: u64,
-        history_included: bool,
-        result: Result<RepositorySnapshot, GitError>,
+        result: Result<RefreshPayload, GitError>,
     ) -> RefreshOutcome {
         if self.global_refresh_in_flight == Some(repository_id) {
             self.global_refresh_in_flight = None;
@@ -800,30 +842,32 @@ impl MainWindow {
         let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
         repository.history_invalidated_during_refresh = false;
         match result {
-            Ok(mut snapshot) => {
-                let history_changed = repository.snapshot.head != snapshot.head
-                    || repository.snapshot.upstream != snapshot.upstream;
-                if history_included {
+            Ok(payload) => {
+                let (working_tree, incoming_history) = match payload {
+                    RefreshPayload::WorkingTree(working_tree) => (working_tree, None),
+                    RefreshPayload::WithHistory {
+                        working_tree,
+                        history,
+                    } => (working_tree, Some(history)),
+                };
+                let history_changed = repository.working_tree.head != working_tree.head
+                    || repository.working_tree.upstream != working_tree.upstream;
+                let working_tree_changed = repository.working_tree.as_ref() != &working_tree;
+                if working_tree_changed {
+                    repository.working_tree = Arc::new(working_tree);
+                    repository.change_counters = repository.working_tree.change_counters();
+                    self.change_rows.remove(&repository_id);
+                }
+                if let Some(history) = incoming_history {
+                    repository.history = Arc::new(history);
                     repository.history_loaded = !history_invalidated_during_refresh;
                     repository.history_loading = false;
                 } else if history_changed || history_invalidated_during_refresh {
                     repository.history_generation = repository.history_generation.saturating_add(1);
                     repository.history_loaded = false;
                     repository.history_loading = false;
-                } else {
-                    snapshot.commits.clone_from(&repository.snapshot.commits);
-                    snapshot.has_more_commits = repository.snapshot.has_more_commits;
-                    snapshot
-                        .history_reference
-                        .clone_from(&repository.snapshot.history_reference);
-                    snapshot
-                        .history_oid
-                        .clone_from(&repository.snapshot.history_oid);
-                }
-                let snapshot_changed = *repository.snapshot != snapshot;
-                if snapshot_changed {
-                    repository.snapshot = Arc::new(snapshot);
-                    self.change_rows.remove(&repository_id);
+                    repository.history = Arc::new(HistorySnapshot::empty());
+                    self.commit_details_cache.remove(&repository_id);
                 }
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
@@ -831,7 +875,7 @@ impl MainWindow {
                 repository.status_message = "Estado actualizado".to_owned();
                 repository.error = None;
                 if history_changed {
-                    self.selected_commit_details.remove(&repository_id);
+                    self.commit_details_cache.remove(&repository_id);
                 }
                 RefreshOutcome {
                     succeeded: true,
@@ -845,7 +889,7 @@ impl MainWindow {
             }
             Err(error) => {
                 let details = error.technical_details();
-                if history_included {
+                if repository.history_loading {
                     repository.history_loading = false;
                 }
                 let is_cancelled = is_cancelled_error(&error);
@@ -902,12 +946,8 @@ impl MainWindow {
         if repository.refresh_coordinator.in_flight() {
             repository.history_invalidated_during_refresh = true;
         }
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.commits.clear();
-        snapshot.has_more_commits = false;
-        snapshot.history_reference = None;
-        snapshot.history_oid = None;
-        self.selected_commit_details.remove(&repository_id);
+        repository.history = Arc::new(HistorySnapshot::empty());
+        self.commit_details_cache.remove(&repository_id);
     }
 
     fn ensure_history_loaded(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -925,7 +965,8 @@ impl MainWindow {
         {
             return;
         }
-        let Some((reference, expected_oid)) = history_target_for_head(&repository.snapshot.head)
+        let Some((reference, expected_oid)) =
+            history_target_for_head(&repository.working_tree.head)
         else {
             repository.history_loaded = true;
             return;
@@ -935,9 +976,11 @@ impl MainWindow {
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
         repository.error = None;
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.history_reference = Some(reference.clone());
-        snapshot.history_oid = Some(expected_oid.clone());
+        {
+            let history = Arc::make_mut(&mut repository.history);
+            history.history_reference = Some(reference.clone());
+            history.history_oid = Some(expected_oid.clone());
+        }
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.notify();
@@ -971,16 +1014,8 @@ impl MainWindow {
                     Ok(page)
                         if history_target_is_current(repository, &page.reference, &page.oid) =>
                     {
-                        let snapshot = Arc::make_mut(&mut repository.snapshot);
-                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
-                        snapshot.commits = page
-                            .commits
-                            .into_iter()
-                            .take(INITIAL_HISTORY_LIMIT)
-                            .map(|commit| commit.summary)
-                            .collect();
-                        snapshot.history_reference = Some(page.reference);
-                        snapshot.history_oid = Some(page.oid);
+                        repository.history =
+                            Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
                         repository.error = None;
@@ -1065,7 +1100,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = !matches!(repository.working_tree.head, HeadState::Unborn);
         let is_directory = repository.root_path.join(&change.path).is_dir();
         let plan = match plan_discard(change, discard_staged, has_head, is_directory) {
             Ok(plan) => plan,
@@ -1136,10 +1171,10 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = !matches!(repository.working_tree.head, HeadState::Unborn);
         let mut planned_paths = HashSet::new();
         let mut plans = Vec::new();
-        for change in &repository.snapshot.changes {
+        for change in &repository.working_tree.changes {
             if change.is_conflicted || !planned_paths.insert(change.path.clone()) {
                 continue;
             }
@@ -1261,12 +1296,7 @@ impl MainWindow {
         };
         let repository_id = repository.id;
         let root_path = repository.root_path.clone();
-        if !repository
-            .snapshot
-            .changes
-            .iter()
-            .any(FileChange::has_staged_change)
-        {
+        if repository.change_counters.staged_count == 0 {
             if let Some(repository) = self
                 .state
                 .repositories
@@ -1666,8 +1696,8 @@ impl MainWindow {
             return;
         }
         let plan = plan_fetch(
-            repository.snapshot.upstream.as_ref(),
-            &repository.snapshot.remotes,
+            repository.working_tree.upstream.as_ref(),
+            &repository.working_tree.remotes,
             None,
         );
         match plan {
@@ -1690,7 +1720,7 @@ impl MainWindow {
         if !repository.can_mutate() {
             return;
         }
-        let plan = plan_pull(repository.snapshot.upstream.as_ref());
+        let plan = plan_pull(repository.working_tree.upstream.as_ref());
         self.run_remote_plan(repository_id, OperationKind::Pull, plan, cx);
     }
 
@@ -1707,9 +1737,9 @@ impl MainWindow {
             return;
         }
         let plan = plan_push(
-            &repository.snapshot.head,
-            repository.snapshot.upstream.as_ref(),
-            &repository.snapshot.remotes,
+            &repository.working_tree.head,
+            repository.working_tree.upstream.as_ref(),
+            &repository.working_tree.remotes,
             None,
         );
         match plan {
@@ -1767,14 +1797,14 @@ impl MainWindow {
                 };
                 let plan = match kind {
                     OperationKind::Fetch => plan_fetch(
-                        repository.snapshot.upstream.as_ref(),
-                        &repository.snapshot.remotes,
+                        repository.working_tree.upstream.as_ref(),
+                        &repository.working_tree.remotes,
                         Some(&remote_name),
                     ),
                     OperationKind::Push => plan_push(
-                        &repository.snapshot.head,
-                        repository.snapshot.upstream.as_ref(),
-                        &repository.snapshot.remotes,
+                        &repository.working_tree.head,
+                        repository.working_tree.upstream.as_ref(),
+                        &repository.working_tree.remotes,
                         Some(&remote_name),
                     ),
                     _ => return,
@@ -2052,7 +2082,7 @@ impl MainWindow {
                     .unwrap_or("Repositorio")
                     .to_owned();
                 let full_path = repository.root_path.display().to_string();
-                let change_count = repository.snapshot.changes.len();
+                let change_count = repository.working_tree.changes.len();
                 div()
                     .id(format!("repository-tab-{repository_id:?}"))
                     .flex()
@@ -2117,12 +2147,12 @@ impl MainWindow {
 
     fn render_toolbar(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
         let repository_id = repository.id;
-        let branch = match &repository.snapshot.head {
+        let branch = match &repository.working_tree.head {
             HeadState::Branch { name, .. } => name.clone(),
             HeadState::Detached { .. } => "HEAD separado".to_owned(),
             HeadState::Unborn => "Sin commit inicial".to_owned(),
         };
-        let upstream = repository.snapshot.upstream.as_ref().map(|upstream| {
+        let upstream = repository.working_tree.upstream.as_ref().map(|upstream| {
             format!(
                 "{}  ↑{} ↓{}",
                 upstream.full_name, upstream.ahead, upstream.behind
@@ -2217,7 +2247,7 @@ impl MainWindow {
         repository: &RepositorySession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let count = repository.snapshot.changes.len();
+        let count = repository.change_counters.change_count;
         div()
             .flex()
             .h(px(36.0))
@@ -2254,7 +2284,7 @@ impl MainWindow {
         if !self.change_rows.contains_key(&repository.id) {
             let rows = Arc::new(build_change_rows(
                 repository.id,
-                &repository.snapshot.changes,
+                &repository.working_tree.changes,
                 &self.collapsed_groups,
             ));
             self.change_rows.insert(repository.id, rows);
@@ -2267,12 +2297,7 @@ impl MainWindow {
         let row_count = rows.len();
         let repository_id = repository.id;
         let input = self.commit_inputs.get(&repository_id).cloned();
-        let staged_count = repository
-            .snapshot
-            .changes
-            .iter()
-            .filter(|change| change.has_staged_change())
-            .count();
+        let staged_count = repository.change_counters.staged_count;
         let can_mutate = repository.can_mutate();
         let message_is_empty = input
             .as_ref()
@@ -2333,7 +2358,8 @@ impl MainWindow {
                                         action_button(
                                             "discard-all",
                                             "Descartar todo",
-                                            !repository.snapshot.changes.is_empty() && can_mutate,
+                                            !repository.working_tree.changes.is_empty()
+                                                && can_mutate,
                                         )
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
@@ -2579,7 +2605,7 @@ impl MainWindow {
             return;
         };
         let Some(current_branch) = repository
-            .snapshot
+            .working_tree
             .branches
             .iter()
             .find(|current| current.full_name == branch.full_name)
@@ -2599,12 +2625,13 @@ impl MainWindow {
         repository.history_loaded = branch.oid.is_none();
         repository.history_loading = branch.oid.is_some();
         repository.selected_commit = None;
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.commits.clear();
-        snapshot.has_more_commits = false;
-        snapshot.history_reference = Some(branch.full_name.clone());
-        snapshot.history_oid.clone_from(&branch.oid);
-        self.selected_commit_details.remove(&repository_id);
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(Vec::new()),
+            has_more_commits: false,
+            history_reference: Some(branch.full_name.clone()),
+            history_oid: branch.oid.clone(),
+        });
+        self.commit_details_cache.remove(&repository_id);
         let Some(expected_oid) = branch.oid else {
             repository.status_message = "La rama no tiene commits".to_owned();
             repository.error = None;
@@ -2652,16 +2679,8 @@ impl MainWindow {
                                 &page.oid,
                             ) =>
                     {
-                        let snapshot = Arc::make_mut(&mut repository.snapshot);
-                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
-                        snapshot.commits = page
-                            .commits
-                            .into_iter()
-                            .take(INITIAL_HISTORY_LIMIT)
-                            .map(|commit| commit.summary)
-                            .collect();
-                        snapshot.history_reference = Some(page.reference);
-                        snapshot.history_oid = Some(page.oid);
+                        repository.history =
+                            Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
                         repository.error = None;
@@ -2702,6 +2721,14 @@ impl MainWindow {
             return;
         };
         repository.selected_commit = Some(commit_id.clone());
+        if self
+            .commit_details_cache
+            .get(&repository_id)
+            .is_some_and(|cache| cache.get(&commit_id).is_some())
+        {
+            cx.notify();
+            return;
+        }
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.spawn(async move |this, cx| {
@@ -2713,7 +2740,10 @@ impl MainWindow {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(details) => {
-                        this.selected_commit_details.insert(repository_id, details);
+                        this.commit_details_cache
+                            .entry(repository_id)
+                            .or_default()
+                            .insert(details);
                         if let Some(repository) = this
                             .state
                             .repositories
@@ -2754,8 +2784,8 @@ impl MainWindow {
             return;
         }
         let (Some(reference), Some(oid)) = (
-            repository.snapshot.history_reference.clone(),
-            repository.snapshot.history_oid.clone(),
+            repository.history.history_reference.clone(),
+            repository.history.history_oid.clone(),
         ) else {
             repository.error = Some("No hay una referencia de historial seleccionada".to_owned());
             cx.notify();
@@ -2764,7 +2794,7 @@ impl MainWindow {
         repository.history_loading = true;
         let generation = repository.history_generation;
         let root_path = repository.root_path.clone();
-        let offset = repository.snapshot.commits.len();
+        let offset = repository.history.commits.len();
         let git_client = self.git_client.clone();
         repository.status_message = "Cargando más commits…".to_owned();
         repository.error = None;
@@ -2801,13 +2831,14 @@ impl MainWindow {
                             {
                                 return;
                             }
-                            Arc::make_mut(&mut repository.snapshot).commits.extend(
+                            let history = Arc::make_mut(&mut repository.history);
+                            Arc::make_mut(&mut history.commits).extend(
                                 page.commits
                                     .into_iter()
                                     .take(INITIAL_HISTORY_LIMIT)
                                     .map(|commit| commit.summary),
                             );
-                            Arc::make_mut(&mut repository.snapshot).has_more_commits = has_more;
+                            history.has_more_commits = has_more;
                             repository.history_loaded = true;
                             repository.history_loading = false;
                             repository.status_message = "Historial actualizado".to_owned();
@@ -2836,14 +2867,19 @@ impl MainWindow {
     }
 
     fn render_history(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
-        let snapshot = Arc::clone(&repository.snapshot);
-        let count = snapshot.commits.len();
+        let commits = Arc::clone(&repository.history.commits);
+        let count = commits.len();
         let repository_id = repository.id;
         let selected_commit = repository.selected_commit.clone();
-        let has_more = repository.snapshot.has_more_commits;
-        let selected_reference = repository.snapshot.history_reference.clone();
-        let branches = repository.snapshot.branches.clone();
-        let details = self.selected_commit_details.get(&repository_id).cloned();
+        let has_more = repository.history.has_more_commits;
+        let selected_reference = repository.history.history_reference.clone();
+        let branches = repository.working_tree.branches.clone();
+        let details = repository.selected_commit.as_ref().and_then(|commit_id| {
+            self.commit_details_cache
+                .get(&repository_id)?
+                .get(commit_id)
+                .cloned()
+        });
         div()
             .flex()
             .flex_col()
@@ -2907,7 +2943,7 @@ impl MainWindow {
                     "history-list",
                     count,
                     cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
-                        snapshot.commits[range]
+                        commits[range]
                             .iter()
                             .map(|commit| {
                                 let commit_id = commit.id.clone();
@@ -3141,8 +3177,24 @@ fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
 }
 
 fn history_target_is_current(repository: &RepositorySession, reference: &str, oid: &str) -> bool {
-    repository.snapshot.history_reference.as_deref() == Some(reference)
-        && repository.snapshot.history_oid.as_deref() == Some(oid)
+    repository.history.history_reference.as_deref() == Some(reference)
+        && repository.history.history_oid.as_deref() == Some(oid)
+}
+
+fn history_snapshot_from_page(page: crate::domain::HistoryPage, limit: usize) -> HistorySnapshot {
+    let has_more_commits = page.commits.len() > limit;
+    HistorySnapshot {
+        commits: Arc::new(
+            page.commits
+                .into_iter()
+                .take(limit)
+                .map(|commit| commit.summary)
+                .collect(),
+        ),
+        has_more_commits,
+        history_reference: Some(page.reference),
+        history_oid: Some(page.oid),
+    }
 }
 
 const fn branch_kind_label(kind: BranchKind) -> &'static str {
@@ -3378,7 +3430,10 @@ mod tests {
         thread,
     };
 
-    use crate::process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
+    use crate::{
+        domain::CommitSummary,
+        process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner},
+    };
 
     use super::*;
 
@@ -3427,7 +3482,7 @@ mod tests {
             cursor_client: CursorClient::new(PathBuf::from("agent")),
             state_store: None,
             commit_inputs: HashMap::new(),
-            selected_commit_details: HashMap::new(),
+            commit_details_cache: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -3462,7 +3517,6 @@ mod tests {
 
         let first = window.prepare_refresh(repository_id).unwrap();
         let first_generation = first.generation;
-        let first_include_history = first.include_history;
         let first_snapshot =
             thread::spawn(move || git_client.snapshot(&first.root_path, &first.cancellation));
         started_receiver.recv().unwrap();
@@ -3475,8 +3529,7 @@ mod tests {
         let first_outcome = window.finish_refresh(
             repository_id,
             first_generation,
-            first_include_history,
-            first_result,
+            first_result.map(RefreshPayload::WorkingTree),
         );
         assert_eq!(first_outcome.continuation, RefreshContinuation::Repeat);
 
@@ -3487,8 +3540,7 @@ mod tests {
         let follow_up_outcome = window.finish_refresh(
             repository_id,
             follow_up.generation,
-            follow_up.include_history,
-            follow_up_result,
+            follow_up_result.map(RefreshPayload::WorkingTree),
         );
 
         assert_eq!(
@@ -3503,13 +3555,13 @@ mod tests {
             .find(|repository| repository.id == repository_id)
             .unwrap();
         assert_eq!(
-            repository.snapshot.head,
+            repository.working_tree.head,
             HeadState::Branch {
                 name: "main".to_owned(),
                 oid: Some("new".to_owned()),
             }
         );
-        assert_eq!(repository.snapshot.changes.len(), 1);
+        assert_eq!(repository.working_tree.changes.len(), 1);
     }
 
     #[test]
@@ -3527,21 +3579,20 @@ mod tests {
         let outcome = window.finish_refresh(
             old_id,
             pending.generation,
-            pending.include_history,
-            Ok(RepositorySnapshot {
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
                 head: HeadState::Branch {
                     name: "stale".to_owned(),
                     oid: Some("old".to_owned()),
                 },
-                ..RepositorySnapshot::default()
-            }),
+                ..WorkingTreeSnapshot::default()
+            })),
         );
 
         assert!(!outcome.succeeded);
         assert!(!window.repository_session_is_open(old_id));
         assert!(window.repository_session_is_open(reopened_id));
         assert_eq!(
-            window.state.repositories[0].snapshot.head,
+            window.state.repositories[0].working_tree.head,
             HeadState::Unborn
         );
     }
@@ -3607,7 +3658,6 @@ mod tests {
         let outcome = window.finish_refresh(
             second_id,
             pending.generation,
-            pending.include_history,
             Err(GitError::InvalidStatus {
                 message: "respuesta rota".to_owned(),
             }),
@@ -3636,9 +3686,9 @@ mod tests {
     fn rapid_branch_selection_rejects_the_previous_response() {
         let mut repository = RepositorySession::new(PathBuf::from("repo"));
         {
-            let snapshot = Arc::make_mut(&mut repository.snapshot);
-            snapshot.history_reference = Some("refs/heads/first".to_owned());
-            snapshot.history_oid = Some("1111".to_owned());
+            let history = Arc::make_mut(&mut repository.history);
+            history.history_reference = Some("refs/heads/first".to_owned());
+            history.history_oid = Some("1111".to_owned());
         }
         assert!(history_target_is_current(
             &repository,
@@ -3647,9 +3697,9 @@ mod tests {
         ));
 
         {
-            let snapshot = Arc::make_mut(&mut repository.snapshot);
-            snapshot.history_reference = Some("refs/heads/second".to_owned());
-            snapshot.history_oid = Some("2222".to_owned());
+            let history = Arc::make_mut(&mut repository.history);
+            history.history_reference = Some("refs/heads/second".to_owned());
+            history.history_oid = Some("2222".to_owned());
         }
         assert!(!history_target_is_current(
             &repository,
@@ -3697,14 +3747,136 @@ mod tests {
         window.finish_refresh(
             first_id,
             first_refresh.generation,
-            first_refresh.include_history,
-            Ok(RepositorySnapshot::default()),
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot::default())),
         );
         let second_refresh = window.prepare_refresh(second_id).unwrap();
 
         assert_eq!(window.global_refresh_in_flight, Some(second_id));
         assert!(!window.pending_refreshes.contains(&second_id));
         assert!(second_refresh.generation > 0);
+    }
+
+    fn sample_commit_summary(index: usize) -> CommitSummary {
+        CommitSummary {
+            id: format!("commit-{index:05}"),
+            short_id: format!("{index:05}"),
+            subject: format!("Subject {index}"),
+            author_name: "Author".to_owned(),
+            author_email: "author@example.com".to_owned(),
+            authored_at: i64::try_from(index).unwrap_or(0),
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn working_tree_refresh_preserves_large_history_without_cloning() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let large_commits = Arc::new(
+            (0..10_000)
+                .map(sample_commit_summary)
+                .collect::<Vec<CommitSummary>>(),
+        );
+        let mut repository = repository;
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::clone(&large_commits),
+            has_more_commits: true,
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("abcd".to_owned()),
+        });
+        repository.history_loaded = true;
+        let history_before = Arc::clone(&repository.history);
+        let commits_before = Arc::clone(&repository.history.commits);
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        let outcome = window.finish_refresh(
+            repository_id,
+            pending.generation,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
+                changes: vec![FileChange {
+                    path: PathBuf::from("changed.txt"),
+                    original_path: None,
+                    index_status: ChangeKind::Unmodified,
+                    worktree_status: ChangeKind::Modified,
+                    is_conflicted: false,
+                }],
+                ..WorkingTreeSnapshot::default()
+            })),
+        );
+
+        assert!(outcome.succeeded);
+        let repository = window
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        assert_eq!(repository.working_tree.changes.len(), 1);
+        assert_eq!(repository.history.commits.len(), 10_000);
+        assert!(Arc::ptr_eq(&repository.history, &history_before));
+        assert!(Arc::ptr_eq(&repository.history.commits, &commits_before));
+    }
+
+    #[test]
+    fn finish_refresh_comparison_cost_is_bounded_with_large_history() {
+        let large_commits = Arc::new(
+            (0..10_000)
+                .map(sample_commit_summary)
+                .collect::<Vec<CommitSummary>>(),
+        );
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::clone(&large_commits),
+            has_more_commits: true,
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("abcd".to_owned()),
+        });
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+        let incoming = WorkingTreeSnapshot {
+            changes: vec![FileChange {
+                path: PathBuf::from("changed.txt"),
+                original_path: None,
+                index_status: ChangeKind::Unmodified,
+                worktree_status: ChangeKind::Modified,
+                is_conflicted: false,
+            }],
+            ..WorkingTreeSnapshot::default()
+        };
+
+        let start = std::time::Instant::now();
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            Ok(RefreshPayload::WorkingTree(incoming)),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 50,
+            "finish_refresh tardó {elapsed:?}; no debe escalar con el historial cargado"
+        );
+    }
+
+    #[test]
+    fn commit_details_cache_evicts_oldest_entry() {
+        let mut cache = CommitDetailsCache::default();
+        for index in 0..=MAX_CACHED_COMMIT_DETAILS {
+            cache.insert(CommitDetails {
+                summary: sample_commit_summary(index),
+                body: String::new(),
+                committer_name: String::new(),
+                committer_email: String::new(),
+                committed_at: 0,
+                parent_ids: Vec::new(),
+            });
+        }
+
+        assert_eq!(cache.entries.len(), MAX_CACHED_COMMIT_DETAILS);
+        assert!(!cache.entries.contains_key("commit-00000"));
+        assert!(cache.entries.contains_key("commit-00032"));
     }
 
     #[test]

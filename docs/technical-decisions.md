@@ -114,6 +114,22 @@ El esquema actual es la versión 1. `state.json` se escribe mediante un archivo 
 y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
 continúa con estado vacío.
 
+## Working tree e historial desacoplados (PERF-03)
+
+Cada `RepositorySession` separa `working_tree` (`Arc<WorkingTreeSnapshot>`) e `history`
+(`Arc<HistorySnapshot>`). Un refresh de lectura solo compara y sustituye el working tree; el
+historial paginado permanece intacto salvo invalidación explícita (cambio de `HEAD`/upstream,
+selección de otra rama o carga diferida). Los commits se almacenan en `Arc<Vec<CommitSummary>>`
+para que `render_history` y la paginación no clonen miles de filas en cada frame.
+
+Los contadores de la pestaña Cambios (`change_count`, `staged_count`) se derivan una vez al
+actualizar el working tree. Los detalles de commit se cachean por repositorio con un límite fijo
+(32 entradas, LRU) para evitar clonados profundos al alternar selección.
+
+Mediciones en pruebas unitarias (`finish_refresh_comparison_cost_is_bounded_with_large_history`):
+con 10 000 commits cargados, `finish_refresh` tras un cambio del working tree completa en menos de
+50 ms porque ya no recorre ni compara la lista de commits.
+
 ## Estados de interacción por repositorio
 
 Cada `RepositorySession` mantiene por separado `refresh_state` y `mutation_state`. El refresh
