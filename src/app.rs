@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::OnceLock};
 
+use async_channel::unbounded;
 use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, point, px, size};
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -7,9 +8,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     actions::{
-        CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+        CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
+        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
+        ShowHistory,
     },
+    cli::InstanceServer,
     persistence::{
         AppStateStore, DisplayBounds, LoadedState, PersistedAppState, WindowPlacement,
         default_window_placement, validate_window_placement,
@@ -19,14 +22,29 @@ use crate::{
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
+/// Configuración de arranque de la aplicación gráfica.
+#[derive(Clone, Debug, Default)]
+pub struct AppStartup {
+    /// Repositorio que debe abrirse al iniciar, si se invocó desde la CLI.
+    pub open_repository: Option<PathBuf>,
+}
+
 /// Inicia la aplicación y crea su ventana principal.
-pub fn run() {
+pub fn run(startup: AppStartup) {
     initialize_logging();
 
-    gpui_platform::application().run(|cx: &mut App| {
+    let (instance_sender, instance_receiver) = unbounded();
+    let _instance_server = InstanceServer::start(instance_sender)
+        .inspect_err(
+            |error| error!(error = %error, "No se pudo iniciar el servidor de instancia única"),
+        )
+        .ok();
+
+    gpui_platform::application().run(move |cx: &mut App| {
         CommitInput::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenRepository, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-o", CloneRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-w", CloseActiveRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-tab", NextRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-tab", PreviousRepository, Some("GitHelper")),
@@ -36,10 +54,10 @@ pub fn run() {
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);
-        let startup = load_startup_state();
+        let persisted_startup = load_startup_state();
         let bounds = initial_window_bounds(
             cx,
-            startup
+            persisted_startup
                 .as_ref()
                 .and_then(|startup| startup.loaded.state.window_placement),
         );
@@ -48,7 +66,16 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| MainWindow::new(startup, cx)),
+            |_, cx| {
+                cx.new(|cx| {
+                    MainWindow::new(
+                        persisted_startup,
+                        startup.clone(),
+                        instance_receiver.clone(),
+                        cx,
+                    )
+                })
+            },
         );
 
         match window_result {

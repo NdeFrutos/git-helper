@@ -4,6 +4,7 @@ actions!(
     git_helper,
     [
         OpenRepository,
+        CloneRepository,
         CloseActiveRepository,
         NextRepository,
         PreviousRepository,

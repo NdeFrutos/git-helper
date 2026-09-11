@@ -58,6 +58,10 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 - [ ] Errores de Git (por ejemplo, pull no fast-forward) aparecen en la barra de estado sin colgar
   la UI.
 - [ ] Operaciones largas muestran indicador de carga y se pueden cancelar si aplica.
+- [ ] Al cancelar o agotar el tiempo una operación Git/Cursor, la sesión sale de `Running`, conserva
+  el último snapshot visible y muestra un estado diferenciado; después se reconcilia el estado real.
+- [ ] En Windows, repetir cancelaciones de una operación que lance descendientes no deja procesos
+  ni abre ventanas de consola.
 
 ## Accesibilidad y DPI
 
