@@ -380,6 +380,27 @@ impl MainWindow {
             .ok();
         })
         .detach();
+
+        if let Some(perf_repository) = std::env::var_os("GH_PERF_OPEN_REPO") {
+            let repository_path = PathBuf::from(perf_repository);
+            let git_client = self.git_client.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        git_client
+                            .discover_repository(&repository_path, &CancellationToken::default())
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Ok(root_path) = result {
+                        this.finish_open_repository(root_path, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     fn active_repository(&self) -> Option<&RepositorySession> {
