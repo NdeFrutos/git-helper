@@ -25,6 +25,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Debe coincidir con .github/workflows/ci.yml: el job que calienta la caché en
+  # main y este pipeline comparten clave y rutas.
+  CARGO_CACHE_VERSION: v2
+  CARGO_WIX_VERSION: 0.3.9
+
 concurrency:
   group: release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
@@ -91,6 +97,7 @@ jobs:
     outputs:
       duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
       cache_hit: ${{ steps.cache.outputs.cache-hit }}
+      cache_size_mb: ${{ steps.metrics.outputs.cache_size_mb }}
     steps:
       - name: Start timing
         id: clock
@@ -109,10 +116,10 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-
       - name: Controlled checks failure
         if: inputs.failure_mode == 'checks'
         shell: pwsh
@@ -123,17 +130,14 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
         run: cargo test --all-targets --locked
-      - name: Record checks timing
+      - name: Record checks timing and cache metrics
         id: metrics
         if: always()
         shell: pwsh
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-        run: |
-          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
-          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
-          "Checks: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Checks" -StartedAt $env:STARTED_AT
 
   package:
     name: Build Windows packages
@@ -142,6 +146,7 @@ jobs:
     outputs:
       duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
       cache_hit: ${{ steps.cache.outputs.cache-hit }}
+      cache_size_mb: ${{ steps.metrics.outputs.cache_size_mb }}
     steps:
       - name: Start timing
         id: clock
@@ -160,10 +165,10 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-
       - name: Controlled package failure
         if: inputs.failure_mode == 'package'
         shell: pwsh
@@ -172,11 +177,7 @@ jobs:
         run: cargo build --release --locked
       - name: Install cargo-wix
         shell: pwsh
-        run: |
-          $cargoWix = Join-Path $env:USERPROFILE ".cargo\bin\cargo-wix.exe"
-          if (-not (Test-Path -LiteralPath $cargoWix -PathType Leaf)) {
-            cargo install cargo-wix --version 0.3.9 --locked
-          }
+        run: ./.github/scripts/ensure-cargo-wix.ps1 -Version $env:CARGO_WIX_VERSION
       - name: Build MSI without rebuilding Rust
         run: cargo wix --no-build --nocapture
       - name: Prepare and verify release assets
@@ -213,17 +214,14 @@ jobs:
           path: dist
           if-no-files-found: error
           retention-days: 7
-      - name: Record package timing
+      - name: Record package timing and cache metrics
         id: metrics
         if: always()
         shell: pwsh
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-        run: |
-          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
-          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
-          "Package: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Package" -StartedAt $env:STARTED_AT
 
   publish:
     name: Publish validated artifacts
@@ -281,6 +279,8 @@ jobs:
           PACKAGE_SECONDS: ${{ needs.package.outputs.duration_seconds }}
           CHECKS_CACHE_HIT: ${{ needs.checks.outputs.cache_hit }}
           PACKAGE_CACHE_HIT: ${{ needs.package.outputs.cache_hit }}
+          CHECKS_CACHE_SIZE_MB: ${{ needs.checks.outputs.cache_size_mb }}
+          PACKAGE_CACHE_SIZE_MB: ${{ needs.package.outputs.cache_size_mb }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -291,8 +291,8 @@ jobs:
           ## Métricas de release
           - Tiempo de pared: $wallSeconds s
           - Tiempo total de runners: $runnerSeconds s
-          - Checks: $env:CHECKS_SECONDS s (cache exacta: $env:CHECKS_CACHE_HIT)
-          - Package: $env:PACKAGE_SECONDS s (cache exacta: $env:PACKAGE_CACHE_HIT)
+          - Checks: $env:CHECKS_SECONDS s (cache exacta: $env:CHECKS_CACHE_HIT; $env:CHECKS_CACHE_SIZE_MB MB en disco)
+          - Package: $env:PACKAGE_SECONDS s (cache exacta: $env:PACKAGE_CACHE_HIT; $env:PACKAGE_CACHE_SIZE_MB MB en disco)
           - Publish: $publishSeconds s
           - Dry run: $env:DRY_RUN
           "@ >> $env:GITHUB_STEP_SUMMARY
