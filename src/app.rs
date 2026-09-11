@@ -14,8 +14,8 @@ use crate::{
     },
     cli::InstanceServer,
     persistence::{
-        AppStateStore, DisplayBounds, LoadedState, PersistedAppState, WindowPlacement,
-        default_window_placement, validate_window_placement,
+        AppStateStore, DisplayBounds, WindowPlacement, default_window_placement,
+        validate_window_placement,
     },
     ui::{CommitInput, MainWindow, StartupState},
 };
@@ -54,13 +54,8 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);
-        let persisted_startup = load_startup_state();
-        let bounds = initial_window_bounds(
-            cx,
-            persisted_startup
-                .as_ref()
-                .and_then(|startup| startup.loaded.state.window_placement),
-        );
+        let persisted_startup = locate_startup_store();
+        let bounds = initial_window_bounds(cx, None);
         let window_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -100,25 +95,12 @@ pub fn run(startup: AppStartup) {
     });
 }
 
-/// Lee `state.json` una única vez en el arranque; la ventana reutiliza este resultado.
-///
-/// Leer aquí (y no también en `MainWindow`) conserva el respaldo por corrupción,
-/// que solo lo observa la primera lectura porque esta renombra el archivo dañado.
-fn load_startup_state() -> Option<StartupState> {
+/// Localiza el almacén sin leerlo; la lectura se hará en background tras el primer frame.
+fn locate_startup_store() -> Option<StartupState> {
     let store = AppStateStore::default_location()
         .inspect_err(|error| error!(error = %error, "No se pudo localizar el estado persistido"))
         .ok()?;
-    let loaded = match store.load() {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            error!(error = %error, "No se pudo leer el estado persistido");
-            LoadedState {
-                state: PersistedAppState::default(),
-                corruption_backup: None,
-            }
-        }
-    };
-    Some(StartupState { store, loaded })
+    Some(StartupState { store })
 }
 
 /// Ajusta la geometría ya leída a los monitores visibles; no vuelve a tocar disco.

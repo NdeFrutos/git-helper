@@ -7,7 +7,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel,
-    Render, Subscription, Window, div, prelude::*, px, rgba, uniform_list,
+    Render, Subscription, Window, div, prelude::*, px, rgba, size, uniform_list,
 };
 
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
         default_clone_destination, default_clone_root, parse_ssh_url, plan_clone_destination,
         plan_discard, plan_fetch, plan_pull, plan_push,
     },
-    persistence::{AppStateStore, LoadedState, PersistedAppState, StateWriter, WindowPlacement},
+    persistence::{AppStateStore, PersistedAppState, StateWriter, WindowPlacement},
     process::CancellationToken,
     watcher::RepositoryWatcher,
 };
@@ -173,16 +173,15 @@ struct GenerationCompletion {
     staged_changed: bool,
 }
 
-/// Estado leído una sola vez durante el arranque junto al almacén que lo produjo.
+/// Almacén localizado durante el arranque; su contenido se lee después en background.
 pub struct StartupState {
     pub store: AppStateStore,
-    pub loaded: LoadedState,
 }
 
 /// Modelo y presentación de la ventana principal.
 pub struct MainWindow {
-    /// Estado leído una sola vez en el arranque; `initialize` lo consume.
-    loaded_state: Option<LoadedState>,
+    /// Almacén que `initialize` leerá una sola vez en background.
+    startup_store: Option<AppStateStore>,
     state: AppState,
     git_client: GitClient,
     cursor_client: CursorClient,
@@ -220,10 +219,7 @@ pub struct MainWindow {
     reason = "La entidad GPUI conserva métodos listener y render cohesionados; los mensajes cortos priorizan legibilidad"
 )]
 impl MainWindow {
-    /// Crea la ventana con el estado ya leído en el arranque; no vuelve a tocar disco.
-    ///
-    /// `startup` procede de la única lectura de `state.json` que hace `app::run`,
-    /// de modo que el respaldo por corrupción se detecta y se muestra una sola vez.
+    /// Crea la ventana sin leer estado persistido en el hilo de UI.
     #[must_use]
     pub fn new(
         persisted_startup: Option<StartupState>,
@@ -231,12 +227,13 @@ impl MainWindow {
         instance_request_receiver: InstanceRequestReceiver,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (state_writer, loaded_state) = persisted_startup.map_or((None, None), |startup| {
-            (Some(StateWriter::new(startup.store)), Some(startup.loaded))
+        let (state_writer, startup_store) = persisted_startup.map_or((None, None), |startup| {
+            let store = startup.store;
+            (Some(StateWriter::new(store.clone())), Some(store))
         });
         let state = AppState::default();
         Self {
-            loaded_state,
+            startup_store,
             state,
             git_client: GitClient::default(),
             cursor_client: CursorClient::new(PathBuf::from("agent")),
@@ -312,10 +309,25 @@ impl MainWindow {
             true
         });
 
-        if let Some(loaded) = self.loaded_state.take() {
-            let corruption_backup = loaded.corruption_backup;
-            let persisted = loaded.state;
+        if let Some(store) = self.startup_store.take() {
             cx.spawn(async move |this, cx| {
+                let loaded = cx.background_spawn(async move { store.load() }).await;
+                let loaded = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            this.global_error =
+                                Some(format!("No se pudo restaurar el estado: {error}"));
+                            this.apply_pending_startup_repository(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+                let corruption_backup = loaded.corruption_backup;
+                let restored_placement = loaded.state.window_placement;
+                let persisted = loaded.state;
                 let (mut loaded_state, commit_drafts, cursor_executable) = cx
                     .background_spawn(async move {
                         let (mut state, commit_drafts) = persisted.into_app_state();
@@ -345,7 +357,11 @@ impl MainWindow {
                         (state, commit_drafts, cursor_executable)
                     })
                     .await;
-                this.update(cx, |this, cx| {
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(placement) = restored_placement {
+                        window.resize(size(px(placement.width), px(placement.height)));
+                        this.window_placement = Some(placement);
+                    }
                     let current_active = this.state.active_repository_id;
                     loaded_state.repositories.retain(|loaded_repository| {
                         !this.state.repositories.iter().any(|current_repository| {
@@ -4423,7 +4439,7 @@ mod tests {
 
     fn test_window(git_client: GitClient, repositories: Vec<RepositorySession>) -> MainWindow {
         MainWindow {
-            loaded_state: None,
+            startup_store: None,
             state: AppState {
                 active_repository_id: repositories.first().map(|repository| repository.id),
                 repositories,
