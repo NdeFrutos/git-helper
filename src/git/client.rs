@@ -1493,7 +1493,7 @@ mod tests {
             .snapshot(Path::new("repo"), &CancellationToken::default())
             .unwrap();
 
-        assert!(snapshot.commits.is_empty());
+        assert!(snapshot.changes.is_empty());
         assert!(
             runner
                 .requests()
