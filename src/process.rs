@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -16,6 +16,8 @@ use tracing::{debug, warn};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Señal cooperativa que permite cancelar un proceso hijo.
 #[derive(Clone, Debug, Default)]
@@ -76,8 +78,6 @@ pub enum ProcessError {
     TimedOut(Duration),
     #[error("no se pudo consultar o finalizar el proceso: {0}")]
     Wait(#[source] std::io::Error),
-    #[error("un worker de comunicación terminó inesperadamente")]
-    WorkerPanicked,
 }
 
 /// Abstracción inyectable usada por Git y Cursor CLI.
@@ -101,12 +101,13 @@ impl ProcessRunner for SystemProcessRunner {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
         let started_at = Instant::now();
+        let stdin = request.stdin;
         let mut command = Command::new(&request.program);
         command
             .args(&request.arguments)
             .envs(request.environment.iter().cloned())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
@@ -117,8 +118,25 @@ impl ProcessRunner for SystemProcessRunner {
             command.env_remove(variable);
         }
 
-        if request.stdin.is_some() {
-            command.stdin(Stdio::piped());
+        // Los temporales evitan que un descendiente que herede un pipe mantenga
+        // bloqueado el cleanup después de que termine o se cancele el proceso
+        // padre. stdout y stderr siguen siendo capturados de forma independiente.
+        let stdout_capture = tempfile::tempfile().map_err(ProcessError::Spawn)?;
+        let stdout_reader = stdout_capture.try_clone().map_err(ProcessError::Spawn)?;
+        let stderr_capture = tempfile::tempfile().map_err(ProcessError::Spawn)?;
+        let stderr_reader = stderr_capture.try_clone().map_err(ProcessError::Spawn)?;
+        command.stdout(Stdio::from(stdout_capture));
+        command.stderr(Stdio::from(stderr_capture));
+
+        if let Some(input) = stdin {
+            let mut stdin_capture = tempfile::tempfile().map_err(ProcessError::Stdin)?;
+            stdin_capture
+                .write_all(&input)
+                .map_err(ProcessError::Stdin)?;
+            stdin_capture
+                .seek(SeekFrom::Start(0))
+                .map_err(ProcessError::Stdin)?;
+            command.stdin(Stdio::from(stdin_capture));
         } else {
             command.stdin(Stdio::null());
         }
@@ -127,33 +145,12 @@ impl ProcessRunner for SystemProcessRunner {
         }
 
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ProcessError::Spawn(std::io::Error::other("stdout no está disponible"))
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ProcessError::Spawn(std::io::Error::other("stderr no está disponible"))
-        })?;
-
-        let stdout_worker = thread::spawn(move || read_pipe(stdout));
-        let stderr_worker = thread::spawn(move || read_pipe(stderr));
-        let stdin_worker = request.stdin.map(|input| {
-            let mut stdin = child.stdin.take();
-            thread::spawn(move || {
-                let Some(mut stdin) = stdin.take() else {
-                    return Err(std::io::Error::other("stdin no está disponible"));
-                };
-                stdin.write_all(&input)?;
-                drop(stdin);
-                Ok(())
-            })
-        });
 
         let mut poll_interval = Duration::from_micros(150);
         let maximum_poll_interval = Duration::from_millis(25);
         let status = loop {
             if cancellation.is_cancelled() {
                 terminate_child(&mut child)?;
-                let _ = join_workers(stdout_worker, stderr_worker, stdin_worker);
                 warn!(
                     operation = request.label,
                     elapsed_ms = started_at.elapsed().as_millis(),
@@ -163,7 +160,6 @@ impl ProcessRunner for SystemProcessRunner {
             }
             if started_at.elapsed() >= request.timeout {
                 terminate_child(&mut child)?;
-                let _ = join_workers(stdout_worker, stderr_worker, stdin_worker);
                 warn!(
                     operation = request.label,
                     elapsed_ms = started_at.elapsed().as_millis(),
@@ -178,7 +174,14 @@ impl ProcessRunner for SystemProcessRunner {
             poll_interval = poll_interval.saturating_mul(2).min(maximum_poll_interval);
         };
 
-        let (stdout, stderr) = join_workers(stdout_worker, stderr_worker, stdin_worker)?;
+        let stdout = read_capture(stdout_reader).map_err(|source| ProcessError::ReadPipe {
+            stream: "stdout",
+            source,
+        })?;
+        let stderr = read_capture(stderr_reader).map_err(|source| ProcessError::ReadPipe {
+            stream: "stderr",
+            source,
+        })?;
         debug!(
             operation = request.label,
             success = status.success(),
@@ -193,46 +196,221 @@ impl ProcessRunner for SystemProcessRunner {
     }
 }
 
-fn read_pipe(mut pipe: impl Read) -> Result<Vec<u8>, std::io::Error> {
+fn read_capture(mut capture: impl Read + Seek) -> Result<Vec<u8>, std::io::Error> {
     let mut output = Vec::new();
-    pipe.read_to_end(&mut output)?;
+    capture.seek(SeekFrom::Start(0))?;
+    capture.read_to_end(&mut output)?;
     Ok(output)
 }
 
 fn terminate_child(child: &mut std::process::Child) -> Result<(), ProcessError> {
+    #[cfg(target_os = "windows")]
+    let tree_error = if child
+        .try_wait()
+        .map_err(ProcessError::Wait)?
+        .is_none()
+    {
+        terminate_process_tree(child.id()).err()
+    } else {
+        None
+    };
+
     if let Err(kill_error) = child.kill()
         && kill_error.kind() != std::io::ErrorKind::InvalidInput
     {
         return Err(ProcessError::Wait(kill_error));
     }
-    child.wait().map_err(ProcessError::Wait)?;
+    #[cfg(target_os = "windows")]
+    let wait_result = wait_for_process(child, PROCESS_TERMINATION_TIMEOUT).map(|_| ());
+    #[cfg(not(target_os = "windows"))]
+    let wait_result = child.wait().map(|_| ()).map_err(ProcessError::Wait);
+    wait_result?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(tree_error) = tree_error {
+        return Err(tree_error);
+    }
+
     Ok(())
 }
 
-fn join_workers(
-    stdout_worker: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
-    stderr_worker: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
-    stdin_worker: Option<thread::JoinHandle<Result<(), std::io::Error>>>,
-) -> Result<(Vec<u8>, Vec<u8>), ProcessError> {
-    if let Some(stdin_worker) = stdin_worker {
-        stdin_worker
-            .join()
-            .map_err(|_| ProcessError::WorkerPanicked)?
-            .map_err(ProcessError::Stdin)?;
+#[cfg(target_os = "windows")]
+fn terminate_process_tree(process_id: u32) -> Result<(), ProcessError> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = Command::new(taskkill_executable());
+    command
+        .args([
+            OsString::from("/PID"),
+            process_id.to_string().into(),
+            OsString::from("/T"),
+            OsString::from("/F"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut taskkill = command.spawn().map_err(ProcessError::Wait)?;
+    let status = wait_for_process(&mut taskkill, PROCESS_TERMINATION_TIMEOUT)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ProcessError::Wait(std::io::Error::other(format!(
+            "taskkill terminó con el código {:?}",
+            status.code()
+        ))))
     }
-    let stdout = stdout_worker
-        .join()
-        .map_err(|_| ProcessError::WorkerPanicked)?
-        .map_err(|source| ProcessError::ReadPipe {
-            stream: "stdout",
-            source,
-        })?;
-    let stderr = stderr_worker
-        .join()
-        .map_err(|_| ProcessError::WorkerPanicked)?
-        .map_err(|source| ProcessError::ReadPipe {
-            stream: "stderr",
-            source,
-        })?;
-    Ok((stdout, stderr))
+}
+
+#[cfg(target_os = "windows")]
+fn taskkill_executable() -> PathBuf {
+    std::env::var_os("SystemRoot").map_or_else(
+        || PathBuf::from("taskkill.exe"),
+        |system_root| PathBuf::from(system_root).join("System32").join("taskkill.exe"),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_process(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<ExitStatus, ProcessError> {
+    let started_at = Instant::now();
+    let mut poll_interval = Duration::from_millis(1);
+    let maximum_poll_interval = Duration::from_millis(25);
+    loop {
+        if let Some(status) = child.try_wait().map_err(ProcessError::Wait)? {
+            return Ok(status);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProcessError::Wait(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "taskkill no terminó dentro del límite de cleanup",
+            )));
+        }
+        thread::sleep(poll_interval);
+        poll_interval = poll_interval.saturating_mul(2).min(maximum_poll_interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        time::Duration,
+    };
+
+    #[cfg(windows)]
+    use std::{fs, path::Path};
+
+    use super::{
+        CancellationToken, ProcessRequest, ProcessRunner, SystemProcessRunner,
+    };
+
+    #[cfg(windows)]
+    use super::ProcessError;
+
+    #[test]
+    fn captures_output_without_a_shell_owned_pipe() {
+        let request = ProcessRequest {
+            label: "process-capture-test",
+            program: PathBuf::from(if cfg!(windows) { "git.exe" } else { "git" }),
+            arguments: vec!["--version".into()],
+            environment: Vec::new(),
+            removed_environment: Vec::new(),
+            current_directory: None,
+            stdin: None,
+            timeout: Duration::from_secs(10),
+        };
+        let output = SystemProcessRunner
+            .run(request, &CancellationToken::default())
+            .expect("Git debe poder devolver su versión");
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeout_terminates_descendants_that_inherit_output_handles() {
+        let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
+        let request = write_fixture(
+            temporary.path(),
+            "@echo off\r\ncmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
+            Duration::from_secs(5),
+        );
+        let started_at = std::time::Instant::now();
+        let result = SystemProcessRunner.run(request, &CancellationToken::default());
+
+        assert!(matches!(result, Err(ProcessError::TimedOut(_))));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(2_300));
+        assert!(!temporary.path().join("marker.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_terminates_descendants_and_returns_promptly() {
+        let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
+        let request = write_fixture(
+            temporary.path(),
+            "@echo off\r\ncmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
+            Duration::from_secs(5),
+        );
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let started_at = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            SystemProcessRunner.run(request, &worker_cancellation)
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        cancellation.cancel();
+        let result = worker.join().expect("el runner no debe dejar un worker colgado");
+
+        assert!(matches!(result, Err(ProcessError::Cancelled)));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(2_300));
+        assert!(!temporary.path().join("marker.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normal_parent_exit_does_not_wait_for_an_inherited_handle() {
+        let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
+        let request = write_fixture(
+            temporary.path(),
+            "@echo off\r\nstart \"\" /B cmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
+            Duration::from_secs(5),
+        );
+        let started_at = std::time::Instant::now();
+        let result = SystemProcessRunner.run(request, &CancellationToken::default());
+
+        assert!(result.is_ok());
+        assert!(started_at.elapsed() < Duration::from_millis(1_500));
+        std::thread::sleep(Duration::from_millis(2_300));
+        assert!(temporary.path().join("marker.txt").exists());
+    }
+
+    #[cfg(windows)]
+    fn write_fixture(
+        directory: &Path,
+        contents: &str,
+        timeout: Duration,
+    ) -> ProcessRequest {
+        let script = directory.join("process-tree-fixture.cmd");
+        fs::write(&script, contents).expect("debe escribir el fixture de procesos");
+        ProcessRequest {
+            label: "process-tree-fixture",
+            program: PathBuf::from("cmd.exe"),
+            arguments: vec!["/D".into(), "/S".into(), "/C".into(), script.into()],
+            environment: Vec::new(),
+            removed_environment: Vec::new(),
+            current_directory: Some(directory.to_path_buf()),
+            stdin: None,
+            timeout,
+        }
+    }
 }

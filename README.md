@@ -123,7 +123,7 @@ workflow. Las notas de release se generan automáticamente a partir del historia
 | `src/git/` | Única puerta de acceso a `git.exe`, parsers y planes seguros |
 | `src/cursor/` | Contexto staged limitado, ejecución de `agent` y parser JSON |
 | `src/persistence/` | Estado versionado y escritura atómica |
-| `src/process.rs` | Procesos sin shell, pipes, cancelación y timeout |
+| `src/process.rs` | Procesos sin shell, captura aislada, cancelación y timeout |
 | `src/ui/` | Ventana, entrada de commit, listas virtualizadas y tema GPUI |
 | `src/watcher/` | Observación del repositorio y debounce de eventos |
 

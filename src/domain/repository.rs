@@ -81,6 +81,10 @@ pub enum MutationState {
         kind: OperationKind,
         message: String,
     },
+    Cancelled {
+        kind: OperationKind,
+        message: String,
+    },
     Failed {
         kind: OperationKind,
         message: String,
