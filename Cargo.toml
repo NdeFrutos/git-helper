@@ -65,6 +65,12 @@ opt-level = 3
 [lints.rust]
 unsafe_code = "forbid"
 
+[features]
+default = []
+# Habilita ganchos solo para mediciones de rendimiento (p. ej. GH_PERF_OPEN_REPO).
+# No debe activarse en los binarios publicados.
+perf-hooks = []
+
 [[example]]
 name = "bench"
 path = "examples/bench.rs"

@@ -52,10 +52,12 @@ function Get-HardwareSummary {
     }
 }
 
-Write-Host 'Compilando Git Helper en release…'
+Write-Host 'Compilando Git Helper en release (con feature perf-hooks)…'
 Push-Location $repoRoot
 try {
-    cargo build --release --locked
+    # perf-hooks habilita GH_PERF_OPEN_REPO, necesario para la medición en reposo.
+    # El binario publicado se construye sin esta feature.
+    cargo build --release --locked --features perf-hooks
     cargo build --release --locked --example bench
 }
 finally {
@@ -95,7 +97,7 @@ $report = [ordered]@{
     recorded_at_utc = (Get-Date).ToUniversalTime().ToString('o')
     git_sha         = Get-GitSha
     git_helper_version = (Select-String -Path (Join-Path $repoRoot 'Cargo.toml') -Pattern '^version = "(.+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value })
-    build_profile   = 'release'
+    build_profile   = 'release+perf-hooks'
     hardware        = Get-HardwareSummary
     sampling        = [ordered]@{
         bench_iterations = $Iterations

@@ -86,7 +86,15 @@ Métricas reportadas (p50/p95):
 
 ### 3. Procesos Git en reposo
 
-Con build release y un repositorio local:
+El gancho `GH_PERF_OPEN_REPO` **solo existe si el binario se compila con la feature
+`perf-hooks`**; el binario publicado (MSI) se construye sin ella y por tanto ignora la
+variable. Hay que construir primero un binario de medición:
+
+```powershell
+cargo build --release --locked --features perf-hooks
+```
+
+Con ese binario y un repositorio local:
 
 ```powershell
 $env:GH_PERF_OPEN_REPO = (Resolve-Path .\perf-fixtures\clean).Path

@@ -9,7 +9,9 @@
     refrescos espurios en reposo.
 
 .PARAMETER Executable
-    Ruta a git-helper.exe compilado en release.
+    Ruta a git-helper.exe compilado en release con la feature `perf-hooks`
+    (`cargo build --release --locked --features perf-hooks`). Sin esa feature el binario
+    ignora GH_PERF_OPEN_REPO y no abrirá ningún repositorio.
 
 .PARAMETER RepositoryPath
     Repositorio a abrir (se pasa por variable de entorno GH_PERF_OPEN_REPO).

@@ -135,11 +135,7 @@ fn resolve_stage_file(options: &BenchOptions) -> PathBuf {
     })
 }
 
-fn run_benchmark(
-    repository: &Path,
-    iterations: usize,
-    stage_relative: &Path,
-) -> BenchReport {
+fn run_benchmark(repository: &Path, iterations: usize, stage_relative: &Path) -> BenchReport {
     let client = GitClient::default();
     let cancellation = CancellationToken::default();
     let _ = client.detect_version(&cancellation);
