@@ -557,3 +557,47 @@ fn classifies_common_ssh_failures() {
         git_helper::git::GitError::SshHostKeyVerificationFailed { .. }
     ));
 }
+
+#[test]
+fn failed_clone_leaves_no_partial_destination() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let missing_remote = temporary.path().join("no-existe.git");
+    let clone_destination = temporary.path().join("working-copy");
+    let client = GitClient::default();
+
+    let error = client
+        .clone_repository(
+            &format!("file://{}", missing_remote.display()),
+            &clone_destination,
+            &CancellationToken::default(),
+        )
+        .expect_err("clonar un remoto inexistente debe fallar");
+
+    assert!(!matches!(
+        error,
+        git_helper::git::GitError::InvalidSshUrl { .. }
+    ));
+    assert!(
+        !clone_destination.exists(),
+        "un clonado fallido no debe dejar el destino a medias"
+    );
+}
+
+#[test]
+fn rejects_clone_arguments_that_git_would_read_as_options() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let client = GitClient::default();
+
+    let error = client
+        .clone_repository(
+            "--upload-pack=payload",
+            &temporary.path().join("destino"),
+            &CancellationToken::default(),
+        )
+        .expect_err("una URL con guion inicial debe rechazarse antes de ejecutar git");
+
+    assert!(matches!(
+        error,
+        git_helper::git::GitError::InvalidSshUrl { .. }
+    ));
+}

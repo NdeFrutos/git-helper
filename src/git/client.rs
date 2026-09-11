@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use tracing::warn;
+
 use crate::{
     domain::{
         BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage, Remote,
@@ -866,7 +868,8 @@ impl GitClient {
                 source,
             })?;
         }
-        let output = self.run_process(
+        let destination_existed = destination.exists();
+        let result = self.run_process(
             "git-clone",
             vec![
                 OsString::from("clone"),
@@ -879,15 +882,21 @@ impl GitClient {
             REMOTE_OPERATION_TIMEOUT,
             cancellation,
             false,
-        )?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(classify_remote_failure(
+        );
+        let outcome = match result {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(classify_remote_failure(
                 &String::from_utf8_lossy(&output.stderr),
                 output.status.code(),
-            ))
+            )),
+            Err(error) => Err(GitError::from(error)),
+        };
+        if outcome.is_err() && !destination_existed {
+            // Un clonado cancelado o interrumpido deja un árbol a medias que bloquearía
+            // el siguiente intento; solo se borra lo que ha creado esta operación.
+            remove_partial_clone(destination);
         }
+        outcome
     }
 
     /// Lee la URL configurada para un remote concreto sin consultar la red.
@@ -1214,6 +1223,19 @@ fn validate_history_ref(reference: &str) -> Result<(), GitError> {
         });
     }
     Ok(())
+}
+
+/// Borra el destino a medio clonar sin propagar errores de limpieza.
+fn remove_partial_clone(destination: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(destination)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            path = %destination.display(),
+            %error,
+            "no se pudo limpiar el destino de un clonado fallido"
+        );
+    }
 }
 
 /// Rechaza URLs y destinos que git podría interpretar como opciones aunque exista `--`.

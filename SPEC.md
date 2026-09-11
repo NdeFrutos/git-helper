@@ -105,8 +105,8 @@ Flujo:
 
 1. El usuario elige **Clonar repositorio** (`Ctrl+Shift+O`) e introduce una URL SSH (`git@host:org/repo.git` o `ssh://user@host/path/repo.git`).
 2. La aplicación valida el formato antes de tocar la red y rechaza esquemas no SSH (`https://`, `file://`, etc.).
-3. Se propone un destino bajo `%LOCALAPPDATA%\GitHelper\repos\<nombre>` o una carpeta elegida con el selector nativo.
-4. Si el destino ya contiene un repositorio Git con el mismo `origin` canónico, se ofrece abrirlo sin sobrescribir.
+3. Se propone un destino bajo `%LOCALAPPDATA%\GitHelper\repos\<nombre>`. Con el selector nativo se elige la carpeta contenedora y el clon se crea dentro, en `<carpeta>\<nombre>`.
+4. Si el destino ya contiene un repositorio Git —no un subdirectorio de otro— con el mismo `origin` canónico, se ofrece abrirlo sin sobrescribir. Un destino ocupado por otro contenido o por otro `origin` se rechaza con un mensaje explícito.
 5. En caso contrario se ejecuta `git clone <url> <destino>` con progreso, cancelación y errores SSH accionables.
 6. Tras un clonado correcto se abre el repositorio en una pestaña y se persiste el par `(ssh_url_normalizada, ruta_local)` en `state.json`.
 
@@ -114,6 +114,8 @@ Requisitos y limitaciones:
 
 - Git Helper usa el stack SSH del sistema (`GIT_SSH`, `~/.ssh/config`, `ssh-agent`); no almacena claves ni contraseñas.
 - Los errores frecuentes (host desconocido, clave ausente, timeout, host key changed) se resumen en la UI con indicaciones prácticas.
+- La URL se normaliza a `ssh://host[:puerto]/ruta` para comparar remotes: el puerto no estándar y el caso de la ruta forman parte de la identidad del repositorio.
+- Un clonado cancelado o fallido borra el destino que haya creado, de modo que el siguiente intento parte de cero.
 - HTTPS, editor de `~/.ssh/config`, gestión visual de claves y trabajo remoto sin clon local quedan fuera de alcance.
 
 ## 4. Experiencia de usuario

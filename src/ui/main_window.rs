@@ -544,14 +544,31 @@ impl MainWindow {
                             files: false,
                             directories: true,
                             multiple: false,
-                            prompt: Some("Selecciona la carpeta destino del clon".into()),
+                            prompt: Some("Selecciona la carpeta que contendrá el clon".into()),
                         });
                         cx.spawn(async move |this, cx| {
                             let Ok(Ok(Some(paths))) = path_receiver.await else {
                                 return;
                             };
-                            let Some(destination) = paths.into_iter().next() else {
+                            let Some(parent) = paths.into_iter().next() else {
                                 return;
+                            };
+                            // El selector nativo devuelve la carpeta contenedora: el clon se
+                            // crea dentro, en su propio directorio, para no mezclarlo con
+                            // el contenido que ya hubiera allí.
+                            let destination = match default_clone_destination(
+                                &parent,
+                                &parsed_for_destination.repository_name,
+                            ) {
+                                Ok(destination) => destination,
+                                Err(error) => {
+                                    this.update(cx, |this, cx| {
+                                        this.global_error = Some(error.user_message());
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                    return;
+                                }
                             };
                             this.update(cx, |this, cx| {
                                 this.continue_clone_with_destination(
@@ -661,6 +678,7 @@ impl MainWindow {
         let url = parsed.original.clone();
         let normalized = parsed.normalized.clone();
         let git_client = self.git_client.clone();
+        let discover_client = self.git_client.clone();
         let discover_destination = destination.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -669,23 +687,31 @@ impl MainWindow {
                     git_client.clone_repository(&url, &destination, &cancellation)
                 })
                 .await;
+            // Localizar la raíz del clon vuelve a lanzar git: se resuelve en segundo plano
+            // para no bloquear el hilo de la interfaz al terminar el clonado.
+            let outcome = match result {
+                Ok(()) => Ok(cx
+                    .background_spawn(async move {
+                        discover_client.discover_repository(
+                            &discover_destination,
+                            &CancellationToken::default(),
+                        )
+                    })
+                    .await),
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, cx| {
                 this.active_clone_cancellation = None;
                 this.clone_in_progress = false;
-                match result {
-                    Ok(()) => match this
-                        .git_client
-                        .discover_repository(&discover_destination, &CancellationToken::default())
-                    {
-                        Ok(root_path) => {
-                            this.finish_open_repository(root_path, Some(normalized), cx);
-                        }
-                        Err(error) => {
-                            this.global_error = Some(error.user_message());
-                            this.global_status_message =
-                                "El clon terminó pero no se pudo abrir el repositorio".to_owned();
-                        }
-                    },
+                match outcome {
+                    Ok(Ok(root_path)) => {
+                        this.finish_open_repository(root_path, Some(normalized), cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.global_error = Some(error.user_message());
+                        this.global_status_message =
+                            "El clon terminó pero no se pudo abrir el repositorio".to_owned();
+                    }
                     Err(error) => {
                         let cancelled = is_cancelled_error(&error);
                         this.global_error = if cancelled {
@@ -708,34 +734,53 @@ impl MainWindow {
     }
 
     fn open_ssh_clone_mapping(&mut self, mapping: &SshCloneMapping, cx: &mut Context<Self>) {
-        if !mapping.local_path.is_dir() {
-            self.global_error = Some(format!(
-                "El clon ya no existe en {}",
-                mapping.local_path.display()
-            ));
-            self.state
-                .ssh_clone_mappings
-                .retain(|candidate| candidate.ssh_url_normalized != mapping.ssh_url_normalized);
-            self.save_state(cx);
-            cx.notify();
-            return;
-        }
-        match self
-            .git_client
-            .discover_repository(&mapping.local_path, &CancellationToken::default())
-        {
-            Ok(root_path) => {
-                self.finish_open_repository(
-                    root_path,
-                    Some(mapping.ssh_url_normalized.clone()),
-                    cx,
-                );
-            }
-            Err(error) => {
-                self.global_error = Some(error.user_message());
+        let ssh_url_normalized = mapping.ssh_url_normalized.clone();
+        let local_path = mapping.local_path.clone();
+        let discover_path = local_path.clone();
+        let git_client = self.git_client.clone();
+        self.global_status_message = "Abriendo clon reciente…".to_owned();
+        cx.notify();
+        // Comprobar la ruta y localizar la raíz lanza git y toca disco: ambas cosas
+        // ocurren fuera del hilo de la interfaz.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if !discover_path.is_dir() {
+                        return Ok(None);
+                    }
+                    git_client
+                        .discover_repository(&discover_path, &CancellationToken::default())
+                        .map(Some)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(root_path)) => {
+                        this.finish_open_repository(root_path, Some(ssh_url_normalized), cx);
+                    }
+                    Ok(None) => {
+                        this.global_error =
+                            Some(format!("El clon ya no existe en {}", local_path.display()));
+                        this.global_status_message = "Clon SSH no disponible".to_owned();
+                        this.forget_ssh_clone_mapping(&ssh_url_normalized);
+                        this.save_state(cx);
+                    }
+                    Err(error) => {
+                        this.global_error = Some(error.user_message());
+                        this.global_status_message = "No se pudo abrir el clon".to_owned();
+                    }
+                }
                 cx.notify();
-            }
-        }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn forget_ssh_clone_mapping(&mut self, ssh_url_normalized: &str) {
+        self.state
+            .ssh_clone_mappings
+            .retain(|candidate| candidate.ssh_url_normalized != ssh_url_normalized);
     }
 
     fn close_active_repository(
@@ -3381,13 +3426,9 @@ impl MainWindow {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        let ssh_clones = self
-            .state
-            .ssh_clone_mappings
-            .iter()
-            .filter(|mapping| mapping.local_path.is_dir())
-            .cloned()
-            .collect::<Vec<_>>();
+        // La existencia en disco se comprueba al cargar el estado y al abrir cada clon:
+        // repetirla en cada frame de render supondría un acceso a disco por fotograma.
+        let ssh_clones = self.state.ssh_clone_mappings.clone();
         div()
             .flex()
             .flex_1()

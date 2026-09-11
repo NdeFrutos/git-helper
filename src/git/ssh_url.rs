@@ -15,6 +15,8 @@ pub struct ParsedSshUrl {
 }
 
 const UNSUPPORTED_SCHEMES: &[&str] = &["https://", "http://", "file://", "git://", "ftp://"];
+const SSH_SCHEME: &str = "ssh://";
+const DEFAULT_SSH_PORT: u16 = 22;
 
 /// Valida y parsea una URL SSH en los formatos habituales de Git.
 pub fn parse_ssh_url(input: &str) -> Result<ParsedSshUrl, GitError> {
@@ -47,7 +49,7 @@ pub fn parse_ssh_url(input: &str) -> Result<ParsedSshUrl, GitError> {
         }
     }
 
-    let parsed = if lower.starts_with("ssh://") {
+    let parsed = if lower.starts_with(SSH_SCHEME) {
         parse_ssh_scheme(trimmed)?
     } else {
         parse_scp_style(trimmed)?
@@ -120,13 +122,14 @@ fn parse_scp_style(input: &str) -> Result<ParsedSshUrl, GitError> {
             message: "Formato scp inválido; no se pudo leer el host".to_owned(),
         })?
         .to_ascii_lowercase();
-    Ok(build_parsed(input, &host, path_part))
+    // La sintaxis scp no admite puerto: todo lo que sigue al `:` es la ruta.
+    Ok(build_parsed(input, &host, None, path_part))
 }
 
 fn parse_ssh_scheme(input: &str) -> Result<ParsedSshUrl, GitError> {
-    let without_scheme = input
-        .trim_start_matches("ssh://")
-        .trim_start_matches("SSH://");
+    // El esquema puede venir en cualquier combinación de mayúsculas (`SSH://`, `Ssh://`),
+    // así que se recorta por longitud en lugar de por coincidencia exacta.
+    let without_scheme = &input[SSH_SCHEME.len()..];
     let (authority, path_part) =
         without_scheme
             .split_once('/')
@@ -138,22 +141,37 @@ fn parse_ssh_scheme(input: &str) -> Result<ParsedSshUrl, GitError> {
             message: "La URL ssh:// no incluye una ruta de repositorio".to_owned(),
         });
     }
-    let host = authority
-        .rsplit('@')
-        .next()
-        .ok_or_else(|| GitError::InvalidSshUrl {
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let (host, port) = split_host_and_port(host_and_port)?;
+    if host.is_empty() {
+        return Err(GitError::InvalidSshUrl {
             message: "La URL ssh:// no incluye un host válido".to_owned(),
-        })?
-        .split(':')
-        .next()
-        .ok_or_else(|| GitError::InvalidSshUrl {
-            message: "La URL ssh:// no incluye un host válido".to_owned(),
-        })?
-        .to_ascii_lowercase();
-    Ok(build_parsed(input, &host, path_part))
+        });
+    }
+    Ok(build_parsed(input, &host, port, path_part))
 }
 
-fn build_parsed(original: &str, host: &str, repository_path: &str) -> ParsedSshUrl {
+/// Separa `host[:puerto]` conservando el puerto para distinguir servidores distintos.
+fn split_host_and_port(authority: &str) -> Result<(String, Option<u16>), GitError> {
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok((authority.to_ascii_lowercase(), None));
+    };
+    // Un IPv6 sin corchetes (`::1`) no lleva puerto: el último `:` forma parte del host.
+    if host.contains(':') && !host.ends_with(']') {
+        return Ok((authority.to_ascii_lowercase(), None));
+    }
+    let port = port.parse::<u16>().map_err(|_| GitError::InvalidSshUrl {
+        message: format!("Puerto SSH inválido: «{port}»"),
+    })?;
+    Ok((host.to_ascii_lowercase(), Some(port)))
+}
+
+fn build_parsed(
+    original: &str,
+    host: &str,
+    port: Option<u16>,
+    repository_path: &str,
+) -> ParsedSshUrl {
     let repository_path = canonical_repository_path(repository_path);
     let repository_name = repository_path
         .rsplit('/')
@@ -162,7 +180,13 @@ fn build_parsed(original: &str, host: &str, repository_path: &str) -> ParsedSshU
         .filter(|segment| !segment.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_default();
-    let normalized = format!("ssh://{host}/{repository_path}");
+    // El puerto forma parte de la identidad del remoto: `host:2222` y `host` pueden ser
+    // servidores distintos, así que se conserva salvo cuando es el 22 por defecto.
+    let authority = match port {
+        Some(port) if port != DEFAULT_SSH_PORT => format!("{host}:{port}"),
+        _ => host.to_owned(),
+    };
+    let normalized = format!("ssh://{authority}/{repository_path}");
     ParsedSshUrl {
         original: original.to_owned(),
         normalized,
@@ -265,6 +289,34 @@ mod tests {
         ));
         assert!(matches!(
             parse_ssh_url("git@host.example:org/re po.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_scheme_regardless_of_capitalization() {
+        let parsed = parse_ssh_url("SSH://git@Host.Example/org/repo.git").expect("debe parsear");
+        assert_eq!(parsed.host, "host.example");
+        assert_eq!(parsed.repository_path, "org/repo");
+        assert_eq!(parsed.normalized, "ssh://host.example/org/repo");
+    }
+
+    #[test]
+    fn keeps_non_default_port_in_the_normalized_url() {
+        let custom = normalize_ssh_url("ssh://git@host.example:2222/org/repo.git").expect("2222");
+        let default = normalize_ssh_url("ssh://git@host.example:22/org/repo.git").expect("22");
+        let implicit =
+            normalize_ssh_url("ssh://git@host.example/org/repo.git").expect("sin puerto");
+
+        assert_eq!(custom, "ssh://host.example:2222/org/repo");
+        assert_eq!(default, implicit);
+        assert_ne!(custom, implicit);
+    }
+
+    #[test]
+    fn rejects_invalid_ports() {
+        assert!(matches!(
+            parse_ssh_url("ssh://git@host.example:puerto/org/repo.git"),
             Err(GitError::InvalidSshUrl { .. })
         ));
     }
