@@ -99,6 +99,19 @@ Atajos disponibles:
 | `Ctrl+Enter` | Crear el commit |
 | `Ctrl+Shift+G` | Generar un mensaje con Cursor |
 
+## Cuando algo falla
+
+La banda de error muestra tres cosas: qué ocurrió, el siguiente paso seguro y los detalles
+técnicos, que se pueden expandir y copiar. Los casos reconocidos —identidad de Git sin configurar,
+`index.lock` bloqueado, hook que rechaza la operación, credenciales rechazadas, rama sin upstream,
+push rechazado, divergencia con el remote y fallos del proveedor de IA— incluyen una recomendación
+concreta. Un error que Git Helper no reconoce conserva su salida íntegra y no se le atribuye una
+causa inventada.
+
+Las recomendaciones nunca reparan nada por su cuenta: Git Helper no borra `index.lock`, no cambia
+tu configuración de identidad, no hace merge, rebase ni stash automático y nunca usa push forzado.
+Las URLs con credenciales embebidas se ocultan antes de mostrar o copiar los detalles.
+
 ## Privacidad y seguridad
 
 - No hay telemetría propia.

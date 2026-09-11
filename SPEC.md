@@ -690,6 +690,18 @@ Los errores se mostrarán cerca de la acción que falló y podrán expandirse pa
 - Cursor CLI no instalado, no autenticado o bloqueado por política.
 - Respuesta inválida o cancelación de Cursor CLI.
 
+Cada error visible se presenta con tres elementos: una explicación breve de qué ocurrió, el
+siguiente paso seguro y el detalle técnico expandible y copiable. La clasificación se apoya en
+señales que Git no traduce (nombres de configuración como `user.email`, rutas como `index.lock`,
+nombres de hook y marcadores como `non-fast-forward`) antes que en frases concretas, para que una
+salida localizada siga reconociéndose. Un error sin clasificar conserva su salida íntegra y no
+recibe una causa atribuida: solo una recomendación genérica de revisar los detalles y reconciliar
+el estado.
+
+El siguiente paso nunca describe una reparación implícita: Git Helper no elimina `index.lock`, no
+modifica `user.name` ni `user.email`, no hace merge, rebase ni stash automático y no usa push
+forzado. Las credenciales embebidas en URLs se ocultan antes de mostrar o copiar los detalles.
+
 No se ocultará stderr ni se mostrará únicamente un mensaje genérico.
 
 ### 8.2 Logging

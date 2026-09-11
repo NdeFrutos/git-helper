@@ -20,8 +20,8 @@ use crate::{
 
 use super::{
     BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
-    classify_remote_failure, parse_branch_refs, parse_log, parse_status, resolve_upstream,
-    validate_existing_path_inside_repository, validate_relative_path,
+    classify_command_failure, classify_remote_failure, parse_branch_refs, parse_log, parse_status,
+    resolve_upstream, validate_existing_path_inside_repository, validate_relative_path,
 };
 
 const LOCAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1183,11 +1183,14 @@ fn require_success(output: ProcessOutput) -> Result<ProcessOutput, GitError> {
     }
 }
 
+/// Todo fallo de un comando Git pasa por la clasificación tipada: la UI
+/// necesita la misma recomendación tanto si el fallo viene de una lectura
+/// como de una mutación o de una operación remota.
 fn command_failed(output: &ProcessOutput) -> GitError {
-    GitError::CommandFailed {
-        exit_code: output.status.code(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    }
+    classify_command_failure(
+        &String::from_utf8_lossy(&output.stderr),
+        output.status.code(),
+    )
 }
 
 fn is_empty_history_error(stderr: &[u8]) -> bool {
