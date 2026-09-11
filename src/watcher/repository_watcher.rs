@@ -276,7 +276,7 @@ fn classify_path(
         .or_else(|| common_git_directory.and_then(|directory| path.strip_prefix(directory).ok()));
     if let Some(relative) = git_relative {
         let is_exact = |candidate: &str| relative == Path::new(candidate);
-        if is_exact("config") {
+        if is_exact("config") || is_exact("config.worktree") {
             return Some(RepositoryChange {
                 git_config_changed: true,
                 ..RepositoryChange::default()
@@ -372,10 +372,13 @@ mod tests {
         let git = root.join(".git");
 
         let config = classify_path(&git.join("config"), root, &git, None, &[]).unwrap();
+        let worktree_config =
+            classify_path(&git.join("config.worktree"), root, &git, None, &[]).unwrap();
         let history = classify_path(&git.join("refs/heads/main"), root, &git, None, &[]).unwrap();
         let ignores = classify_path(&root.join(".gitignore"), root, &git, None, &[]).unwrap();
 
         assert!(config.git_config_changed);
+        assert!(worktree_config.git_config_changed);
         assert!(history.history_changed);
         assert!(ignores.refresh_ignored_paths());
     }

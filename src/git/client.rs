@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     domain::{
-        BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage, Remote,
-        RemoteOperationPlan, RepositorySnapshot,
+        BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage,
+        HistorySnapshot, Remote, RemoteOperationPlan, WorkingTreeSnapshot,
     },
     process::{
         CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
-    parse_branch_refs, parse_log, parse_status, resolve_upstream,
+    classify_remote_failure, parse_branch_refs, parse_log, parse_status, resolve_upstream,
     validate_existing_path_inside_repository, validate_relative_path,
 };
 
@@ -148,7 +148,7 @@ impl GitClient {
         &self,
         repository_root: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<RepositorySnapshot, GitError> {
+    ) -> Result<WorkingTreeSnapshot, GitError> {
         let (status, remotes, branches) = thread::scope(|scope| {
             let remotes_worker = scope.spawn(|| self.remotes(repository_root, cancellation));
             let branches_worker = scope.spawn(|| self.branch_refs(repository_root, cancellation));
@@ -168,41 +168,56 @@ impl GitClient {
         let upstream = resolve_upstream(&status, &remotes);
         let branches = mark_active_branch(branches, &status.head);
 
-        Ok(RepositorySnapshot {
+        Ok(WorkingTreeSnapshot {
             head: status.head,
             upstream,
             remotes,
             branches,
             changes: status.changes,
-            commits: Vec::new(),
-            has_more_commits: false,
-            history_reference: None,
-            history_oid: None,
         })
     }
 
-    /// Lee el snapshot y una primera página de historial de forma concurrente.
+    /// Lee el working tree y una primera página de historial de forma concurrente.
     pub fn snapshot_with_history(
         &self,
         repository_root: &Path,
         history_limit: usize,
         cancellation: &CancellationToken,
-    ) -> Result<RepositorySnapshot, GitError> {
-        let mut snapshot = self.snapshot(repository_root, cancellation)?;
-        let page = match history_target(&snapshot.head) {
+    ) -> Result<(WorkingTreeSnapshot, HistorySnapshot), GitError> {
+        let working_tree = self.snapshot(repository_root, cancellation)?;
+        let history = self.history_page_as_snapshot(
+            repository_root,
+            &working_tree.head,
+            history_limit,
+            0,
+            cancellation,
+        )?;
+        Ok((working_tree, history))
+    }
+
+    /// Convierte una página de historial en el snapshot de historial de la sesión.
+    pub fn history_page_as_snapshot(
+        &self,
+        repository_root: &Path,
+        head: &HeadState,
+        history_limit: usize,
+        skip: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<HistorySnapshot, GitError> {
+        let page = match history_target(head) {
             Some((reference, oid)) if reference.starts_with("refs/") => self.history_for_oid(
                 repository_root,
                 &reference,
                 &oid,
                 history_limit + 1,
-                0,
+                skip,
                 cancellation,
             )?,
             Some((_, oid)) => self.history_for_revision(
                 repository_root,
                 &oid,
                 history_limit + 1,
-                0,
+                skip,
                 cancellation,
             )?,
             None => HistoryPage {
@@ -212,19 +227,19 @@ impl GitClient {
             },
         };
         let has_more_commits = page.commits.len() > history_limit;
-        let commits = page
-            .commits
-            .into_iter()
-            .take(history_limit)
-            .map(|commit| commit.summary)
-            .collect();
-        snapshot.history_reference = (!page.reference.is_empty()).then_some(page.reference);
-        snapshot.history_oid = (!page.oid.is_empty()).then_some(page.oid);
+        let commits = Arc::new(
+            page.commits
+                .into_iter()
+                .take(history_limit)
+                .map(|commit| commit.summary)
+                .collect(),
+        );
 
-        Ok(RepositorySnapshot {
+        Ok(HistorySnapshot {
             commits,
             has_more_commits,
-            ..snapshot
+            history_reference: (!page.reference.is_empty()).then_some(page.reference),
+            history_oid: (!page.oid.is_empty()).then_some(page.oid),
         })
     }
 
@@ -851,6 +866,98 @@ impl GitClient {
         )
     }
 
+    /// Clona un repositorio remoto en la ruta destino indicada.
+    pub fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        validate_clone_argument(url)?;
+        validate_clone_argument(&destination.to_string_lossy())?;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let staging_directory = if destination.exists() {
+            None
+        } else {
+            let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+            Some(
+                tempfile::Builder::new()
+                    .prefix(".git-helper-clone-")
+                    .tempdir_in(parent)
+                    .map_err(|source| GitError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?,
+            )
+        };
+        let clone_destination = staging_directory
+            .as_ref()
+            .map_or(destination, tempfile::TempDir::path);
+        let result = self.run_process(
+            "git-clone",
+            vec![
+                OsString::from("clone"),
+                // `--` evita que una URL o un destino con guion inicial se lean como opción de git.
+                OsString::from("--"),
+                OsString::from(url),
+                clone_destination.as_os_str().to_os_string(),
+            ],
+            None,
+            REMOTE_OPERATION_TIMEOUT,
+            cancellation,
+            false,
+        );
+        let outcome = match result {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(classify_remote_failure(
+                &String::from_utf8_lossy(&output.stderr),
+                output.status.code(),
+            )),
+            Err(error) => Err(GitError::from(error)),
+        };
+        if outcome.is_ok()
+            && let Some(staging_directory) = staging_directory.as_ref()
+        {
+            // Publica el clon terminado solo si el destino sigue libre. El temporal es
+            // propiedad exclusiva de esta operación y se limpia al fallar o cancelarse.
+            std::fs::rename(staging_directory.path(), destination).map_err(|source| {
+                GitError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        outcome
+    }
+
+    /// Lee la URL configurada para un remote concreto sin consultar la red.
+    pub fn remote_url(
+        &self,
+        repository_root: &Path,
+        remote_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitError> {
+        let output = self.run_git_read_only(
+            "git-remote-url",
+            repository_root,
+            ["remote", "get-url", remote_name],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::RemoteNotConfigured {
+                remote: remote_name.to_owned(),
+            });
+        }
+        decode_trimmed_stdout(&output, "git remote get-url")
+    }
+
     /// Ejecuta exclusivamente planes remotos creados por la capa tipada.
     pub fn execute_remote(
         &self,
@@ -1154,6 +1261,18 @@ fn validate_history_ref(reference: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Rechaza URLs y destinos que git podría interpretar como opciones aunque exista `--`.
+fn validate_clone_argument(value: &str) -> Result<(), GitError> {
+    if value.is_empty() || value.starts_with('-') || value.contains('\0') {
+        return Err(GitError::InvalidSshUrl {
+            message: format!(
+                "Argumento de clonado no admitido porque git lo interpretaría como opción: {value}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_oid(oid: &str) -> Result<String, GitError> {
     if !(4..=64).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(GitError::InvalidReferenceName {
@@ -1181,6 +1300,25 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    struct ConcurrentDestinationRunner {
+        destination: PathBuf,
+    }
+
+    impl ProcessRunner for ConcurrentDestinationRunner {
+        fn run(
+            &self,
+            _request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            std::fs::create_dir_all(&self.destination).expect("debe crear el destino concurrente");
+            std::fs::write(self.destination.join("datos-ajenos.txt"), b"conservar")
+                .expect("debe escribir los datos concurrentes");
+            Err(ProcessError::Spawn(std::io::Error::other(
+                "fallo de clone simulado",
+            )))
+        }
     }
 
     impl RecordingRunner {
@@ -1227,21 +1365,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_clone_does_not_delete_a_destination_created_concurrently() {
+        let temporary = tempfile::tempdir().expect("debe crear el temporal");
+        let destination = temporary.path().join("working-copy");
+        let runner = Arc::new(ConcurrentDestinationRunner {
+            destination: destination.clone(),
+        });
+        let client = GitClient::with_runner(PathBuf::from("git"), runner);
+
+        client
+            .clone_repository(
+                "git@example.com:org/repo.git",
+                &destination,
+                &CancellationToken::default(),
+            )
+            .expect_err("el clone simulado debe fallar");
+
+        assert_eq!(
+            std::fs::read(destination.join("datos-ajenos.txt"))
+                .expect("los datos concurrentes deben sobrevivir"),
+            b"conservar"
+        );
+    }
+
+    #[test]
     fn snapshot_omits_history_and_reuses_cached_remotes() {
         let runner = Arc::new(RecordingRunner::default());
         let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
         let cancellation = CancellationToken::default();
 
-        let first = client
+        client
             .snapshot(Path::new("repo"), &cancellation)
             .expect("debe crear el primer snapshot");
-        let second = client
+        client
             .snapshot(Path::new("repo"), &cancellation)
             .expect("debe reutilizar la caché");
         let requests = runner.requests();
 
-        assert!(first.commits.is_empty());
-        assert!(second.commits.is_empty());
         assert_eq!(
             requests
                 .iter()

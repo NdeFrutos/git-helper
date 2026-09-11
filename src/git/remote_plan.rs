@@ -71,9 +71,10 @@ pub fn plan_push(
 ) -> Result<RemoteOperationPlan, GitError> {
     let branch_name = match head {
         HeadState::Branch { name, oid: Some(_) } => name,
-        HeadState::Branch { oid: None, .. } | HeadState::Detached { .. } | HeadState::Unborn => {
-            return Err(GitError::DetachedHead);
+        HeadState::Branch { oid: None, .. } | HeadState::Unborn => {
+            return Err(GitError::UnbornHead);
         }
+        HeadState::Detached { .. } => return Err(GitError::DetachedHead),
     };
     if upstream.is_some() {
         return Ok(RemoteOperationPlan::Push);
@@ -203,7 +204,7 @@ mod tests {
 
         assert!(matches!(
             plan_push(&head, None, &remotes, None),
-            Err(GitError::DetachedHead)
+            Err(GitError::UnbornHead)
         ));
     }
 }

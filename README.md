@@ -14,6 +14,7 @@ sincronizar con remotes y consultar el historial.
 ## Qué permite hacer
 
 - Abrir varios repositorios locales y cambiar entre ellos mediante pestañas.
+- Clonar repositorios remotos accesibles por SSH y abrirlos en una pestaña.
 - Ver cambios staged, sin preparar, sin seguimiento y en conflicto.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
 - Crear commits sin añadir archivos automáticamente.
@@ -43,15 +44,43 @@ permisos de administrador.
 También se publica `git-helper-<versión>-windows-x86_64-portable.zip`: basta con extraerlo y abrir
 `git-helper.exe`. Git for Windows debe estar disponible en `PATH` en ambos casos.
 
+Durante la instalación con MSI puedes marcar la feature opcional **PATH Environment Variable**
+para invocar `ghelper` desde cualquier terminal. En el ZIP portable, añade manualmente la carpeta
+`bin` (donde están `git-helper.exe` y `ghelper.exe`) al `PATH` del sistema o del usuario si quieres
+el mismo acceso por línea de comandos.
+
 ### Requisitos de uso
 
 - Windows 10 u 11 de 64 bits.
 - [Git for Windows](https://gitforwindows.org/).
 - Opcional: [Cursor CLI](https://cursor.com/cli) y una sesión iniciada para generar mensajes.
+- Para clonar por SSH: clave en `ssh-agent` (`ssh-add`), entrada en `~/.ssh/known_hosts` y Git for Windows con su SSH habitual.
+
+## Línea de comandos
+
+Con la feature PATH del MSI (o la carpeta `bin` en el PATH del ZIP portable) puedes abrir
+repositorios desde PowerShell, Cursor o T3 Code:
+
+```powershell
+ghelper --help
+ghelper .
+ghelper "C:\Users\dev\proyectos\mi-repo"
+```
+
+- `ghelper [RUTA]` abre Git Helper con ese repositorio en la pestaña activa. La ruta puede ser
+  absoluta, relativa al directorio actual o `.` estando ya dentro del repo.
+- Sin argumentos restaura la sesión persistida, igual que abrir la aplicación desde el menú Inicio.
+- Si Git Helper ya está en ejecución, la solicitud se reenvía a la ventana existente: se activa la
+  pestaña del repositorio o se abre una nueva si aún no estaba cargado.
+- Rutas inexistentes, carpetas que no son repositorios Git o Git ausente del PATH muestran un error
+  en la consola y devuelven un código de salida distinto de cero, sin dejar procesos huérfanos.
+
+`ghelper.exe` es un launcher de consola; `git-helper.exe` sigue siendo la aplicación gráfica que
+aparece en el menú Inicio.
 
 ## Uso rápido
 
-1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` o `Ctrl+O`.
+1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` (`Ctrl+O`) o clónalo con `Clonar repositorio` (`Ctrl+Shift+O`).
 2. Prepara los archivos que quieras incluir desde la vista `Cambios`.
 3. Escribe el mensaje —o solicita una propuesta a Cursor— y pulsa `Commit`.
 4. Usa `Fetch`, `Pull` o `Push` desde la barra superior cuando necesites sincronizar.
@@ -61,6 +90,7 @@ Atajos disponibles:
 | Atajo | Acción |
 |---|---|
 | `Ctrl+O` | Abrir repositorio |
+| `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar la pestaña activa |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar de repositorio |
 | `F5` | Actualizar el estado |
@@ -130,7 +160,7 @@ de GitHub.
 | `src/git/` | Única puerta de acceso a `git.exe`, parsers y planes seguros |
 | `src/cursor/` | Contexto staged limitado, ejecución de `agent` y parser JSON |
 | `src/persistence/` | Estado versionado y escritura atómica |
-| `src/process.rs` | Procesos sin shell, pipes, cancelación y timeout |
+| `src/process.rs` | Procesos sin shell, captura aislada, cancelación y timeout |
 | `src/ui/` | Ventana, entrada de commit, listas virtualizadas y tema GPUI |
 | `src/watcher/` | Observación del repositorio y debounce de eventos |
 
@@ -142,6 +172,8 @@ la trazabilidad de código están en [docs/technical-decisions.md](docs/technica
 ## Limitaciones conocidas
 
 - El soporte oficial se limita a Windows 10/11 x64.
+- El clonado remoto admite URLs SSH; HTTPS y otros esquemas quedan pendientes.
+- Git Helper no gestiona claves SSH: usa `ssh-agent`, `~/.ssh/config` y el SSH incluido en Git for Windows.
 - No incluye diff, editor, git graph, checkout de ramas, stash, rebase ni resolución visual de
   conflictos.
 - La vista de ramas es informativa: consultar otra rama carga su historial por referencia sin

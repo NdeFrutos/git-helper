@@ -39,10 +39,26 @@ los ejemplos de Zed. No se copió código GPL de Zed.
 ## Límites de procesos
 
 `src/process.rs` es la única abstracción de procesos. No usa una shell, conserva argumentos como
-`OsString`, lee stdout y stderr en paralelo, permite cancelación cooperativa y aplica timeouts. Git
-recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
-`CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
-las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
+`OsString` y aplica timeouts. stdout, stderr y stdin se redirigen a temporales anónimos: así se
+mantiene la captura independiente de ambos streams sin crear lectores bloqueables cuando un
+descendiente hereda los handles. En Windows, la cancelación y el timeout finalizan el árbol activo
+con `taskkill.exe /PID <pid> /T /F`; el comando auxiliar también se crea con `CREATE_NO_WINDOW`, no
+usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` falla —lo hace también cuando el hijo
+acaba de terminar por su cuenta— se registra el aviso y se continúa con el hijo directo; el runner
+solo devuelve un error de infraestructura si el proceso sigue vivo tras la espera acotada, de modo
+que la clasificación de cancelación o timeout nunca se pierde por esa carrera. La salida normal del padre no espera a
+descendientes que se hayan desacoplado voluntariamente; los datos capturados se leen sin esperar al
+cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
+`CURSOR_API_TOKEN`.
+
+Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
+los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
+descendiente es el propio binario de pruebas —no un intérprete externo, cuyo arranque decidía en CI
+si la prueba llegaba a comprobar algo—, publica su PID y las pruebas verifican su desaparición con
+`tasklist.exe`; no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta
+antes incluso de que el descendiente pudiera escribirlo. La
+comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
+puede no tener Cargo o Windows disponible.
 
 ## Inventario de ramas e historial
 
@@ -114,6 +130,24 @@ El esquema actual es la versión 1. `state.json` se escribe mediante un archivo 
 y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
 continúa con estado vacío.
 
+## Working tree e historial desacoplados (PERF-03)
+
+Cada `RepositorySession` separa `working_tree` (`Arc<WorkingTreeSnapshot>`) e `history`
+(`Arc<HistorySnapshot>`). Un refresh de lectura solo compara y sustituye el working tree; el
+historial paginado permanece intacto salvo invalidación explícita (cambio de `HEAD`/upstream,
+selección de otra rama o carga diferida). Los commits se almacenan en `Arc<Vec<CommitSummary>>`
+para que `render_history` y la paginación no clonen miles de filas en cada frame.
+
+Los contadores de la pestaña Cambios (`change_count`, `staged_count`) se derivan una vez al
+actualizar el working tree. Los detalles de commit se cachean por repositorio con un límite fijo
+(32 entradas, LRU) para evitar clonados profundos al alternar selección.
+
+La medición manual ignorada en la prueba unitaria
+(`finish_refresh_comparison_cost_is_bounded_with_large_history`) conserva el umbral de referencia:
+con 10 000 commits cargados, `finish_refresh` tras un cambio del working tree completa en menos de
+50 ms porque ya no recorre ni compara la lista de commits. La garantía de regresión que se ejecuta
+en CI es determinista y comprueba que los `Arc` del historial permanecen intactos.
+
 ## Estados de interacción por repositorio
 
 Cada `RepositorySession` mantiene por separado `refresh_state` y `mutation_state`. El refresh
@@ -123,3 +157,22 @@ el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión c
 último `status_message` y el error accionable; los errores globales quedan reservados para fallos
 de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
 un estado distinto de un fallo para que la UI no la presente como error.
+
+## Canal de instancia única
+
+`ghelper` y `git-helper.exe` se comunican por un socket TCP en `127.0.0.1` con puerto **efímero**:
+el servidor enlaza el puerto 0 y publica `{version, port, token}` en
+`%LOCALAPPDATA%\GitHelper\instance-endpoint.json`, privado por usuario (en Unix se escribe con
+permisos `0600` fijados en la propia creación, para que el token nunca exista en disco con un
+modo más laxo). Así cada sesión de Windows tiene su propia instancia y ningún programa ajeno
+puede ocupar un puerto fijo y secuestrar el arranque.
+
+Cada solicitud viaja en una trama `GHLP` + versión + token + longitud (`u32`) + payload UTF-8. El
+servidor rechaza marcas o versiones desconocidas, compara el token en tiempo constante y limita el
+payload a 4 KiB antes de reservar memoria. Tras aceptar, revalida la ruta recibida con
+`git rev-parse --show-toplevel` —la validación del proceso `ghelper` no es suficiente, porque el
+receptor no controla quién escribe en el socket— y solo entonces entrega la solicitud a la UI.
+
+El cliente únicamente da el reenvío por bueno si recibe el ACK del protocolo; si no hay endpoint
+publicado, la conexión falla o la confirmación no llega, abre su propia ventana en lugar de
+terminar en silencio.

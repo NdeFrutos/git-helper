@@ -1,0 +1,330 @@
+use std::path::{Path, PathBuf};
+
+use directories::BaseDirs;
+
+use super::GitError;
+
+/// URL SSH parseada y lista para clonar o comparar con un remote existente.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedSshUrl {
+    pub original: String,
+    pub normalized: String,
+    pub host: String,
+    pub repository_path: String,
+    pub repository_name: String,
+}
+
+const UNSUPPORTED_SCHEMES: &[&str] = &["https://", "http://", "file://", "git://", "ftp://"];
+const SSH_SCHEME: &str = "ssh://";
+const DEFAULT_SSH_PORT: u16 = 22;
+
+/// Valida y parsea una URL SSH en los formatos habituales de Git.
+pub fn parse_ssh_url(input: &str) -> Result<ParsedSshUrl, GitError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no puede estar vacía".to_owned(),
+        });
+    }
+    if trimmed.starts_with('-') {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no puede empezar por '-'; git la interpretaría como una opción"
+                .to_owned(),
+        });
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no puede contener espacios ni caracteres de control".to_owned(),
+        });
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for scheme in UNSUPPORTED_SCHEMES {
+        if lower.starts_with(scheme) {
+            return Err(GitError::UnsupportedUrlScheme {
+                scheme: scheme.trim_end_matches("://").to_owned(),
+            });
+        }
+    }
+
+    let parsed = if lower.starts_with(SSH_SCHEME) {
+        parse_ssh_scheme(trimmed)?
+    } else {
+        parse_scp_style(trimmed)?
+    };
+
+    if parsed.repository_path.is_empty() || parsed.repository_name.is_empty() {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no incluye una ruta de repositorio válida".to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
+/// Normaliza una URL SSH para comparar remotes equivalentes.
+pub fn normalize_ssh_url(input: &str) -> Result<String, GitError> {
+    Ok(parse_ssh_url(input)?.normalized)
+}
+
+/// Indica si dos URLs SSH apuntan al mismo repositorio remoto.
+pub fn ssh_urls_equivalent(left: &str, right: &str) -> Result<bool, GitError> {
+    Ok(normalize_ssh_url(left)? == normalize_ssh_url(right)?)
+}
+
+/// Devuelve la carpeta por defecto donde se almacenan los clones.
+pub fn default_clone_root() -> Result<PathBuf, GitError> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| BaseDirs::new().map(|directories| directories.data_local_dir().to_owned()))
+        .map(|root| root.join("GitHelper").join("repos"))
+        .ok_or(GitError::CloneRootUnavailable)
+}
+
+/// Calcula el destino local sugerido para un repositorio clonado por SSH.
+pub fn default_clone_destination(
+    clone_root: &Path,
+    repository_name: &str,
+) -> Result<PathBuf, GitError> {
+    let safe_name = sanitize_directory_name(repository_name);
+    if safe_name.is_empty() {
+        return Err(GitError::InvalidSshUrl {
+            message: "No se pudo derivar un nombre de carpeta seguro para el clon".to_owned(),
+        });
+    }
+    Ok(clone_root.join(safe_name))
+}
+
+fn parse_scp_style(input: &str) -> Result<ParsedSshUrl, GitError> {
+    let Some(colon_index) = input.rfind(':') else {
+        return Err(GitError::InvalidSshUrl {
+            message: "Formato SSH no reconocido; usa git@host:org/repo.git o ssh://…".to_owned(),
+        });
+    };
+    if colon_index == 0 || colon_index == input.len() - 1 {
+        return Err(GitError::InvalidSshUrl {
+            message: "Formato scp inválido; falta el host o la ruta del repositorio".to_owned(),
+        });
+    }
+    let host_part = &input[..colon_index];
+    let path_part = input[colon_index + 1..].trim_start_matches('/');
+    if !host_part.contains('@') {
+        return Err(GitError::InvalidSshUrl {
+            message: "Formato scp inválido; se esperaba usuario@host:ruta".to_owned(),
+        });
+    }
+    let host = host_part
+        .split('@')
+        .nth(1)
+        .ok_or_else(|| GitError::InvalidSshUrl {
+            message: "Formato scp inválido; no se pudo leer el host".to_owned(),
+        })?
+        .to_ascii_lowercase();
+    // La sintaxis scp no admite puerto: todo lo que sigue al `:` es la ruta.
+    Ok(build_parsed(input, &host, None, path_part))
+}
+
+fn parse_ssh_scheme(input: &str) -> Result<ParsedSshUrl, GitError> {
+    // El esquema puede venir en cualquier combinación de mayúsculas (`SSH://`, `Ssh://`),
+    // así que se recorta por longitud en lugar de por coincidencia exacta.
+    let without_scheme = &input[SSH_SCHEME.len()..];
+    let (authority, path_part) =
+        without_scheme
+            .split_once('/')
+            .ok_or_else(|| GitError::InvalidSshUrl {
+                message: "La URL ssh:// debe incluir una ruta de repositorio".to_owned(),
+            })?;
+    if path_part.is_empty() {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL ssh:// no incluye una ruta de repositorio".to_owned(),
+        });
+    }
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let (host, port) = split_host_and_port(host_and_port)?;
+    if host.is_empty() {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL ssh:// no incluye un host válido".to_owned(),
+        });
+    }
+    Ok(build_parsed(input, &host, port, path_part))
+}
+
+/// Separa `host[:puerto]` conservando el puerto para distinguir servidores distintos.
+fn split_host_and_port(authority: &str) -> Result<(String, Option<u16>), GitError> {
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok((authority.to_ascii_lowercase(), None));
+    };
+    // Un IPv6 sin corchetes (`::1`) no lleva puerto: el último `:` forma parte del host.
+    if host.contains(':') && !host.ends_with(']') {
+        return Ok((authority.to_ascii_lowercase(), None));
+    }
+    let port = port.parse::<u16>().map_err(|_| GitError::InvalidSshUrl {
+        message: format!("Puerto SSH inválido: «{port}»"),
+    })?;
+    Ok((host.to_ascii_lowercase(), Some(port)))
+}
+
+fn build_parsed(
+    original: &str,
+    host: &str,
+    port: Option<u16>,
+    repository_path: &str,
+) -> ParsedSshUrl {
+    let repository_path = canonical_repository_path(repository_path);
+    let repository_name = repository_path
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    // El puerto forma parte de la identidad del remoto: `host:2222` y `host` pueden ser
+    // servidores distintos, así que se conserva salvo cuando es el 22 por defecto.
+    let authority = match port {
+        Some(port) if port != DEFAULT_SSH_PORT => format!("{host}:{port}"),
+        _ => host.to_owned(),
+    };
+    let normalized = format!("ssh://{authority}/{repository_path}");
+    ParsedSshUrl {
+        original: original.to_owned(),
+        normalized,
+        host: host.to_owned(),
+        repository_path,
+        repository_name,
+    }
+}
+
+fn normalize_repository_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .replace('\\', "/")
+}
+
+/// Conserva el caso de la ruta: los servidores SSH genéricos distinguen `Team/App` de `team/app`.
+fn canonical_repository_path(path: &str) -> String {
+    let normalized = normalize_repository_path(path);
+    normalized
+        .strip_suffix(".git")
+        .unwrap_or(normalized.as_str())
+        .to_owned()
+}
+
+fn sanitize_directory_name(name: &str) -> String {
+    let mut sanitized = String::new();
+    for character in name.chars() {
+        let mapped = match character {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        };
+        sanitized.push(mapped);
+    }
+    sanitized.trim().trim_end_matches('.').to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_scp_style_urls() {
+        let parsed = parse_ssh_url("git@github.com:org/repo.git").expect("debe parsear scp");
+        assert_eq!(parsed.host, "github.com");
+        assert_eq!(parsed.repository_path, "org/repo");
+        assert_eq!(parsed.repository_name, "repo");
+        assert_eq!(parsed.normalized, "ssh://github.com/org/repo");
+    }
+
+    #[test]
+    fn parses_ssh_scheme_urls() {
+        let parsed =
+            parse_ssh_url("ssh://git@gitlab.com:2222/group/project.git").expect("debe parsear ssh");
+        assert_eq!(parsed.host, "gitlab.com");
+        assert_eq!(parsed.repository_path, "group/project");
+        assert_eq!(parsed.repository_name, "project");
+    }
+
+    #[test]
+    fn rejects_https_and_empty_urls() {
+        assert!(matches!(
+            parse_ssh_url("https://github.com/org/repo.git"),
+            Err(GitError::UnsupportedUrlScheme { .. })
+        ));
+        assert!(matches!(
+            parse_ssh_url(""),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn normalizes_equivalent_urls() {
+        let left = normalize_ssh_url("git@GitHub.com:Org/Repo.git").expect("left");
+        let right = normalize_ssh_url("ssh://git@github.com/Org/Repo").expect("right");
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn keeps_repository_path_case_sensitive() {
+        let parsed = parse_ssh_url("git@host.example:Team/App.git").expect("debe parsear");
+        assert_eq!(parsed.repository_path, "Team/App");
+        assert_eq!(parsed.repository_name, "App");
+        assert!(
+            !ssh_urls_equivalent("git@host.example:Team/App", "git@host.example:team/app")
+                .expect("debe comparar")
+        );
+    }
+
+    #[test]
+    fn rejects_urls_that_look_like_git_options() {
+        assert!(matches!(
+            parse_ssh_url("--upload-pack=calc.exe git@host.example:org/repo.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+        assert!(matches!(
+            parse_ssh_url("--upload-pack=calc.exe"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+        assert!(matches!(
+            parse_ssh_url("git@host.example:org/re po.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_scheme_regardless_of_capitalization() {
+        let parsed = parse_ssh_url("SSH://git@Host.Example/org/repo.git").expect("debe parsear");
+        assert_eq!(parsed.host, "host.example");
+        assert_eq!(parsed.repository_path, "org/repo");
+        assert_eq!(parsed.normalized, "ssh://host.example/org/repo");
+    }
+
+    #[test]
+    fn keeps_non_default_port_in_the_normalized_url() {
+        let custom = normalize_ssh_url("ssh://git@host.example:2222/org/repo.git").expect("2222");
+        let default = normalize_ssh_url("ssh://git@host.example:22/org/repo.git").expect("22");
+        let implicit =
+            normalize_ssh_url("ssh://git@host.example/org/repo.git").expect("sin puerto");
+
+        assert_eq!(custom, "ssh://host.example:2222/org/repo");
+        assert_eq!(default, implicit);
+        assert_ne!(custom, implicit);
+    }
+
+    #[test]
+    fn rejects_invalid_ports() {
+        assert!(matches!(
+            parse_ssh_url("ssh://git@host.example:puerto/org/repo.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn builds_default_destination_under_clone_root() {
+        let root = Path::new("GitHelper").join("repos");
+        let destination = default_clone_destination(&root, "demo").expect("destino");
+        assert_eq!(destination, root.join("demo"));
+    }
+}
