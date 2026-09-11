@@ -120,7 +120,13 @@ Los detalles correctos se cachean por hash de commit en una caché LRU sencilla 
 caché se conserva al cambiar de rama para que volver a un commit conocido no lance otro proceso
 Git. Los errores no se cachean y permanecen asociados a la selección actual para permitir reintento.
 Al refrescar, la selección se conserva solo si el commit sigue en la referencia; en caso contrario
-el fallback es dejarla vacía.
+el fallback es dejarla vacía y no se ofrece reintento, porque no hay nada que volver a pedir.
+
+El refresco lee el historial de la referencia fijada por la vista, pero esa fijación no puede dejar
+la sesión bloqueada: solo se respetan referencias con nombre —un OID suelto de HEAD desacoplado
+quedaría anclado al commit anterior— y, si la referencia ya no existe, el historial vuelve a HEAD en
+lugar de convertir el refresco completo en un error. El estado del repositorio no depende de que la
+rama que se estaba mirando siga viva.
 
 ## Persistencia
 

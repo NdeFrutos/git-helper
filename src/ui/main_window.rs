@@ -21,8 +21,8 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
-        FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
-        RepositorySession, RepositorySnapshot, RepositoryView,
+        FileChange, HeadState, HistoryPage, MutationState, OperationKind, RefreshState,
+        RepositoryId, RepositorySession, RepositorySnapshot, RepositoryView,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
     persistence::{AppStateStore, PersistedAppState},
@@ -488,6 +488,19 @@ impl MainWindow {
         self.history_detail_errors.remove(&repository_id);
     }
 
+    /// El estado de la carga de detalles pertenece a la sesión: la barra solo
+    /// muestra `global_status_message` cuando no hay ningún repositorio activo.
+    fn set_session_status(&mut self, repository_id: RepositoryId, message: &str) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.to_owned();
+        }
+    }
+
     fn clear_history_details_cancellation(&mut self, repository_id: RepositoryId, request_id: u64) {
         if self
             .history_detail_cancellations
@@ -855,20 +868,16 @@ impl MainWindow {
                     if history_included {
                         repository.history_loaded = !history_invalidated_during_refresh;
                         repository.history_loading = false;
-                    } else if history_changed || history_invalidated_during_refresh {
-                        repository.history_generation =
-                            repository.history_generation.saturating_add(1);
-                        repository.history_loaded = false;
-                        repository.history_loading = false;
-                        snapshot.commits.clone_from(&repository.snapshot.commits);
-                        snapshot.has_more_commits = repository.snapshot.has_more_commits;
-                        snapshot
-                            .history_reference
-                            .clone_from(&repository.snapshot.history_reference);
-                        snapshot
-                            .history_oid
-                            .clone_from(&repository.snapshot.history_oid);
                     } else {
+                        // Un refresco sin historial no lo devuelve: se conserva
+                        // el visible para no vaciar la lista, y se marca para
+                        // recarga si HEAD o la invalidación lo dejaron obsoleto.
+                        if history_changed || history_invalidated_during_refresh {
+                            repository.history_generation =
+                                repository.history_generation.saturating_add(1);
+                            repository.history_loaded = false;
+                            repository.history_loading = false;
+                        }
                         snapshot.commits.clone_from(&repository.snapshot.commits);
                         snapshot.has_more_commits = repository.snapshot.has_more_commits;
                         snapshot
@@ -983,9 +992,14 @@ impl MainWindow {
         };
         let repository_id = repository.id;
         repository.selected_view = view;
+        let has_selection = repository.selected_commit.is_some();
         self.save_state(cx);
         if view == RepositoryView::History {
             self.ensure_history_loaded(repository_id, cx);
+        } else if !has_selection {
+            // Un error sin selección viva ya no se puede reintentar ni
+            // interpretar al volver: no debe sobrevivir al cambio de vista.
+            self.history_detail_errors.remove(&repository_id);
         }
         cx.notify();
     }
@@ -2838,7 +2852,7 @@ impl MainWindow {
             BeginDetailsSelection::Cached(details) => {
                 self.selected_commit_details.insert(repository_id, details);
                 self.history_detail_errors.remove(&repository_id);
-                self.global_status_message = "Detalles del commit cargados".to_owned();
+                self.set_session_status(repository_id, "Detalles del commit cargados");
                 cx.notify();
                 return;
             }
@@ -2847,7 +2861,7 @@ impl MainWindow {
         let cancellation = CancellationToken::default();
         self.history_detail_cancellations
             .insert(repository_id, (request.request_id, cancellation.clone()));
-        self.global_status_message = "Cargando detalles del commit…".to_owned();
+        self.set_session_status(repository_id, "Cargando detalles del commit…");
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -2883,14 +2897,16 @@ impl MainWindow {
                     DetailsCompletion::Applied(details) => {
                         this.selected_commit_details.insert(repository_id, *details);
                         this.history_detail_errors.remove(&repository_id);
-                        this.global_status_message = "Detalles del commit cargados".to_owned();
+                        this.set_session_status(repository_id, "Detalles del commit cargados");
                         this.clear_history_details_cancellation(repository_id, request.request_id);
                     }
                     DetailsCompletion::Failed(error) => {
                         this.selected_commit_details.remove(&repository_id);
                         this.history_detail_errors.insert(repository_id, error);
-                        this.global_status_message =
-                            "No se pudieron cargar los detalles".to_owned();
+                        this.set_session_status(
+                            repository_id,
+                            "No se pudieron cargar los detalles",
+                        );
                         this.clear_history_details_cancellation(repository_id, request.request_id);
                     }
                     DetailsCompletion::Stale => {
@@ -3022,6 +3038,10 @@ impl MainWindow {
         let details = self.selected_commit_details.get(&repository_id).cloned();
         let details_loading = self.history_details.is_loading(repository_id);
         let detail_error = self.history_detail_errors.get(&repository_id).cloned();
+        // Los errores que dejan la selección vacía (el commit salió del
+        // historial visible) no se pueden reintentar: el usuario tiene que
+        // elegir otra fila, así que no se ofrece un botón que no haría nada.
+        let can_retry_details = detail_error.is_some() && selected_commit.is_some();
         let has_details_panel = details_loading || detail_error.is_some() || details.is_some();
         div()
             .flex()
@@ -3178,12 +3198,14 @@ impl MainWindow {
                         .when_some(detail_error, |panel, error| {
                             panel
                                 .child(div().text_color(ERROR_COLOR).child(error))
-                                .child(
-                                    action_button("retry-commit-details", "Reintentar", true)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.retry_selected_commit(repository_id, cx);
-                                        })),
-                                )
+                                .when(can_retry_details, |panel| {
+                                    panel.child(
+                                        action_button("retry-commit-details", "Reintentar", true)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.retry_selected_commit(repository_id, cx);
+                                            })),
+                                    )
+                                })
                         })
                         .when_some(details, |panel, details| {
                             panel
@@ -3335,6 +3357,15 @@ fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
     }
 }
 
+/// Lee el snapshot y el historial de la referencia fijada por la vista.
+///
+/// La fijación solo se respeta si es una referencia con nombre. Un OID suelto
+/// —HEAD desacoplado— no puede fijarse: se quedaría anclado al commit anterior
+/// y los commits nuevos no aparecerían nunca.
+///
+/// Si la referencia fijada ya no existe, el historial vuelve a HEAD en lugar de
+/// hacer fallar todo el refresco: el estado del repositorio sigue siendo válido
+/// y una rama borrada no debe dejar la sesión en error de forma permanente.
 fn snapshot_with_history_target(
     git_client: &GitClient,
     root_path: &Path,
@@ -3342,21 +3373,46 @@ fn snapshot_with_history_target(
     history_limit: usize,
     cancellation: &CancellationToken,
 ) -> Result<RepositorySnapshot, GitError> {
-    let Some((reference, oid)) = history_target else {
-        return git_client.snapshot_with_history(root_path, history_limit, cancellation);
-    };
+    let pinned_reference = history_target
+        .map(|(reference, _)| reference)
+        .filter(|reference| reference.starts_with("refs/"));
     let mut snapshot = git_client.snapshot(root_path, cancellation)?;
-    let page = if reference.starts_with("refs/") {
-        git_client.history_for_ref(root_path, &reference, history_limit + 1, 0, cancellation)?
-    } else {
-        git_client.history_for_oid(
+    let page = match pinned_reference {
+        Some(reference) => {
+            match git_client.history_for_ref(
+                root_path,
+                &reference,
+                history_limit + 1,
+                0,
+                cancellation,
+            ) {
+                Ok(page) => Some(page),
+                Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. }) => {
+                    history_page_for_head(
+                        git_client,
+                        root_path,
+                        &snapshot.head,
+                        history_limit,
+                        cancellation,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => history_page_for_head(
+            git_client,
             root_path,
-            &reference,
-            &oid,
-            history_limit + 1,
-            0,
+            &snapshot.head,
+            history_limit,
             cancellation,
-        )?
+        )?,
+    };
+    let Some(page) = page else {
+        snapshot.commits.clear();
+        snapshot.has_more_commits = false;
+        snapshot.history_reference = None;
+        snapshot.history_oid = None;
+        return Ok(snapshot);
     };
     let has_more_commits = page.commits.len() > history_limit;
     snapshot.commits = page
@@ -3369,6 +3425,29 @@ fn snapshot_with_history_target(
     snapshot.history_reference = Some(page.reference);
     snapshot.history_oid = Some(page.oid);
     Ok(snapshot)
+}
+
+/// Historial de HEAD, o `None` si todavía no hay commits.
+fn history_page_for_head(
+    git_client: &GitClient,
+    root_path: &Path,
+    head: &HeadState,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Option<HistoryPage>, GitError> {
+    let Some((reference, oid)) = history_target_for_head(head) else {
+        return Ok(None);
+    };
+    git_client
+        .history_for_oid(
+            root_path,
+            &reference,
+            &oid,
+            history_limit + 1,
+            0,
+            cancellation,
+        )
+        .map(Some)
 }
 
 fn history_target_is_current(repository: &RepositorySession, reference: &str, oid: &str) -> bool {
@@ -4124,6 +4203,187 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn failure_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        ExitStatus::from_raw(1)
+    }
+
+    #[cfg(unix)]
+    fn failure_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(256)
+    }
+
+    /// Runner determinista para el historial: responde estado, resolución de
+    /// referencia y `git log`, y registra qué revisión se consultó.
+    struct ScriptedHistoryRunner {
+        head_oid: &'static str,
+        detached: bool,
+        reference_exists: bool,
+        requested_revisions: Mutex<Vec<String>>,
+        labels: Mutex<Vec<&'static str>>,
+    }
+
+    impl ScriptedHistoryRunner {
+        fn new(head_oid: &'static str, detached: bool, reference_exists: bool) -> Self {
+            Self {
+                head_oid,
+                detached,
+                reference_exists,
+                requested_revisions: Mutex::new(Vec::new()),
+                labels: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn log_record(revision: &str) -> Vec<u8> {
+            let fields = [
+                revision,
+                revision,
+                "",
+                "Autora",
+                "autora@example.invalid",
+                "0",
+                "Autora",
+                "autora@example.invalid",
+                "0",
+                "",
+                "asunto",
+                "",
+            ];
+            let mut record = fields.join("\0").into_bytes();
+            record.push(0);
+            record
+        }
+    }
+
+    impl ProcessRunner for ScriptedHistoryRunner {
+        fn run(
+            &self,
+            request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            self.labels.lock().unwrap().push(request.label);
+            let arguments: Vec<String> = request
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            let (status, stdout) = match request.label {
+                "git-status" => {
+                    let head = if self.detached { "(detached)" } else { "main" };
+                    (
+                        success_status(),
+                        format!("# branch.oid {}\0# branch.head {head}\0", self.head_oid)
+                            .into_bytes(),
+                    )
+                }
+                "git-remotes" | "git-branches" => (success_status(), Vec::new()),
+                "git-resolve-history-ref" => {
+                    if self.reference_exists {
+                        (success_status(), b"abcdef\n".to_vec())
+                    } else {
+                        (failure_status(), Vec::new())
+                    }
+                }
+                "git-history-ref" => {
+                    let revision = arguments
+                        .iter()
+                        .skip_while(|argument| argument.as_str() != "log")
+                        .nth(1)
+                        .expect("git log debe recibir una revisión")
+                        .clone();
+                    let record = Self::log_record(&revision);
+                    self.requested_revisions.lock().unwrap().push(revision);
+                    (success_status(), record)
+                }
+                label => panic!("petición Git inesperada: {label}"),
+            };
+            Ok(ProcessOutput {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_pinned_reference_that_disappeared_falls_back_to_head_without_failing_the_refresh() {
+        let runner = Arc::new(ScriptedHistoryRunner::new("abc123", false, false));
+        let git_client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        let snapshot = snapshot_with_history_target(
+            &git_client,
+            Path::new("repo"),
+            Some(("refs/heads/borrada".to_owned(), "def456".to_owned())),
+            20,
+            &CancellationToken::default(),
+        )
+        .expect("una rama borrada no debe invalidar el estado del repositorio");
+
+        assert_eq!(
+            snapshot.history_reference.as_deref(),
+            Some("refs/heads/main")
+        );
+        assert_eq!(snapshot.history_oid.as_deref(), Some("abc123"));
+        assert_eq!(
+            runner.requested_revisions.lock().unwrap().as_slice(),
+            ["abc123"]
+        );
+    }
+
+    #[test]
+    fn a_detached_head_pin_follows_the_current_head_instead_of_the_previous_oid() {
+        let runner = Arc::new(ScriptedHistoryRunner::new("abc123", true, true));
+        let git_client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        let snapshot = snapshot_with_history_target(
+            &git_client,
+            Path::new("repo"),
+            Some(("def456".to_owned(), "def456".to_owned())),
+            20,
+            &CancellationToken::default(),
+        )
+        .expect("el historial de HEAD desacoplado debe leerse");
+
+        assert_eq!(snapshot.history_oid.as_deref(), Some("abc123"));
+        assert_eq!(
+            runner.requested_revisions.lock().unwrap().as_slice(),
+            ["abc123"],
+            "un OID fijado dejaría el historial anclado al commit anterior"
+        );
+        assert!(
+            !runner
+                .labels
+                .lock()
+                .unwrap()
+                .contains(&"git-resolve-history-ref")
+        );
+    }
+
+    #[test]
+    fn a_pinned_branch_is_honoured_while_it_exists() {
+        let runner = Arc::new(ScriptedHistoryRunner::new("abc123", false, true));
+        let git_client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        let snapshot = snapshot_with_history_target(
+            &git_client,
+            Path::new("repo"),
+            Some(("refs/heads/feature".to_owned(), "def456".to_owned())),
+            20,
+            &CancellationToken::default(),
+        )
+        .expect("la rama fijada debe leerse");
+
+        assert_eq!(
+            snapshot.history_reference.as_deref(),
+            Some("refs/heads/feature")
+        );
+        assert_eq!(snapshot.history_oid.as_deref(), Some("abcdef"));
     }
 
     #[test]
