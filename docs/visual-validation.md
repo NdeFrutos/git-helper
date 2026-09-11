@@ -1,7 +1,8 @@
 # Validación visual manual
 
 Checklist para comprobar la interfaz de Git Helper en Windows antes de distribuir un binario o MSI.
-Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125 % y 150 %.
+La comprobación compacta de UX-06 usa una ventana de 960×640 y se repite con escala DPI del
+100 %, 125 %, 150 % y 200 % cuando el entorno lo permite.
 
 ## Preparación
 
@@ -9,6 +10,10 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 2. Tener al menos un repositorio Git local con cambios staged, unstaged y sin cambios.
 3. Tener Git for Windows instalado y accesible en `PATH`.
 4. Opcional: tener Cursor CLI (`agent`) autenticado para probar la generación de mensajes.
+
+Para UX-06, guardar una captura por tamaño/DPI en la evidencia de la revisión. La captura debe
+incluir la barra de pestañas, la rama, la lista de cambios y la zona de commit; no se deben incluir
+credenciales ni contenido sensible.
 
 ## Arranque y persistencia
 
@@ -25,6 +30,8 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 ## Pestañas y navegación
 
 - [ ] Se pueden abrir varios repositorios en pestañas distintas.
+- [ ] Con diez pestañas abiertas, la barra conserva un control de overflow horizontal y cada pestaña
+  sigue identificándose por nombre truncado y ruta completa accesible.
 - [ ] `Ctrl+Tab` / `Ctrl+Shift+Tab` cambian de pestaña.
 - [ ] El botón de cerrar en cada pestaña cierra solo esa sesión.
 - [ ] Las pestañas internas `Changes` e `History` cambian sin perder el estado de la otra.
@@ -38,6 +45,7 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
+- [ ] Una ruta larga se trunca en la barra inferior sin ocultar el estado ni la versión de Git.
 
 ## Commit y Cursor CLI
 
@@ -55,6 +63,9 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 ## Estados de error y vacío
 
 - [ ] Repositorio sin cambios muestra estado vacío comprensible.
+- [ ] El árbol limpio, el repositorio sin commit inicial, la carga inicial, el fallo inicial y el
+  estado anterior conservado tras un fallo de refresh se distinguen visualmente.
+- [ ] El error muestra un resumen accionable; sus detalles técnicos se pueden expandir y copiar.
 - [ ] Errores de Git (por ejemplo, pull no fast-forward) aparecen en la barra de estado sin colgar
   la UI.
 - [ ] Operaciones largas muestran indicador de carga y se pueden cancelar si aplica.
@@ -67,6 +78,8 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 
 - [ ] El texto es legible con escala del sistema al 100 %.
 - [ ] Con escala 125 % o 150 %, los botones y filas no se solapan de forma inaceptable.
+- [ ] Con escala 200 %, las acciones principales siguen visibles y las acciones de cada fila pueden
+  pasar juntas a una segunda línea sin solaparse con la ruta.
 - [ ] Los colores de estado no son el único indicador (también hay letras/códigos).
 
 ## Instalador (si aplica)
@@ -74,3 +87,10 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 - [ ] El MSI instala `git-helper.exe`, `LICENSE` y `THIRD_PARTY_NOTICES.md`.
 - [ ] El acceso directo y el icono en “Programas y características” usan `assets/icon.ico`.
 - [ ] La desinstalación elimina los archivos instalados sin dejar el ejecutable en `bin`.
+
+## Registro de UX-06
+
+- [x] `cargo build --release --locked` completó correctamente en Windows durante esta revisión.
+- [ ] La inspección interactiva de 960×640 y DPI 100/125/150/200 % queda pendiente cuando haya un
+  entorno de captura nativa disponible; el conector usado en esta revisión no expuso ventanas de
+  aplicaciones de escritorio.

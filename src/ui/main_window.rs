@@ -6,8 +6,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel,
-    Render, Subscription, Window, div, prelude::*, px, rgba, size, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, PromptButton,
+    PromptLevel, Render, Subscription, Window, div, prelude::*, px, rgba, size, uniform_list,
 };
 
 use crate::{
@@ -48,15 +48,26 @@ use super::{
     },
     theme::{
         ACCENT_COLOR, BACKGROUND_COLOR, BORDER_COLOR, ELEVATED_BACKGROUND_COLOR, ERROR_COLOR,
-        HOVER_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR, SELECTED_BACKGROUND_COLOR,
-        SUCCESS_COLOR, WARNING_COLOR,
+        HOVER_BACKGROUND_COLOR, INPUT_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR,
+        SELECTED_BACKGROUND_COLOR, SUCCESS_COLOR, WARNING_COLOR,
     },
 };
 
 const INITIAL_HISTORY_LIMIT: usize = 200;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
-const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 40;
-const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 40;
+const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 56;
+const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 56;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryContentState {
+    Loading,
+    Refreshing,
+    RefreshFailed,
+    Stale,
+    NoInitialCommit,
+    Clean,
+    Changes,
+}
 
 #[derive(Clone)]
 enum ChangeListRow {
@@ -172,6 +183,7 @@ pub struct MainWindow {
     pending_refreshes: HashSet<RepositoryId>,
     global_refresh_in_flight: Option<RepositoryId>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
+    expanded_errors: HashSet<RepositoryId>,
     change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
     git_version: Option<String>,
     global_status_message: String,
@@ -224,6 +236,7 @@ impl MainWindow {
             pending_refreshes: HashSet::new(),
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
+            expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
@@ -1101,6 +1114,7 @@ impl MainWindow {
             self.global_refresh_in_flight = None;
         }
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
+        self.expanded_errors.remove(&repository_id);
         self.change_rows.remove(&repository_id);
         if was_active {
             self.state.active_repository_id = self
@@ -1562,6 +1576,7 @@ impl MainWindow {
                     repository.history_loaded = false;
                     repository.history_loading = false;
                 }
+                repository.has_loaded_snapshot = true;
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
                 };
@@ -2862,69 +2877,92 @@ impl MainWindow {
         let active_id = self.state.active_repository_id;
         div()
             .flex()
+            .min_w(px(0.0))
             .items_center()
             .h(px(38.0))
             .border_b_1()
             .border_color(BORDER_COLOR)
             .bg(ELEVATED_BACKGROUND_COLOR)
-            .children(self.state.repositories.iter().map(|repository| {
-                let repository_id = repository.id;
-                let is_active = active_id == Some(repository_id);
-                let name = repository
-                    .root_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Repositorio")
-                    .to_owned();
-                let full_path = repository.root_path.display().to_string();
-                let change_count = repository.working_tree.changes.len();
+            .child(
                 div()
-                    .id(format!("repository-tab-{repository_id:?}"))
+                    .id("repository-tabs-scroll")
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .h_full()
-                    .px_3()
-                    .border_r_1()
-                    .border_color(BORDER_COLOR)
-                    .aria_label(full_path)
-                    .when(is_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
-                    .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_repository(repository_id, cx);
-                    }))
-                    .child(name)
-                    .when(change_count > 0, |tab| {
-                        tab.child(
-                            div()
-                                .text_xs()
-                                .text_color(WARNING_COLOR)
-                                .child(change_count.to_string()),
-                        )
-                    })
-                    .when(
-                        matches!(repository.refresh_state, RefreshState::Running { .. }),
-                        |tab| tab.child(div().text_xs().text_color(ACCENT_COLOR).child("⟳")),
-                    )
-                    .when(!repository.path_accessible, |tab| {
-                        tab.child(div().text_xs().text_color(WARNING_COLOR).child("⛔"))
-                    })
-                    .when(repository.error.is_some(), |tab| {
-                        tab.child(div().text_xs().text_color(ERROR_COLOR).child("!"))
-                    })
-                    .child(
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .children(self.state.repositories.iter().map(|repository| {
+                        let repository_id = repository.id;
+                        let is_active = active_id == Some(repository_id);
+                        let name = repository
+                            .root_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Repositorio")
+                            .to_owned();
+                        let full_path = repository.root_path.display().to_string();
+                        let change_count = repository.working_tree.changes.len();
                         div()
-                            .id(format!("close-repository-tab-{repository_id:?}"))
-                            .px_1()
-                            .text_color(MUTED_TEXT_COLOR)
+                            .id(format!("repository-tab-{repository_id:?}"))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h_full()
+                            .min_w(px(110.0))
+                            .max_w(px(220.0))
+                            .px_3()
+                            .border_r_1()
+                            .border_color(BORDER_COLOR)
+                            .aria_label(full_path)
+                            .when(is_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
                             .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_repository(repository_id, cx);
+                                this.select_repository(repository_id, cx);
                             }))
-                            .child("×"),
-                    )
-            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .when(change_count > 0, |tab| {
+                                tab.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(WARNING_COLOR)
+                                        .child(change_count.to_string()),
+                                )
+                            })
+                            .when(
+                                matches!(repository.refresh_state, RefreshState::Running { .. }),
+                                |tab| {
+                                    tab.child(div().text_xs().text_color(ACCENT_COLOR).child("⟳"))
+                                },
+                            )
+                            .when(!repository.path_accessible, |tab| {
+                                tab.child(div().text_xs().text_color(WARNING_COLOR).child("⛔"))
+                            })
+                            .when(repository.error.is_some(), |tab| {
+                                tab.child(div().text_xs().text_color(ERROR_COLOR).child("!"))
+                            })
+                            .child(
+                                div()
+                                    .id(format!("close-repository-tab-{repository_id:?}"))
+                                    .px_1()
+                                    .text_color(MUTED_TEXT_COLOR)
+                                    .hover(|style| {
+                                        style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_repository(repository_id, cx);
+                                    }))
+                                    .child("×"),
+                            )
+                    })),
+            )
             .child(
                 div()
                     .id("clone-repository-tab")
@@ -2983,6 +3021,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .flex_1()
@@ -3090,6 +3129,7 @@ impl MainWindow {
         repository: &RepositorySession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let content_state = repository_content_state(repository);
         if !self.change_rows.contains_key(&repository.id) {
             let rows = Arc::new(build_change_rows(
                 repository.id,
@@ -3118,22 +3158,69 @@ impl MainWindow {
             .flex_col()
             .flex_1()
             .overflow_hidden()
-            .child(
-                uniform_list(
-                    "change-list",
+            .child(match content_state {
+                RepositoryContentState::Loading => state_card(
+                    "change-state-loading",
+                    "Cargando repositorio…",
+                    "El estado de Git todavía no está disponible.",
+                    ACCENT_COLOR,
+                ),
+                RepositoryContentState::RefreshFailed => state_card(
+                    "change-state-failed",
+                    "No se pudo cargar el repositorio",
+                    "Pulsa Actualizar para reintentar. No se han interpretado cambios como si fueran reales.",
+                    ERROR_COLOR,
+                ),
+                RepositoryContentState::Clean => state_card(
+                    "change-state-clean",
+                    "Árbol limpio",
+                    "No hay cambios pendientes en el directorio de trabajo.",
+                    SUCCESS_COLOR,
+                ),
+                RepositoryContentState::NoInitialCommit => state_card(
+                    "change-state-unborn",
+                    "Sin commit inicial",
+                    "Prepara los archivos y crea el primer commit. Descartar staged requiere hacer unstage antes.",
+                    WARNING_COLOR,
+                ),
+                RepositoryContentState::Changes => uniform_change_list(
+                    rows.clone(),
                     row_count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                        rows[range]
-                            .iter()
-                            .cloned()
-                            .map(|row| this.render_change_row(repository_id, row, window, cx))
-                            .collect()
-                    }),
-                )
-                .w_full()
-                .flex_1(),
-            )
-            .child(
+                    repository_id,
+                    cx,
+                ),
+                RepositoryContentState::Refreshing => div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(state_banner(
+                        "Actualizando…",
+                        "Mostrando el último estado correcto mientras Git responde.",
+                        ACCENT_COLOR,
+                    ))
+                    .child(uniform_change_list(rows.clone(), row_count, repository_id, cx))
+                    .into_any_element(),
+                RepositoryContentState::Stale => div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(state_banner(
+                        "Estado anterior conservado",
+                        "La actualización falló; los cambios visibles pueden estar desactualizados. Pulsa Actualizar.",
+                        ERROR_COLOR,
+                    ))
+                    .child(uniform_change_list(rows, row_count, repository_id, cx))
+                    .into_any_element(),
+            })
+            .when(
+                !matches!(
+                    content_state,
+                    RepositoryContentState::Loading | RepositoryContentState::RefreshFailed
+                ),
+                |changes| {
+                    changes.child(
                 div()
                     .flex()
                     .flex_col()
@@ -3170,6 +3257,7 @@ impl MainWindow {
                                             !repository.working_tree.changes.is_empty()
                                                 && can_mutate,
                                         )
+                                        .text_color(MUTED_TEXT_COLOR)
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 this.confirm_discard_all(repository_id, window, cx);
@@ -3192,16 +3280,27 @@ impl MainWindow {
                                             }),
                                         ),
                                     )
-                                    .child(action_button("commit", "Commit", commit_enabled).when(
-                                        commit_enabled,
-                                        |button| {
-                                            button.on_click(cx.listener(|this, _, window, cx| {
-                                                this.create_commit(&CreateCommit, window, cx);
-                                            }))
-                                        },
-                                    )),
+                                    .child(
+                                        action_button("commit", "Commit", commit_enabled).when(
+                                            commit_enabled,
+                                            |button| {
+                                                button
+                                                    .bg(ACCENT_COLOR)
+                                                    .text_color(BACKGROUND_COLOR)
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.create_commit(
+                                                            &CreateCommit,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }))
+                                            },
+                                        ),
+                                    ),
                             ),
                     ),
+                    )
+                },
             )
             .into_any_element()
     }
@@ -3300,6 +3399,7 @@ impl MainWindow {
                 let action_path = path.clone();
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .w_full()
                     .gap_x_2()
@@ -3321,7 +3421,7 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(px(120.0))
                             .overflow_hidden()
                             .child(
                                 div()
@@ -3807,6 +3907,7 @@ impl MainWindow {
                             }))
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(if branch.is_active {
                                         SUCCESS_COLOR
@@ -3815,12 +3916,25 @@ impl MainWindow {
                                     })
                                     .child(branch_kind_label(branch.kind)),
                             )
-                            .child(div().text_sm().child(branch.name.clone()))
                             .child(
                                 div()
-                                    .ml_auto()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .child(branch.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(MUTED_TEXT_COLOR)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .max_w(px(150.0))
                                     .child(branch_upstream_label(&branch.upstream)),
                             )
                     })),
@@ -3863,10 +3977,21 @@ impl MainWindow {
                                             .flex()
                                             .flex_col()
                                             .flex_1()
+                                            .min_w(px(0.0))
                                             .overflow_hidden()
-                                            .child(div().text_sm().child(commit.subject.clone()))
                                             .child(
                                                 div()
+                                                    .text_sm()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(commit.subject.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .text_xs()
                                                     .text_color(MUTED_TEXT_COLOR)
                                                     .child(commit.author_name.clone()),
@@ -3948,14 +4073,100 @@ impl MainWindow {
             .into_any_element()
     }
 
+    fn toggle_error_details(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        if !self.expanded_errors.insert(repository_id) {
+            self.expanded_errors.remove(&repository_id);
+        }
+        cx.notify();
+    }
+
+    fn copy_error_details(&self, details: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(details));
+    }
+
+    fn render_repository_feedback(
+        &self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((summary, details)) = repository_feedback(repository) else {
+            return div().into_any_element();
+        };
+        let repository_id = repository.id;
+        let is_expanded = self.expanded_errors.contains(&repository_id);
+        let details_for_copy = details.clone();
+        div()
+            .id("repository-feedback")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(ERROR_COLOR)
+            .bg(ELEVATED_BACKGROUND_COLOR)
+            .text_sm()
+            .child(div().text_color(ERROR_COLOR).child(summary))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        action_button(
+                            "error-details",
+                            if is_expanded {
+                                "Ocultar detalles"
+                            } else {
+                                "Ver detalles"
+                            },
+                            true,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_error_details(repository_id, cx);
+                        })),
+                    )
+                    .child(
+                        action_button("copy-error", "Copiar detalles", true).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.copy_error_details(details_for_copy.clone(), cx);
+                            },
+                        )),
+                    ),
+            )
+            .when(is_expanded, |feedback| {
+                feedback.child(
+                    div()
+                        .id("error-details-content")
+                        .p_2()
+                        .max_h(px(120.0))
+                        .overflow_y_scroll()
+                        .bg(INPUT_BACKGROUND_COLOR)
+                        .text_xs()
+                        .text_color(MUTED_TEXT_COLOR)
+                        .child(details),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_status_bar(&self, repository: Option<&RepositorySession>) -> AnyElement {
         let path = repository
             .map(|repository| repository.root_path.display().to_string())
             .unwrap_or_default();
+        let status = repository.map_or_else(
+            || self.global_status_message.clone(),
+            |repository| repository.status_message.clone(),
+        );
+        let git_version = self
+            .git_version
+            .clone()
+            .unwrap_or_else(|| "Git no detectado".to_owned());
         div()
             .flex()
             .items_center()
-            .justify_between()
+            .gap_3()
             .h(px(26.0))
             .px_3()
             .border_t_1()
@@ -3963,16 +4174,28 @@ impl MainWindow {
             .bg(ELEVATED_BACKGROUND_COLOR)
             .text_xs()
             .text_color(MUTED_TEXT_COLOR)
-            .child(path)
-            .child(repository.map_or_else(
-                || self.global_status_message.clone(),
-                |repository| repository.status_message.clone(),
-            ))
             .child(
-                self.git_version
-                    .clone()
-                    .unwrap_or_else(|| "Git no detectado".to_owned()),
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .id("status-path")
+                    .aria_label(path.clone())
+                    .child(path),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(PRIMARY_TEXT_COLOR)
+                    .child(status),
+            )
+            .child(div().flex_shrink_0().child(git_version))
             .into_any_element()
     }
 
@@ -4201,6 +4424,117 @@ impl MainWindow {
     }
 }
 
+fn uniform_change_list(
+    rows: Arc<Vec<ChangeListRow>>,
+    row_count: usize,
+    repository_id: RepositoryId,
+    cx: &mut Context<MainWindow>,
+) -> AnyElement {
+    uniform_list(
+        "change-list",
+        row_count,
+        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+            rows[range]
+                .iter()
+                .cloned()
+                .map(|row| this.render_change_row(repository_id, row, window, cx))
+                .collect()
+        }),
+    )
+    .w_full()
+    .flex_1()
+    .into_any_element()
+}
+
+fn state_banner(title: &str, message: &str, color: gpui::Rgba) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(BORDER_COLOR)
+        .bg(ELEVATED_BACKGROUND_COLOR)
+        .child(div().text_xs().text_color(color).child(title.to_owned()))
+        .child(
+            div()
+                .text_xs()
+                .text_color(MUTED_TEXT_COLOR)
+                .child(message.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn state_card(id: &str, title: &str, message: &str, color: gpui::Rgba) -> AnyElement {
+    div()
+        .id(id.to_owned())
+        .flex()
+        .flex_1()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_5()
+        .text_center()
+        .child(div().text_lg().text_color(color).child(title.to_owned()))
+        .child(
+            div()
+                .max_w(px(520.0))
+                .text_sm()
+                .text_color(MUTED_TEXT_COLOR)
+                .child(message.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn repository_content_state(repository: &RepositorySession) -> RepositoryContentState {
+    if !repository.has_loaded_snapshot {
+        return match repository.refresh_state {
+            RefreshState::Failed { .. } | RefreshState::Cancelled { .. } => {
+                RepositoryContentState::RefreshFailed
+            }
+            _ => RepositoryContentState::Loading,
+        };
+    }
+    if matches!(repository.refresh_state, RefreshState::Failed { .. }) {
+        return RepositoryContentState::Stale;
+    }
+    if repository.is_refreshing() {
+        return RepositoryContentState::Refreshing;
+    }
+    if repository.change_counters.change_count == 0 {
+        return if matches!(repository.working_tree.head, HeadState::Unborn) {
+            RepositoryContentState::NoInitialCommit
+        } else {
+            RepositoryContentState::Clean
+        };
+    }
+    RepositoryContentState::Changes
+}
+
+fn repository_feedback(repository: &RepositorySession) -> Option<(String, String)> {
+    match &repository.refresh_state {
+        RefreshState::Failed { details, .. } => Some((
+            "No se pudo actualizar el estado. Pulsa Actualizar para reintentar.".to_owned(),
+            details.clone(),
+        )),
+        _ => match &repository.mutation_state {
+            MutationState::Failed { details, .. } => Some((
+                "Git rechazó la operación. Revisa los detalles y vuelve a intentarlo.".to_owned(),
+                details.clone(),
+            )),
+            _ => repository.error.clone().map(|details| {
+                (
+                    "No se pudo completar la acción. Revisa los detalles y vuelve a intentarlo."
+                        .to_owned(),
+                    details,
+                )
+            }),
+        },
+    }
+}
+
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_pending_existing_clone_open(window, cx);
@@ -4241,24 +4575,9 @@ impl Render for MainWindow {
             .when(self.clone_panel_visible || self.clone_in_progress, |root| {
                 root.child(self.render_clone_panel(cx))
             })
-            .when_some(
-                active_repository
-                    .as_ref()
-                    .and_then(|repository| repository.error.clone()),
-                |root, error| {
-                    root.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(ERROR_COLOR)
-                            .bg(ELEVATED_BACKGROUND_COLOR)
-                            .text_sm()
-                            .text_color(ERROR_COLOR)
-                            .child(error),
-                    )
-                },
-            )
+            .when_some(active_repository.as_ref(), |root, repository| {
+                root.child(self.render_repository_feedback(repository, cx))
+            })
             .when_some(self.global_error.clone(), |root, error| {
                 root.child(
                     div()
@@ -4816,6 +5135,7 @@ mod tests {
             pending_refreshes: HashSet::new(),
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
+            expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
             git_version: None,
             global_status_message: String::new(),
@@ -5485,6 +5805,51 @@ mod tests {
         };
 
         assert_eq!(group.height_px(), file.height_px());
+    }
+
+    #[test]
+    fn repository_content_states_distinguish_loading_clean_stale_and_unborn() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Loading
+        );
+
+        repository.refresh_state = RefreshState::Failed {
+            message: "fallo".to_owned(),
+            details: "stderr".to_owned(),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::RefreshFailed
+        );
+
+        repository.has_loaded_snapshot = true;
+        repository.refresh_state = RefreshState::Succeeded {
+            message: "ok".to_owned(),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::NoInitialCommit
+        );
+
+        Arc::make_mut(&mut repository.working_tree).head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: Some("abc".to_owned()),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Clean
+        );
+
+        repository.refresh_state = RefreshState::Failed {
+            message: "fallo".to_owned(),
+            details: "stderr".to_owned(),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Stale
+        );
     }
 
     #[test]

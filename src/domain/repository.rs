@@ -212,6 +212,9 @@ pub struct RepositorySession {
     pub working_tree: Arc<WorkingTreeSnapshot>,
     pub history: Arc<HistorySnapshot>,
     pub change_counters: ChangeCounters,
+    /// Indica que el working tree visible procede de una lectura Git correcta.
+    /// No se persiste: las sesiones restauradas deben volver a validarse.
+    pub has_loaded_snapshot: bool,
     pub selected_view: RepositoryView,
     pub selected_change: Option<ChangeSelection>,
     pub selected_commit: Option<CommitId>,
@@ -239,6 +242,7 @@ impl RepositorySession {
             working_tree: Arc::new(WorkingTreeSnapshot::default()),
             history: Arc::new(HistorySnapshot::empty()),
             change_counters: ChangeCounters::default(),
+            has_loaded_snapshot: false,
             selected_view: RepositoryView::default(),
             selected_change: None,
             selected_commit: None,
