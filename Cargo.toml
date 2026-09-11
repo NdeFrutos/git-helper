@@ -9,6 +9,10 @@ license = "Apache-2.0"
 repository = "https://github.com/NdeFrutos/git-helper"
 publish = false
 
+[[bin]]
+name = "ghelper"
+path = "src/bin/ghelper.rs"
+
 [package.metadata.wix]
 eula = false
 license = "LICENSE"

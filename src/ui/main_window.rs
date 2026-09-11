@@ -15,6 +15,8 @@ use crate::{
         CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
         PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
     },
+    app::AppStartup,
+    cli::{InstanceRequest, InstanceRequestReceiver},
     cursor::{
         CommitMessageRequest, CursorClient, GenerationApplyDecision, build_cursor_context,
         resolve_cursor_executable, validate_generation_result,
@@ -141,6 +143,8 @@ pub struct MainWindow {
     git_version: Option<String>,
     global_status_message: String,
     global_error: Option<String>,
+    pending_startup_repository: Option<PathBuf>,
+    instance_request_receiver: Option<InstanceRequestReceiver>,
 }
 
 #[allow(
@@ -152,7 +156,11 @@ pub struct MainWindow {
 impl MainWindow {
     /// Restaura sesiones persistidas sin bloquear la creación de la ventana.
     #[must_use]
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        startup: AppStartup,
+        instance_request_receiver: InstanceRequestReceiver,
+        _cx: &mut Context<Self>,
+    ) -> Self {
         let state_store = AppStateStore::default_location().ok();
         let state = AppState::default();
         Self {
@@ -177,11 +185,25 @@ impl MainWindow {
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
             global_error: None,
+            pending_startup_repository: startup.open_repository,
+            instance_request_receiver: Some(instance_request_receiver),
         }
     }
 
     /// Detecta Git y refresca todas las pestañas restauradas en background.
     pub fn initialize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(instance_request_receiver) = self.instance_request_receiver.clone() {
+            cx.spawn(async move |this, cx| {
+                while let Ok(request) = instance_request_receiver.recv().await {
+                    this.update(cx, |this, cx| {
+                        this.handle_instance_request(request, cx);
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 return;
@@ -247,18 +269,22 @@ impl MainWindow {
                             }
                         }
                         this.save_state(cx);
+                        this.apply_pending_startup_repository(cx);
                         this.global_status_message = "Sesión restaurada".to_owned();
                         cx.notify();
                     }
                     Err(error) => {
                         this.global_error =
                             Some(format!("No se pudo restaurar el estado: {error}"));
+                        this.apply_pending_startup_repository(cx);
                         cx.notify();
                     }
                 })
                 .ok();
             })
             .detach();
+        } else {
+            self.apply_pending_startup_repository(cx);
         }
 
         let git_client = self.git_client.clone();
@@ -376,6 +402,24 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    fn apply_pending_startup_repository(&mut self, cx: &mut Context<Self>) {
+        if let Some(root_path) = self.pending_startup_repository.take() {
+            self.finish_open_repository(root_path, cx);
+        }
+    }
+
+    fn handle_instance_request(&mut self, request: InstanceRequest, cx: &mut Context<Self>) {
+        match request {
+            InstanceRequest::Activate => {
+                cx.activate(true);
+            }
+            InstanceRequest::OpenRepository(root_path) => {
+                self.finish_open_repository(root_path, cx);
+                cx.activate(true);
+            }
+        }
     }
 
     fn finish_open_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
@@ -3443,6 +3487,8 @@ mod tests {
             git_version: None,
             global_status_message: String::new(),
             global_error: None,
+            pending_startup_repository: None,
+            instance_request_receiver: None,
         }
     }
 

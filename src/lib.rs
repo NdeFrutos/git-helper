@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod app;
+pub mod cli;
 pub mod cursor;
 pub mod domain;
 pub mod git;
