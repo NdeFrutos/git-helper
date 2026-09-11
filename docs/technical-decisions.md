@@ -86,6 +86,28 @@ filtro y el watcher se reconstruye con las rutas ignoradas actuales, sin ejecuta
 Si notify comunica un error, la UI conserva el estado visible, retira el watcher fallido y deja F5
 como recuperación explícita; un refresh correcto vuelve a instalar la vigilancia.
 
+## Coordinación de refrescos (UX-01)
+
+Cada `RepositorySession` incluye un `RefreshCoordinator` con dos banderas: `in_flight` indica si hay
+una lectura de estado en curso y `dirty` acumula invalidaciones recibidas mientras tanto. Una
+solicitud de refresh solo arranca un proceso Git cuando `request()` devuelve `true`; las peticiones
+concurrentes marcan `dirty` y se encolan sin crear una tarea por evento.
+
+Al terminar un refresh —con éxito, error o cancelación— `finish()` libera `in_flight` y devuelve si
+hace falta como máximo un refresh adicional que consuma lo pendiente. Si llegan eventos durante ese
+segundo refresh, vuelven a marcar `dirty` y el ciclo se repite una vez más. Las lecturas de status
+siguen usando `GIT_OPTIONAL_LOCKS=0` para no reactivar el watcher por cambios en `.git/index`.
+
+Las mutaciones Git (stage, unstage, descarte, commit, fetch, pull, push) y la generación de mensaje
+con Cursor se serializan por repositorio: mientras `mutation_state` está en `Running`, los refreshes
+solicitados marcan `dirty` y se guardan en `pending_refreshes`. Al finalizar la mutación —incluso si
+falla o se cancela— se llama a `refresh_repository` para reconciliar el snapshot con el working tree
+real.
+
+Al cerrar una pestaña se cancelan los tokens activos, se eliminan watchers y se descartan respuestas
+cuya generación ya no coincide con la sesión. Un watcher que termine de instalarse después del cierre
+no se registra ni procesa eventos.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
