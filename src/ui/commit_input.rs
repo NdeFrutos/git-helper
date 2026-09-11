@@ -1,12 +1,19 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, Style, TextRun, UTF16Selection, Window, WrappedLine, actions, div, fill, point,
-    prelude::*, px, relative, rgba, size,
+    App, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
+    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, Rgba, Size, Style, TextRun, UTF16Selection, Window, WrappedLine,
+    actions, div, fill, point, prelude::*, px, relative, rgba, size,
 };
+
+/// Mínimo de líneas visibles cuando el campo está vacío o con poco texto.
+const MIN_VISIBLE_LINES: f32 = 2.0;
+/// Máximo de líneas visibles antes de activar scroll interno.
+const MAX_VISIBLE_LINES: f32 = 6.0;
+/// Padding vertical total del contenedor (`p_2` arriba + `p_2` abajo).
+const CONTAINER_VERTICAL_PADDING: f32 = 16.0;
 
 use super::theme::{BORDER_COLOR, INPUT_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR};
 
@@ -566,13 +573,18 @@ impl Render for CommitInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle.clone();
         let is_focused = focus_handle.is_focused(window);
+        let line_height = window.line_height();
+        let min_height = line_height * MIN_VISIBLE_LINES + px(CONTAINER_VERTICAL_PADDING);
+        let max_height = line_height * MAX_VISIBLE_LINES + px(CONTAINER_VERTICAL_PADDING);
         div()
             .id("commit-input")
             .key_context("CommitInput")
             .track_focus(&focus_handle)
             .relative()
-            .h(px(92.0))
             .w_full()
+            .min_h(min_height)
+            .max_h(max_height)
+            .overflow_hidden()
             .p_2()
             .rounded_sm()
             .border_1()
@@ -615,7 +627,13 @@ impl Render for CommitInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(TextElement { input: cx.entity() })
+            .child(
+                div()
+                    .id("commit-input-scroll")
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(TextElement { input: cx.entity() }),
+            )
             .when(self.is_generating, |element| {
                 element.child(
                     div()
@@ -673,12 +691,34 @@ impl Element for TextElement {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let input = self.input.clone();
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
+        let layout_id = window.request_measured_layout(
+            style,
+            move |known_dimensions, available_space, window, cx| {
+                let input_state = input.read(cx);
+                let (display_text, text_color, _content_is_empty) =
+                    display_text_for_input(input_state);
+                let wrap_width = known_dimensions
+                    .width
+                    .or(match available_space.width {
+                        AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    })
+                    .unwrap_or(px(200.0));
+                let lines = shape_display_lines(&display_text, text_color, wrap_width, window, cx);
+                let line_height = window.line_height();
+                let content_height = content_height_for_lines(&lines, line_height);
+                Size {
+                    width: known_dimensions.width.unwrap_or(wrap_width),
+                    height: content_height,
+                }
+            },
+        );
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -691,45 +731,10 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor_offset = input.cursor_offset();
-        let style = window.text_style();
-        let display_text = if content.is_empty() {
-            if input.is_generating {
-                "Generando mensaje con Cursor…".to_owned()
-            } else {
-                "Escribe el mensaje de commit…".to_owned()
-            }
-        } else {
-            content
-        };
-        let text_color = if input.content.is_empty() {
-            MUTED_TEXT_COLOR
-        } else {
-            PRIMARY_TEXT_COLOR
-        };
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color.into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let lines = window
-            .text_system()
-            .shape_text(
-                display_text.into(),
-                font_size,
-                &[run],
-                Some(bounds.size.width),
-                None,
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let (display_text, text_color, content_is_empty) = display_text_for_input(input);
+        let lines = shape_display_lines(&display_text, text_color, bounds.size.width, window, cx);
         let line_height = window.line_height();
         let cursor_position = position_for_index(&lines, cursor_offset, line_height);
         let cursor = cursor_position.map(|position| {
@@ -746,7 +751,7 @@ impl Element for TextElement {
             &selected_range,
             line_height,
             bounds,
-            input.content.is_empty(),
+            content_is_empty,
         );
         TextPrepaintState {
             lines,
@@ -802,6 +807,64 @@ impl Element for TextElement {
             window.paint_quad(cursor);
         }
     }
+}
+
+fn display_text_for_input(input: &CommitInput) -> (String, Rgba, bool) {
+    let content_is_empty = input.content.is_empty();
+    let display_text = if content_is_empty {
+        if input.is_generating {
+            "Generando mensaje con Cursor…".to_owned()
+        } else {
+            "Escribe el mensaje de commit…".to_owned()
+        }
+    } else {
+        input.content.clone()
+    };
+    let text_color = if content_is_empty {
+        MUTED_TEXT_COLOR
+    } else {
+        PRIMARY_TEXT_COLOR
+    };
+    (display_text, text_color, content_is_empty)
+}
+
+fn shape_display_lines(
+    display_text: &str,
+    text_color: Rgba,
+    wrap_width: Pixels,
+    window: &mut Window,
+    _cx: &mut App,
+) -> Vec<WrappedLine> {
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let run = TextRun {
+        len: display_text.len(),
+        font: style.font(),
+        color: text_color.into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_text(
+            display_text.to_owned().into(),
+            font_size,
+            &[run],
+            Some(wrap_width),
+            None,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn content_height_for_lines(lines: &[WrappedLine], line_height: Pixels) -> Pixels {
+    lines
+        .iter()
+        .map(|line| line.size(line_height).height)
+        .fold(Pixels::ZERO, |total, height| total + height)
+        .max(line_height)
 }
 
 fn position_for_index(
