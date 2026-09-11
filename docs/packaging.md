@@ -122,10 +122,12 @@ Las `restore-keys` degradan por prefijo, de modo que un cambio de lockfile aún 
 y los artefactos del toolchain anterior en lugar de partir de cero. Ninguna clave incluye
 `github.ref`: así una PR o una release pueden restaurar la caché escrita en `main`.
 
-`.github/scripts/ensure-cargo-wix.ps1` comprueba la versión real de `cargo-wix.exe` antes de decidir
-si instala. Con `restore-keys` una restauración parcial puede traer un binario de otra versión, así
-que no basta con comprobar que el fichero existe: si la versión no coincide se reinstala con
-`--force` y se verifica después. Cambiar `CARGO_WIX_VERSION` invalida además la clave exacta.
+`.github/scripts/ensure-cargo-wix.ps1` comprueba qué versión de cargo-wix hay instalada antes de
+decidir si instala, leyéndola de `cargo install --list` (el registro que Cargo mantiene en
+`~/.cargo/.crates.toml`, también cacheado). Con `restore-keys` una restauración parcial puede traer
+un binario de otra versión, así que no basta con comprobar que el fichero existe: si la versión no
+coincide se reinstala con `--force` y se verifica después. Cambiar `CARGO_WIX_VERSION` invalida
+además la clave exacta.
 
 ### Qué invalida qué
 
@@ -193,15 +195,17 @@ el tiempo de pared y la suma de minutos de runner.
 Con las dos dry-runs de la sección anterior el objetivo de 7–8 minutos queda confirmado y superado
 cuando la caché está caliente:
 
-Fase | Antes de CI-02 | Dry-run fría | Dry-run caliente
+Fase | Antes de CI-02 | Dry-run con caché de release fría | Dry-run caliente
 --- | ---: | ---: | ---:
-Checks (Clippy + tests) | 6 min 16 s | 6 min 48 s | 1 min 33 s
+Checks (Clippy + tests) | 6 min 16 s | 1 min 33 s | 1 min 33 s
 Build + WiX + MSI | 6 min 49 s | 10 min 36 s | 3 min 38 s
 Tiempo de pared total | aproximadamente 13 min | 11 min 51 s | 4 min 09 s
 
-En frío el pipeline apenas mejora los 13 minutos previos, porque `checks` y `package` compilan en
-paralelo lo mismo que antes se compilaba en serie; la ganancia real la aporta la caché. No se crea
-ninguna etiqueta ni release para obtener estas mediciones.
+En la primera dry-run solo estaba fría la clave de release: `checks` usa la clave de dev, que ya
+estaba caliente, y por eso tardó lo mismo en las dos. La medición de `checks` partiendo de cero es la
+de la tabla anterior (408 s). El tiempo de pared lo marca siempre `package`, el camino crítico: con
+caché caliente el pipeline completo baja de unos 13 minutos a 4 min 09 s. No se crea ninguna etiqueta
+ni release para obtener estas mediciones.
 
 ## Validación posterior al empaquetado
 
