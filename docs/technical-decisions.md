@@ -107,7 +107,8 @@ un estado distinto de un fallo para que la UI no la presente como error.
 `ghelper` y `git-helper.exe` se comunican por un socket TCP en `127.0.0.1` con puerto **efímero**:
 el servidor enlaza el puerto 0 y publica `{version, port, token}` en
 `%LOCALAPPDATA%\GitHelper\instance-endpoint.json`, privado por usuario (en Unix se escribe con
-permisos `0600`). Así cada sesión de Windows tiene su propia instancia y ningún programa ajeno
+permisos `0600` fijados en la propia creación, para que el token nunca exista en disco con un
+modo más laxo). Así cada sesión de Windows tiene su propia instancia y ningún programa ajeno
 puede ocupar un puerto fijo y secuestrar el arranque.
 
 Cada solicitud viaja en una trama `GHLP` + versión + token + longitud (`u32`) + payload UTF-8. El

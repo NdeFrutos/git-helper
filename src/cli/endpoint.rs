@@ -66,8 +66,7 @@ pub fn write_endpoint(path: &Path, endpoint: &InstanceEndpoint) -> io::Result<()
     }
     let contents = serde_json::to_vec(endpoint)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut file = File::create(path)?;
-    restrict_to_current_user(&file)?;
+    let mut file = create_private_file(path)?;
     file.write_all(&contents)?;
     file.sync_all()?;
     Ok(())
@@ -104,16 +103,30 @@ pub fn remove_endpoint_if_owned(path: &Path, owned: &InstanceEndpoint) {
     }
 }
 
+/// Crea el archivo del endpoint legible solo por el usuario actual.
+///
+/// Los permisos se fijan en la propia creación para que el token nunca llegue a
+/// existir en disco con un modo más laxo; `set_permissions` cubre además el caso
+/// de un archivo que ya existiera con permisos heredados.
 #[cfg(unix)]
-fn restrict_to_current_user(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn create_private_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
+/// En Windows el archivo hereda las ACL de `%LOCALAPPDATA%`, que ya es privado
+/// por usuario, así que basta con crearlo.
 #[cfg(not(unix))]
-fn restrict_to_current_user(_file: &File) -> io::Result<()> {
-    Ok(())
+fn create_private_file(path: &Path) -> io::Result<File> {
+    File::create(path)
 }
 
 #[cfg(test)]
@@ -155,6 +168,26 @@ mod tests {
             .expect("debe escribir el archivo");
 
         assert!(read_endpoint(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publishes_the_token_only_readable_by_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("debe crear el directorio temporal");
+        let path = directory.path().join("endpoint.json");
+        std::fs::write(&path, b"previo").expect("debe crear el archivo previo");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("debe aflojar los permisos previos");
+
+        write_endpoint(&path, &InstanceEndpoint::new(1234)).expect("debe escribir el endpoint");
+
+        let mode = std::fs::metadata(&path)
+            .expect("debe leer los metadatos")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
