@@ -1708,11 +1708,9 @@ impl MainWindow {
                     self.periodic_fetch_in_flight
                         .remove(&(repository_id, remote_name));
                 } else {
-                    repository.remote_freshness.detect_external_updates(
-                        &remotes,
-                        &branches,
-                        now_secs,
-                    );
+                    repository
+                        .remote_freshness
+                        .detect_external_updates(&remotes, &branches, now_secs);
                 }
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
@@ -3099,18 +3097,18 @@ impl MainWindow {
                                         message: error.to_string(),
                                         details: error.technical_details(),
                                     };
-                                    repository.status_message =
-                                        if kind == OperationKind::Fetch && suppress_error {
-                                            repository.remote_freshness.label_for_remote(
-                                                fetch_context.as_ref().map_or(
-                                                    "remote",
-                                                    |context| context.remote_name.as_str(),
-                                                ),
-                                                SystemClock.now_secs(),
-                                            )
-                                        } else {
-                                            "La operación falló".to_owned()
-                                        };
+                                    repository.status_message = if kind == OperationKind::Fetch
+                                        && suppress_error
+                                    {
+                                        repository.remote_freshness.label_for_remote(
+                                            fetch_context.as_ref().map_or("remote", |context| {
+                                                context.remote_name.as_str()
+                                            }),
+                                            SystemClock.now_secs(),
+                                        )
+                                    } else {
+                                        "La operación falló".to_owned()
+                                    };
                                     repository.error =
                                         if kind == OperationKind::Fetch && suppress_error {
                                             None
