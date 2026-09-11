@@ -8,7 +8,10 @@ use std::{
 };
 
 use crate::{
-    domain::{CommitDetails, Remote, RemoteOperationPlan, RepositorySnapshot},
+    domain::{
+        BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage, Remote,
+        RemoteOperationPlan, RepositorySnapshot,
+    },
     process::{
         CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
         SystemProcessRunner,
@@ -16,8 +19,9 @@ use crate::{
 };
 
 use super::{
-    DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData, parse_log, parse_status,
-    resolve_upstream, validate_existing_path_inside_repository, validate_relative_path,
+    BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
+    parse_branch_refs, parse_log, parse_status, resolve_upstream,
+    validate_existing_path_inside_repository, validate_relative_path,
 };
 
 const LOCAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,6 +33,7 @@ pub struct GitClient {
     executable: PathBuf,
     runner: Arc<dyn ProcessRunner>,
     remote_cache: Arc<Mutex<HashMap<PathBuf, Vec<Remote>>>>,
+    branch_cache: Arc<Mutex<HashMap<PathBuf, Vec<BranchReference>>>>,
 }
 
 impl Default for GitClient {
@@ -45,6 +50,7 @@ impl GitClient {
             executable,
             runner: Arc::new(SystemProcessRunner),
             remote_cache: Arc::new(Mutex::new(HashMap::new())),
+            branch_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -55,6 +61,7 @@ impl GitClient {
             executable,
             runner,
             remote_cache: Arc::new(Mutex::new(HashMap::new())),
+            branch_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -116,31 +123,41 @@ impl GitClient {
         )?))
     }
 
-    /// Lee status y remotes como un snapshot ligero para la UI.
+    /// Lee status, remotes y referencias de ramas como un snapshot ligero para la UI.
     pub fn snapshot(
         &self,
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, GitError> {
-        let (status, remotes) = thread::scope(|scope| {
+        let (status, remotes, branches) = thread::scope(|scope| {
             let remotes_worker = scope.spawn(|| self.remotes(repository_root, cancellation));
+            let branches_worker = scope.spawn(|| self.branch_refs(repository_root, cancellation));
             let status = self.status(repository_root, cancellation);
             let remotes = remotes_worker
                 .join()
                 .map_err(|_| GitError::WorkerPanicked {
                     operation: "git remote",
                 })?;
-            Ok::<_, GitError>((status?, remotes?))
+            let branches = branches_worker
+                .join()
+                .map_err(|_| GitError::WorkerPanicked {
+                    operation: "git for-each-ref",
+                })?;
+            Ok::<_, GitError>((status?, remotes?, branches?))
         })?;
         let upstream = resolve_upstream(&status, &remotes);
+        let branches = mark_active_branch(branches, &status.head);
 
         Ok(RepositorySnapshot {
             head: status.head,
             upstream,
             remotes,
+            branches,
             changes: status.changes,
             commits: Vec::new(),
             has_more_commits: false,
+            history_reference: None,
+            history_oid: None,
         })
     }
 
@@ -151,23 +168,38 @@ impl GitClient {
         history_limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, GitError> {
-        let (snapshot, commits) = thread::scope(|scope| {
-            let history_worker =
-                scope.spawn(|| self.history(repository_root, history_limit + 1, 0, cancellation));
-            let snapshot = self.snapshot(repository_root, cancellation);
-            let commits = history_worker
-                .join()
-                .map_err(|_| GitError::WorkerPanicked {
-                    operation: "git log",
-                })?;
-            Ok::<_, GitError>((snapshot?, commits?))
-        })?;
-        let has_more_commits = commits.len() > history_limit;
-        let commits = commits
+        let mut snapshot = self.snapshot(repository_root, cancellation)?;
+        let page = match history_target(&snapshot.head) {
+            Some((reference, oid)) if reference.starts_with("refs/") => self.history_for_oid(
+                repository_root,
+                &reference,
+                &oid,
+                history_limit + 1,
+                0,
+                cancellation,
+            )?,
+            Some((_, oid)) => self.history_for_revision(
+                repository_root,
+                &oid,
+                history_limit + 1,
+                0,
+                cancellation,
+            )?,
+            None => HistoryPage {
+                reference: String::new(),
+                oid: String::new(),
+                commits: Vec::new(),
+            },
+        };
+        let has_more_commits = page.commits.len() > history_limit;
+        let commits = page
+            .commits
             .into_iter()
             .take(history_limit)
             .map(|commit| commit.summary)
             .collect();
+        snapshot.history_reference = (!page.reference.is_empty()).then_some(page.reference);
+        snapshot.history_oid = (!page.oid.is_empty()).then_some(page.oid);
 
         Ok(RepositorySnapshot {
             commits,
@@ -241,9 +273,67 @@ impl GitClient {
         Ok(remotes)
     }
 
+    /// Enumera ramas locales y referencias remote-tracking en una sola lectura cacheable.
+    pub fn branches(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BranchReference>, GitError> {
+        let status = self.status(repository_root, cancellation)?;
+        let branches = self.branch_refs(repository_root, cancellation)?;
+        Ok(mark_active_branch(branches, &status.head))
+    }
+
+    fn branch_refs(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BranchReference>, GitError> {
+        if let Some(branches) = self
+            .branch_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(repository_root)
+            .cloned()
+        {
+            return Ok(branches);
+        }
+        let output = self.run_git_read_only(
+            "git-branches",
+            repository_root,
+            [
+                "for-each-ref",
+                &format!("--format={BRANCH_FORMAT}"),
+                "refs/heads",
+                "refs/remotes",
+            ],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        let branches = parse_branch_refs(&require_success(output)?.stdout)?;
+        self.branch_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(repository_root.to_path_buf(), branches.clone());
+        Ok(branches)
+    }
+
     /// Invalida los remotes cacheados cuando cambia la configuración local.
     pub fn invalidate_remotes(&self, repository_root: &Path) {
         self.remote_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(repository_root);
+        self.branch_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(repository_root);
+    }
+
+    /// Invalida el inventario cuando el watcher detecta cambios en refs.
+    pub fn invalidate_branches(&self, repository_root: &Path) {
+        self.branch_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(repository_root);
@@ -318,6 +408,135 @@ impl GitClient {
         } else {
             Err(command_failed(&output))
         }
+    }
+
+    /// Resuelve una rama/ref y carga su historial sin cambiar el checkout.
+    pub fn history_for_ref(
+        &self,
+        repository_root: &Path,
+        reference: &str,
+        limit: usize,
+        offset: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<HistoryPage, GitError> {
+        validate_history_ref(reference)?;
+        let oid = self.resolve_ref_oid(repository_root, reference, cancellation)?;
+        self.history_for_oid(
+            repository_root,
+            reference,
+            &oid,
+            limit,
+            offset,
+            cancellation,
+        )
+    }
+
+    /// Pagina desde el OID fijado al seleccionar la referencia.
+    ///
+    /// Aunque la rama se mueva mientras la petición está en vuelo, todas las
+    /// páginas pertenecen al mismo grafo hasta que la UI seleccione de nuevo.
+    pub fn history_for_oid(
+        &self,
+        repository_root: &Path,
+        reference: &str,
+        oid: &str,
+        limit: usize,
+        offset: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<HistoryPage, GitError> {
+        let oid = validate_oid(oid)?;
+        if reference != oid {
+            validate_history_ref(reference)?;
+        }
+        let commits =
+            self.history_from_revision(repository_root, &oid, limit, offset, cancellation)?;
+        Ok(HistoryPage {
+            reference: reference.to_owned(),
+            oid,
+            commits,
+        })
+    }
+
+    fn history_for_revision(
+        &self,
+        repository_root: &Path,
+        revision: &str,
+        limit: usize,
+        offset: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<HistoryPage, GitError> {
+        let oid = validate_oid(revision)?;
+        let commits =
+            self.history_from_revision(repository_root, &oid, limit, offset, cancellation)?;
+        Ok(HistoryPage {
+            reference: oid.clone(),
+            oid,
+            commits,
+        })
+    }
+
+    fn history_from_revision(
+        &self,
+        repository_root: &Path,
+        revision: &str,
+        limit: usize,
+        offset: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CommitDetails>, GitError> {
+        let arguments = vec![
+            OsString::from("log"),
+            OsString::from(revision),
+            OsString::from("--date-order"),
+            OsString::from("--decorate=full"),
+            OsString::from("-z"),
+            OsString::from(format!("--format={LOG_FORMAT}")),
+            OsString::from(format!("--max-count={limit}")),
+            OsString::from(format!("--skip={offset}")),
+            OsString::from("--"),
+        ];
+        let output = self.run_git_os_read_only(
+            "git-history-ref",
+            repository_root,
+            arguments,
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        if output.status.success() {
+            parse_log(&output.stdout)
+        } else if is_empty_history_error(&output.stderr) {
+            Ok(Vec::new())
+        } else {
+            Err(command_failed(&output))
+        }
+    }
+
+    fn resolve_ref_oid(
+        &self,
+        repository_root: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitError> {
+        let revision = OsString::from(format!("{reference}^{{commit}}"));
+        let output = self.run_git_os_read_only(
+            "git-resolve-history-ref",
+            repository_root,
+            vec![
+                OsString::from("rev-parse"),
+                OsString::from("--verify"),
+                OsString::from("--quiet"),
+                revision,
+            ],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::ReferenceNotFound {
+                value: reference.to_owned(),
+            });
+        }
+        decode_trimmed_stdout(&output, "git rev-parse de referencia")
     }
 
     /// Carga un commit concreto por su hash validado.
@@ -825,6 +1044,70 @@ fn decode_trimmed_stdout(
     Ok(text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
+fn history_target(head: &HeadState) -> Option<(String, String)> {
+    match head {
+        HeadState::Branch {
+            name,
+            oid: Some(oid),
+        } => Some((format!("refs/heads/{name}"), oid.clone())),
+        HeadState::Detached { oid } if !oid.is_empty() => Some((oid.clone(), oid.clone())),
+        HeadState::Branch { oid: None, .. } | HeadState::Detached { .. } | HeadState::Unborn => {
+            None
+        }
+    }
+}
+
+fn mark_active_branch(
+    mut branches: Vec<BranchReference>,
+    head: &HeadState,
+) -> Vec<BranchReference> {
+    let HeadState::Branch { name, oid } = head else {
+        return branches;
+    };
+    let active_full_name = format!("refs/heads/{name}");
+    if let Some(branch) = branches
+        .iter_mut()
+        .find(|branch| branch.full_name == active_full_name)
+    {
+        branch.is_active = true;
+    } else {
+        // Una rama unborn aún no existe bajo refs/heads, pero sigue siendo útil en el inventario.
+        branches.push(BranchReference {
+            name: name.clone(),
+            full_name: active_full_name,
+            oid: oid.clone(),
+            kind: BranchKind::Local,
+            is_active: true,
+            upstream: BranchUpstream::NoUpstream,
+        });
+    }
+    branches
+}
+
+fn validate_history_ref(reference: &str) -> Result<(), GitError> {
+    if !(reference.starts_with("refs/heads/") || reference.starts_with("refs/remotes/"))
+        || reference.ends_with('/')
+        || reference.contains('\0')
+        || reference.contains("..")
+        || reference.contains("@{")
+        || reference.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(GitError::InvalidReferenceName {
+            value: reference.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_oid(oid: &str) -> Result<String, GitError> {
+    if !(4..=64).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GitError::InvalidReferenceName {
+            value: oid.to_owned(),
+        });
+    }
+    Ok(oid.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -861,8 +1144,19 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessError> {
             let stdout = match request.label {
-                "git-status" => b"# branch.oid (initial)\0# branch.head main\0".to_vec(),
+                "git-status" => {
+                    b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head main\0"
+                        .to_vec()
+                }
                 "git-remotes" => b"origin\n".to_vec(),
+                "git-branches" => concat!(
+                    "refs/heads/main",
+                    "\0",
+                    "0123456789012345678901234567890123456789",
+                    "\0\0\0\0\n"
+                )
+                .as_bytes()
+                .to_vec(),
                 _ => Vec::new(),
             };
             self.requests
@@ -907,6 +1201,13 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.label == "git-branches")
+                .count(),
+            1
+        );
         assert!(
             requests
                 .iter()
@@ -946,7 +1247,12 @@ mod tests {
             .unwrap();
         let requests = runner.requests();
 
-        for label in ["git-status", "git-remotes", "git-history"] {
+        for label in [
+            "git-status",
+            "git-remotes",
+            "git-branches",
+            "git-history-ref",
+        ] {
             assert_eq!(
                 requests
                     .iter()

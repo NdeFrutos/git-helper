@@ -44,6 +44,18 @@ recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
 `CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
 las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
 
+## Inventario de ramas e historial
+
+Las ramas locales y referencias remote-tracking se obtienen con una única lectura NUL-delimitada
+de `git for-each-ref` y se guardan en una caché por repositorio. La caché se invalida cuando cambian
+las refs o la configuración Git; no se lanza un proceso por rama ni se consulta la red para mostrar
+referencias remotas. `refs/remotes/*/HEAD` se descarta por ser simbólica.
+
+El historial seleccionado se resuelve a un OID y se consulta con `git log <oid> --`, por lo que
+seleccionar una rama no hace checkout ni modifica `HEAD`, el índice o el working tree. Cada carga
+paginada conserva la referencia, el OID, el repositorio y una generación de sesión; los resultados
+que llegan tarde después de cambiar de rama o de pestaña se descartan.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado

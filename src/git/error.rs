@@ -31,12 +31,16 @@ pub enum GitError {
     InvalidStatus { message: String },
     #[error("no se pudo interpretar el historial Git: {message}")]
     InvalidLog { message: String },
+    #[error("no se pudo interpretar el inventario de ramas Git: {message}")]
+    InvalidBranches { message: String },
     #[error("la ruta no es segura para esta operación: {path:?}")]
     UnsafePath { path: PathBuf },
     #[error("la ruta no está dentro del repositorio: {path:?}")]
     PathOutsideRepository { path: PathBuf },
     #[error("el remote o la rama no son válidos: {value}")]
     InvalidReferenceName { value: String },
+    #[error("la referencia Git ya no existe: {value}")]
+    ReferenceNotFound { value: String },
     #[error("el mensaje de commit está vacío")]
     EmptyCommitMessage,
     #[error("un worker interno de Git terminó inesperadamente durante {operation}")]

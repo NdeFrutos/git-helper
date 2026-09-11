@@ -1,6 +1,14 @@
 /// Identificador completo de un commit.
 pub type CommitId = String;
 
+/// Página de historial obtenida desde una referencia concreta y su OID resuelto.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    pub reference: String,
+    pub oid: String,
+    pub commits: Vec<CommitDetails>,
+}
+
 /// Referencia decorativa asociada a un commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reference {

@@ -18,6 +18,7 @@ sincronizar con remotes y consultar el historial.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
 - Crear commits sin añadir archivos automáticamente.
 - Ejecutar `fetch`, `pull --ff-only` y `push`, incluida la primera publicación de una rama.
+- Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
@@ -136,6 +137,9 @@ la trazabilidad de código están en [docs/technical-decisions.md](docs/technica
 - El soporte oficial se limita a Windows 10/11 x64.
 - No incluye diff, editor, git graph, checkout de ramas, stash, rebase ni resolución visual de
   conflictos.
+- La vista de ramas es informativa: consultar otra rama carga su historial por referencia sin
+  modificar `HEAD`, el índice ni el working tree. Las referencias remotas reflejan el último
+  `fetch` y no consultan la red por sí mismas.
 - Si existen varios remotes y no hay upstream, algunas operaciones necesitan una selección
   explícita.
 - El instalador aún no está firmado digitalmente.
