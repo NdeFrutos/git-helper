@@ -583,44 +583,79 @@ impl GitClient {
         repository_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<StagedContextData, GitError> {
-        let name_status = self.run_checked_text(
-            "git-staged-name-status",
-            repository_root,
-            ["diff", "--cached", "--name-status", "-z"],
-            cancellation,
-        )?;
-        let numstat = self.run_checked_text(
-            "git-staged-numstat",
-            repository_root,
-            ["diff", "--cached", "--numstat", "-z"],
-            cancellation,
-        )?;
-        let textual_diff = self.run_checked_text(
-            "git-staged-diff",
-            repository_root,
-            ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--"],
-            cancellation,
-        )?;
-        let recent_subjects = if self.has_head(repository_root, cancellation)? {
-            self.run_checked_text(
-                "git-recent-subjects",
+        // Estas lecturas no forman una transacción. Comparar la identidad
+        // antes y después evita construir un prompt mezclando dos índices.
+        for _attempt in 0..2 {
+            let initial_identity = self.staged_identity(repository_root, cancellation)?;
+            let name_status = self.run_checked_text(
+                "git-staged-name-status",
                 repository_root,
-                ["log", "--max-count=20", "--format=%s"],
+                ["diff", "--cached", "--name-status", "-z"],
                 cancellation,
-            )?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect()
-        } else {
-            Vec::new()
-        };
+            )?;
+            let numstat = self.run_checked_text(
+                "git-staged-numstat",
+                repository_root,
+                ["diff", "--cached", "--numstat", "-z"],
+                cancellation,
+            )?;
+            let textual_diff = self.run_checked_text(
+                "git-staged-diff",
+                repository_root,
+                ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--"],
+                cancellation,
+            )?;
+            let recent_subjects = if self.has_head(repository_root, cancellation)? {
+                self.run_checked_text(
+                    "git-recent-subjects",
+                    repository_root,
+                    ["log", "--max-count=20", "--format=%s"],
+                    cancellation,
+                )?
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect()
+            } else {
+                Vec::new()
+            };
+            let final_identity = self.staged_identity(repository_root, cancellation)?;
+            if initial_identity == final_identity {
+                return Ok(StagedContextData {
+                    name_status,
+                    numstat,
+                    textual_diff,
+                    recent_subjects,
+                    index_identity: final_identity,
+                });
+            }
+        }
 
-        Ok(StagedContextData {
-            name_status,
-            numstat,
-            textual_diff,
-            recent_subjects,
-        })
+        Err(GitError::StagedStateChanged)
+    }
+
+    /// Devuelve una identidad machine-readable del contenido staged.
+    pub fn staged_identity(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, GitError> {
+        let output = self.run_git_read_only(
+            "git-staged-identity",
+            repository_root,
+            [
+                "diff",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        Ok(require_success(output)?.stdout)
     }
 
     /// Indica si existe un commit inicial.

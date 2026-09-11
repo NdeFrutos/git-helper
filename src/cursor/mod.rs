@@ -2,6 +2,7 @@ mod client;
 mod context_builder;
 mod error;
 mod executable;
+mod generation;
 mod response_parser;
 
 pub use client::{CursorAuthentication, CursorAvailability, CursorClient};
@@ -10,4 +11,5 @@ pub use context_builder::{
 };
 pub use error::CursorError;
 pub use executable::resolve_cursor_executable;
+pub use generation::{CommitMessageRequest, GenerationApplyDecision, validate_generation_result};
 pub use response_parser::parse_cursor_result;

@@ -47,6 +47,7 @@ pub struct CommitMessageChanged;
 pub struct CommitInput {
     focus_handle: FocusHandle,
     content: String,
+    content_version: u64,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -63,6 +64,7 @@ impl CommitInput {
         Self {
             focus_handle: cx.focus_handle(),
             content: String::new(),
+            content_version: 0,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -109,10 +111,17 @@ impl CommitInput {
         &self.content
     }
 
+    /// Versión monotónica del texto, incluida la edición manual.
+    #[must_use]
+    pub const fn content_version(&self) -> u64 {
+        self.content_version
+    }
+
     /// Sustituye la propuesta sin ejecutar ninguna acción adicional.
     pub fn set_content(&mut self, content: String, cx: &mut Context<Self>) {
         let end = content.len();
         self.content = content;
+        self.content_version = self.content_version.saturating_add(1);
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -308,6 +317,7 @@ impl CommitInput {
     fn replace_selection(&mut self, replacement: &str) {
         self.content
             .replace_range(self.selected_range.clone(), replacement);
+        self.content_version = self.content_version.saturating_add(1);
         let end = self.selected_range.start + replacement.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
