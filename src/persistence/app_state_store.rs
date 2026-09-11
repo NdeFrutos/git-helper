@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, OperationState, RefreshCoordinator, RepositoryId, RepositorySession,
-    RepositorySnapshot, RepositoryView,
+    AppSettings, AppState, MutationState, RefreshCoordinator, RefreshState, RepositoryId,
+    RepositorySession, RepositorySnapshot, RepositoryView,
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -100,7 +100,10 @@ impl PersistedAppState {
                 selected_view: repository.selected_view,
                 selected_change: None,
                 selected_commit: None,
-                operation_state: OperationState::default(),
+                refresh_state: RefreshState::default(),
+                mutation_state: MutationState::default(),
+                status_message: "Preparando repositorio…".to_owned(),
+                error: None,
                 refresh_generation: 0,
                 history_generation: 0,
                 history_loaded: false,
