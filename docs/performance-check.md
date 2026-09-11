@@ -13,7 +13,7 @@ Consolida mediciones headless (capa Git) y comprobaciones manuales de UI en Wind
 | Elemento | Detalle |
 |---|---|
 | SO | Windows 10/11 x64 |
-| Build | `cargo build --release --locked` |
+| Build | `cargo build --release --locked` (la comprobación en reposo necesita además `--features perf-hooks`, ver paso 3) |
 | Git | Git for Windows en `PATH` |
 | Hardware | Anotar CPU, RAM y escala DPI en el informe |
 | Duración típica | ~15 min (fixtures + bench) + 5 min comprobaciones manuales |
@@ -45,7 +45,7 @@ Desde la raíz del repositorio, en PowerShell:
 Esto:
 
 1. Compila `git-helper.exe` y `bench.exe` en release.
-2. Genera fixtures con **0**, **300** y **2.000** cambios sin stage.
+2. Genera fixtures con **0**, **300** y **2.000** archivos versionados y modificados sin stage.
 3. Ejecuta el benchmark Rust por fixture y guarda JSON en `perf-results/bench/`.
 4. Comprueba procesos `git.exe` en reposo durante 60 s (fixture `clean`).
 5. Escribe `perf-results/perf-report.json` con SHA, hardware y resultados.
@@ -67,6 +67,10 @@ Para omitir la comprobación de reposo (headless CI, sin ventana):
 ```
 
 Cada fixture incluye `perf-manifest.json` con la ruta relativa del archivo usado en stage.
+Los archivos se versionan en un commit base y después se modifican, de modo que el fixture
+tiene N cambios sobre contenido seguido por Git (`git status` recorre y compara cada archivo);
+con ficheros sin seguir, Git colapsa el directorio en una sola entrada y la medición no
+representaría el escenario.
 
 ### 2. Benchmark de la capa Git
 
@@ -80,9 +84,16 @@ Métricas reportadas (p50/p95):
 
 - Coste de lanzar `git --version`
 - `status`, `snapshot`, `snapshot_with_history`
-- Flujo app: `stage` → `snapshot` → `unstage`
-- Baseline CLI: `git add` → `git restore --staged`
-- **Sobrecoste app** = diferencia p95 app vs CLI
+- Flujo app completo: `stage` → `snapshot` → `unstage` (`stage_flow_ms`)
+- Flujo app sin refresco: `stage` → `unstage` (`stage_only_ms`)
+- Baseline CLI: `git add` → `git restore --staged` (`git_cli_stage_ms`)
+- **Sobrecoste app** (`stage_overhead_ms`) = `stage_only_ms` − `git_cli_stage_ms`, es decir el
+  mismo trabajo en ambos lados. El snapshot de `stage_flow_ms` no entra en la comparación
+  porque el Git CLI no hace ese refresco; se reporta aparte como coste del flujo de la app.
+
+En el fixture `clean` (0 cambios) no hay nada que preparar: el bench avisa por `stderr`, omite las
+métricas `stage_*` del JSON y mide solo `status`/`snapshot`. Para forzar una medición de stage en
+un repositorio sin cambios, pasar `--stage-file <ruta-relativa>`.
 
 ### 3. Procesos Git en reposo
 
@@ -105,9 +116,15 @@ Remove-Item Env:GH_PERF_OPEN_REPO
 `GH_PERF_OPEN_REPO` abre el repositorio al iniciar (solo para mediciones; no es telemetría).
 Sin auto-fetch ni actividad externa, **no debe aparecer ningún `git.exe`** durante el muestreo.
 
+El script solo cuenta los `git.exe` iniciados después de lanzar la app, pero no puede
+distinguir el proceso padre: cerrar IDEs, agentes y shells que puedan ejecutar Git antes de
+medir, o el recuento saldrá contaminado.
+
 ### 4. Analizar trazas locales
 
-Ejecutar la app con logging detallado (no registra contenido del repo):
+Las trazas `Proceso finalizado` se emiten en nivel `debug`: con el nivel por defecto (`info`)
+el log no contendrá muestras. Ejecutar la app con logging detallado (no registra contenido del
+repo):
 
 ```powershell
 $env:RUST_LOG = 'git_helper=debug,info'

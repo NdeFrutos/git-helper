@@ -6,6 +6,8 @@
 .DESCRIPTION
     Lee %LOCALAPPDATA%\GitHelper\logs\git-helper.log (o una ruta explícita) y extrae
     elapsed_ms de entradas "Proceso finalizado". No incluye contenido del repositorio.
+    Esas entradas se registran en nivel debug: ejecutar la app con
+    $env:RUST_LOG = 'git_helper=debug,info' o el log no contendrá muestras.
 
 .PARAMETER LogPath
     Ruta al archivo de log. Por defecto usa el log diario de Git Helper.
@@ -35,7 +37,10 @@ if (-not (Test-Path -LiteralPath $LogPath)) {
 }
 
 $pattern = 'operation=(?<operation>[^\s]+).*elapsed_ms=(?<elapsed>\d+)'
+# Solo eventos de proceso completado: las trazas de cancelación y timeout también llevan
+# elapsed_ms y falsearían los percentiles de latencia.
 $entries = Select-String -LiteralPath $LogPath -Pattern $pattern -AllMatches |
+    Where-Object { $_.Line -like '*Proceso finalizado*' } |
     ForEach-Object {
         foreach ($match in $_.Matches) {
             [pscustomobject]@{

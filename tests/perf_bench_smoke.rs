@@ -1,4 +1,6 @@
-//! Smoke test del benchmark headless: valida que el example compila y mide en un repo temporal.
+//! Smoke test de las operaciones que mide el benchmark headless (`examples/bench.rs`):
+//! comprueba que snapshot, stage y unstage funcionan sobre un repositorio temporal.
+//! La compilación del propio example la cubre `cargo test --all-targets`.
 
 use std::{fs, path::Path, process::Command};
 

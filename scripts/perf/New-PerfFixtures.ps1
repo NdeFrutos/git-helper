@@ -5,7 +5,9 @@
 
 .DESCRIPTION
     Crea fixtures deterministas bajo un directorio de salida. Cada fixture incluye un
-    commit inicial y archivos modificados sin stage. No envía datos fuera de la máquina.
+    commit inicial con los archivos ya versionados y, después, el mismo número de archivos
+    modificados sin stage (cambios sobre contenido seguido por Git, no ficheros sin seguir:
+    así `git status` debe recorrer y comparar cada archivo). No envía datos fuera de la máquina.
 
 .PARAMETER OutputRoot
     Directorio donde se crearán los fixtures (por defecto perf-fixtures junto al repo).
@@ -17,7 +19,7 @@
     .\New-PerfFixtures.ps1 -OutputRoot .\perf-fixtures -ChangeCounts 0,300,2000
 #>
 param(
-    [string] $OutputRoot = (Join-Path (Split-Path $PSScriptRoot -Parent -Parent) 'perf-fixtures'),
+    [string] $OutputRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'perf-fixtures'),
     [int[]] $ChangeCounts = @(0, 300, 2000)
 )
 
@@ -58,6 +60,9 @@ function Add-ModifiedFiles {
     $changesRoot = Join-Path $RepositoryPath 'changes'
     New-Item -ItemType Directory -Path $changesRoot -Force | Out-Null
 
+    # Primera pasada: crear el contenido base y versionarlo, para que los cambios
+    # posteriores sean modificaciones de archivos seguidos por Git y no ficheros sin
+    # seguir (que `git status` puede colapsar en una sola entrada de directorio).
     for ($index = 0; $index -lt $Count; $index += 1) {
         $shard = [math]::Floor($index / 100)
         $shardDirectory = Join-Path $changesRoot ("shard-{0:D3}" -f $shard)
@@ -65,6 +70,22 @@ function Add-ModifiedFiles {
             New-Item -ItemType Directory -Path $shardDirectory | Out-Null
         }
         $filePath = Join-Path $shardDirectory ("file-{0:D5}.txt" -f $index)
+        Set-Content -LiteralPath $filePath -Value ("base-{0}" -f $index) -NoNewline
+    }
+
+    Push-Location $RepositoryPath
+    try {
+        git add changes | Out-Null
+        git commit -m "base de $Count archivos" | Out-Null
+    }
+    finally {
+        Pop-Location
+    }
+
+    # Segunda pasada: modificar cada archivo versionado para dejar $Count cambios sin stage.
+    for ($index = 0; $index -lt $Count; $index += 1) {
+        $shard = [math]::Floor($index / 100)
+        $filePath = Join-Path (Join-Path $changesRoot ("shard-{0:D3}" -f $shard)) ("file-{0:D5}.txt" -f $index)
         Set-Content -LiteralPath $filePath -Value ("change-{0}" -f $index) -NoNewline
     }
 }

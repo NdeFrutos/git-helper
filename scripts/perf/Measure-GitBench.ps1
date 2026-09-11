@@ -25,7 +25,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path $PSScriptRoot -Parent -Parent
+$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $benchExe = Join-Path $repoRoot 'target\release\examples\bench.exe'
 if (-not (Test-Path -LiteralPath $benchExe)) {
     Write-Host 'Compilando bench en release…'

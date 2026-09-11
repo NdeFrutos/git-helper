@@ -8,6 +8,11 @@
     procesos git.exe existen en cada intervalo. Útil para validar que no hay auto-fetch ni
     refrescos espurios en reposo.
 
+    Limitación: Windows no expone el proceso padre vía Get-Process, así que solo se cuentan
+    los git.exe iniciados después de lanzar Git Helper. Si otra herramienta (IDE, agente,
+    shell) ejecuta git durante el muestreo, sus procesos se contabilizan igual; medir con el
+    resto de herramientas Git cerradas.
+
 .PARAMETER Executable
     Ruta a git-helper.exe compilado en release con la feature `perf-hooks`
     (`cargo build --release --locked --features perf-hooks`). Sin esa feature el binario
@@ -23,7 +28,7 @@
     Intervalo entre muestras.
 #>
 param(
-    [string] $Executable = (Join-Path (Split-Path $PSScriptRoot -Parent -Parent) 'target\release\git-helper.exe'),
+    [string] $Executable = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'target\release\git-helper.exe'),
     [Parameter(Mandatory)]
     [string] $RepositoryPath,
     [int] $SampleSeconds = 60,
@@ -37,6 +42,8 @@ $resolvedRepository = (Resolve-Path -LiteralPath $RepositoryPath).Path
 $env:GH_PERF_OPEN_REPO = $resolvedRepository
 
 $application = Start-Process -FilePath $resolvedExecutable -PassThru
+# Los git.exe anteriores al arranque no son de esta medición; se descartan por hora de inicio.
+$launchedAt = $application.StartTime
 Start-Sleep -Seconds 8
 
 $samples = @()
@@ -44,7 +51,12 @@ $deadline = (Get-Date).AddSeconds($SampleSeconds)
 
 try {
     while ((Get-Date) -lt $deadline -and -not $application.HasExited) {
-        $gitProcesses = @(Get-Process -Name git -ErrorAction SilentlyContinue)
+        $gitProcesses = @(
+            Get-Process -Name git -ErrorAction SilentlyContinue |
+                Where-Object {
+                    try { $_.StartTime -ge $launchedAt } catch { $false }
+                }
+        )
         $samples += [pscustomobject]@{
             timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
             git_process_count = $gitProcesses.Count

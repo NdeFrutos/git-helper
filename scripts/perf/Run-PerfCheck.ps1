@@ -18,14 +18,14 @@
     Omite la comprobación de procesos git en reposo (requiere ventana visible).
 #>
 param(
-    [string] $OutputRoot = (Join-Path (Split-Path $PSScriptRoot -Parent -Parent) 'perf-results'),
+    [string] $OutputRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'perf-results'),
     [int[]] $ChangeCounts = @(0, 300, 2000),
     [int] $Iterations = 40,
     [switch] $SkipIdleCheck
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path $PSScriptRoot -Parent -Parent
+$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $fixturesRoot = Join-Path $OutputRoot 'fixtures'
 $benchRoot = Join-Path $OutputRoot 'bench'
 New-Item -ItemType Directory -Path $fixturesRoot, $benchRoot -Force | Out-Null
@@ -111,7 +111,7 @@ $report = [ordered]@{
     bench_reports   = $benchReports
     idle_git_processes = $idleReport
     manual_checks   = @(
-        'Primer frame visible (<1 s): medir con trazas RUST_LOG=info o cronómetro.',
+        'Primer frame visible (<1 s): medir con trazas RUST_LOG=git_helper=debug,info o cronómetro.',
         'Cambio de pestaña Cambios/Historial p95 (<100 ms): medir con trazas o grabación de pantalla.',
         'Scroll en listas grandes: validar suavidad visual con fixture changes-2000.'
     )

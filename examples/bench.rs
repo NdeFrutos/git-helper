@@ -42,8 +42,17 @@ struct Measurements {
     snapshot: PercentileStats,
     #[serde(rename = "snapshot_with_history_ms")]
     snapshot_with_history: PercentileStats,
+    /// Métricas de stage: ausentes si el repositorio no tiene cambios que preparar.
+    #[serde(flatten)]
+    stage: Option<StageMeasurements>,
+}
+
+#[derive(Serialize)]
+struct StageMeasurements {
     #[serde(rename = "stage_flow_ms")]
     stage_flow: PercentileStats,
+    #[serde(rename = "stage_only_ms")]
+    stage_only: PercentileStats,
     #[serde(rename = "git_cli_stage_ms")]
     git_cli_stage: PercentileStats,
     #[serde(rename = "stage_overhead_ms")]
@@ -75,7 +84,11 @@ struct BenchOptions {
 fn main() {
     let options = parse_options();
     let stage_relative = resolve_stage_file(&options);
-    let report = run_benchmark(&options.repository, options.iterations, &stage_relative);
+    let report = run_benchmark(
+        &options.repository,
+        options.iterations,
+        stage_relative.as_deref(),
+    );
     emit_report(&report, options.json_output);
 }
 
@@ -114,6 +127,12 @@ fn parse_options() -> BenchOptions {
         }
     }
 
+    if iterations == 0 {
+        // Coherente con el resto de errores de argumentos: código 2, no panic.
+        eprintln!("--iterations debe ser al menos 1; no hay percentiles sin muestras");
+        std::process::exit(2);
+    }
+
     BenchOptions {
         repository,
         iterations,
@@ -122,20 +141,27 @@ fn parse_options() -> BenchOptions {
     }
 }
 
-fn resolve_stage_file(options: &BenchOptions) -> PathBuf {
+fn resolve_stage_file(options: &BenchOptions) -> Option<PathBuf> {
     if let Some(stage_file) = &options.stage_file {
-        return stage_file.clone();
+        return Some(stage_file.clone());
     }
-    discover_stage_candidate(&options.repository).unwrap_or_else(|| {
+    let candidate = discover_stage_candidate(&options.repository);
+    if candidate.is_none() {
+        // El fixture `clean` (0 cambios) es un escenario válido del procedimiento: se miden
+        // status y snapshot, y las métricas de stage quedan fuera del informe.
         eprintln!(
-            "No hay archivos modificados para medir stage. \
-             Pasa --stage-file <ruta-relativa> o crea cambios con scripts/perf/New-PerfFixtures.ps1"
+            "Aviso: no hay archivos modificados; se omiten las métricas de stage. \
+             Usa --stage-file <ruta-relativa> para forzar una."
         );
-        std::process::exit(2);
-    })
+    }
+    candidate
 }
 
-fn run_benchmark(repository: &Path, iterations: usize, stage_relative: &Path) -> BenchReport {
+fn run_benchmark(
+    repository: &Path,
+    iterations: usize,
+    stage_relative: Option<&Path>,
+) -> BenchReport {
     let client = GitClient::default();
     let cancellation = CancellationToken::default();
     let _ = client.detect_version(&cancellation);
@@ -167,21 +193,41 @@ fn run_benchmark(repository: &Path, iterations: usize, stage_relative: &Path) ->
                 .unwrap();
         })
     });
-    let stage_flow_ms = collect_samples(iterations, || {
-        measure(|| {
-            client
-                .stage(repository, stage_relative, &cancellation)
-                .unwrap();
-            client.snapshot(repository, &cancellation).unwrap();
-            client
-                .unstage(repository, stage_relative, &cancellation)
-                .unwrap();
-        })
+    let stage = stage_relative.map(|stage_relative| {
+        let stage_flow = collect_samples(iterations, || {
+            measure(|| {
+                client
+                    .stage(repository, stage_relative, &cancellation)
+                    .unwrap();
+                client.snapshot(repository, &cancellation).unwrap();
+                client
+                    .unstage(repository, stage_relative, &cancellation)
+                    .unwrap();
+            })
+        });
+        let stage_only = collect_samples(iterations, || {
+            measure(|| {
+                client
+                    .stage(repository, stage_relative, &cancellation)
+                    .unwrap();
+                client
+                    .unstage(repository, stage_relative, &cancellation)
+                    .unwrap();
+            })
+        });
+        let git_cli_stage = collect_samples(iterations, || {
+            measure(|| run_git_cli_stage(repository, stage_relative))
+        });
+        // El sobrecoste compara el mismo trabajo en ambos lados (stage + unstage). `stage_flow`
+        // incluye además el snapshot de refresco, que el Git CLI no hace, y no es comparable.
+        let stage_overhead = diff_percentiles(&stage_only, &git_cli_stage);
+        StageMeasurements {
+            stage_flow,
+            stage_only,
+            git_cli_stage,
+            stage_overhead,
+        }
     });
-    let git_cli_stage_ms = collect_samples(iterations, || {
-        measure(|| run_git_cli_stage(repository, stage_relative))
-    });
-    let stage_overhead_ms = diff_percentiles(&stage_flow_ms, &git_cli_stage_ms);
 
     BenchReport {
         metadata: Metadata {
@@ -202,9 +248,7 @@ fn run_benchmark(repository: &Path, iterations: usize, stage_relative: &Path) ->
             status: status_ms,
             snapshot: snapshot_ms,
             snapshot_with_history: snapshot_with_history_ms,
-            stage_flow: stage_flow_ms,
-            git_cli_stage: git_cli_stage_ms,
-            stage_overhead: stage_overhead_ms,
+            stage,
         },
     }
 }
@@ -224,15 +268,34 @@ fn discover_stage_candidate(repository: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repository)
-        .args(["status", "--porcelain"])
+        // `--untracked-files=all` evita que un directorio sin seguir se colapse en una sola
+        // entrada: sin esto el candidato podía ser una carpeta con miles de archivos y la
+        // medición de "stage de un archivo" no medía eso en absoluto.
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().find(|line| line.len() > 3)?;
-    Some(PathBuf::from(line[3..].trim()))
+    stdout
+        .lines()
+        .filter_map(parse_porcelain_path)
+        .map(PathBuf::from)
+        .find(|candidate| repository.join(candidate).is_file())
+}
+
+/// Extrae la ruta de una línea `git status --porcelain` (v1).
+///
+/// Descarta rutas entrecomilladas (`core.quotepath` las escapa y no se pueden usar tal cual)
+/// y se queda con el destino en los renombrados `XY origen -> destino`.
+fn parse_porcelain_path(line: &str) -> Option<&str> {
+    let path = line.get(3..)?.trim();
+    let path = path.rsplit(" -> ").next()?;
+    if path.is_empty() || path.starts_with('"') {
+        return None;
+    }
+    Some(path)
 }
 
 fn run_git_cli_stage(repository: &Path, relative_path: &Path) {
@@ -320,18 +383,14 @@ fn print_human_report(report: &BenchReport) {
         "snapshot + historial(200)",
         &report.measurements.snapshot_with_history,
     );
-    print_stats(
-        "stage + snapshot + unstage (app)",
-        &report.measurements.stage_flow,
-    );
-    print_stats(
-        "stage + unstage (git CLI)",
-        &report.measurements.git_cli_stage,
-    );
-    print_stats(
-        "sobrecoste app vs CLI (p95)",
-        &report.measurements.stage_overhead,
-    );
+    let Some(stage) = &report.measurements.stage else {
+        println!("  stage: sin cambios en el repositorio, métricas omitidas");
+        return;
+    };
+    print_stats("stage + snapshot + unstage (app)", &stage.stage_flow);
+    print_stats("stage + unstage (app)", &stage.stage_only);
+    print_stats("stage + unstage (git CLI)", &stage.git_cli_stage);
+    print_stats("sobrecoste app vs CLI (p95)", &stage.stage_overhead);
 }
 
 fn print_stats(label: &str, stats: &PercentileStats) {
