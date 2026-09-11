@@ -4250,9 +4250,9 @@ mod tests {
             worktree_status: ChangeKind::Untracked,
             is_conflicted: false,
         };
-        let refreshed_snapshot = RepositorySnapshot {
+        let refreshed_snapshot = WorkingTreeSnapshot {
             changes: vec![actual_change],
-            ..RepositorySnapshot::default()
+            ..WorkingTreeSnapshot::default()
         };
 
         for failure in [
@@ -4271,14 +4271,21 @@ mod tests {
             let mut window = test_window(GitClient::default(), vec![repository]);
             window.state.repositories[0].mutation_state = failure;
             window.state.repositories[0].refresh_generation = 1;
-            Arc::make_mut(&mut window.state.repositories[0].snapshot).changes =
+            Arc::make_mut(&mut window.state.repositories[0].working_tree).changes =
                 vec![previous_change.clone()];
 
-            let outcome =
-                window.finish_refresh(repository_id, 1, false, Ok(refreshed_snapshot.clone()));
+            let outcome = window.finish_refresh(
+                repository_id,
+                1,
+                false,
+                Ok(RefreshPayload::WorkingTree(refreshed_snapshot.clone())),
+            );
 
             assert!(outcome.succeeded);
-            assert_eq!(*window.state.repositories[0].snapshot, refreshed_snapshot);
+            assert_eq!(
+                *window.state.repositories[0].working_tree,
+                refreshed_snapshot
+            );
             assert!(matches!(
                 window.state.repositories[0].refresh_state,
                 RefreshState::Succeeded { .. }
