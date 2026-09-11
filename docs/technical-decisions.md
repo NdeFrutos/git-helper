@@ -39,10 +39,26 @@ los ejemplos de Zed. No se copió código GPL de Zed.
 ## Límites de procesos
 
 `src/process.rs` es la única abstracción de procesos. No usa una shell, conserva argumentos como
-`OsString`, lee stdout y stderr en paralelo, permite cancelación cooperativa y aplica timeouts. Git
-recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
-`CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
-las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
+`OsString` y aplica timeouts. stdout, stderr y stdin se redirigen a temporales anónimos: así se
+mantiene la captura independiente de ambos streams sin crear lectores bloqueables cuando un
+descendiente hereda los handles. En Windows, la cancelación y el timeout finalizan el árbol activo
+con `taskkill.exe /PID <pid> /T /F`; el comando auxiliar también se crea con `CREATE_NO_WINDOW`, no
+usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` falla —lo hace también cuando el hijo
+acaba de terminar por su cuenta— se registra el aviso y se continúa con el hijo directo; el runner
+solo devuelve un error de infraestructura si el proceso sigue vivo tras la espera acotada, de modo
+que la clasificación de cancelación o timeout nunca se pierde por esa carrera. La salida normal del padre no espera a
+descendientes que se hayan desacoplado voluntariamente; los datos capturados se leen sin esperar al
+cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
+`CURSOR_API_TOKEN`.
+
+Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
+los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
+descendiente es el propio binario de pruebas —no un intérprete externo, cuyo arranque decidía en CI
+si la prueba llegaba a comprobar algo—, publica su PID y las pruebas verifican su desaparición con
+`tasklist.exe`; no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta
+antes incluso de que el descendiente pudiera escribirlo. La
+comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
+puede no tener Cargo o Windows disponible.
 
 ## Inventario de ramas e historial
 

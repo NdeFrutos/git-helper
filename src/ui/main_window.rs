@@ -106,7 +106,7 @@ struct PreparedRefresh {
 
 enum GenerationPreparationError {
     StagedChanged,
-    Message(String),
+    Message { message: String, timed_out: bool },
 }
 
 struct GenerationCompletion {
@@ -115,6 +115,8 @@ struct GenerationCompletion {
     result: Result<String, String>,
     current_index_identity: Option<Result<Vec<u8>, String>>,
     was_cancelled: bool,
+    /// Clasificado desde el error tipado antes de convertirlo en texto.
+    timed_out: bool,
     staged_changed: bool,
 }
 
@@ -848,23 +850,34 @@ impl MainWindow {
                 if history_included {
                     repository.history_loading = false;
                 }
-                let is_cancelled = is_cancelled_error(&error);
-                repository.refresh_state = if is_cancelled {
-                    RefreshState::Cancelled {
-                        message: "Actualización cancelada".to_owned(),
+                match classify_git_process_failure(&error) {
+                    ProcessFailure::Cancelled => {
+                        repository.refresh_state = RefreshState::Cancelled {
+                            message: "Actualización cancelada".to_owned(),
+                        };
+                        repository.status_message = "Actualización cancelada".to_owned();
+                        repository.error = None;
                     }
-                } else {
-                    RefreshState::Failed {
-                        message: error.to_string(),
-                        details: details.clone(),
+                    ProcessFailure::TimedOut(timeout) => {
+                        repository.refresh_state = RefreshState::Failed {
+                            message: format!(
+                                "La actualización agotó el tiempo máximo de {}",
+                                format_timeout(timeout)
+                            ),
+                            details: details.clone(),
+                        };
+                        repository.status_message = "Tiempo agotado al actualizar".to_owned();
+                        repository.error = Some(details);
                     }
-                };
-                repository.status_message = if is_cancelled {
-                    "Actualización cancelada".to_owned()
-                } else {
-                    "Error al actualizar".to_owned()
-                };
-                repository.error = (!is_cancelled).then_some(details);
+                    ProcessFailure::Other => {
+                        repository.refresh_state = RefreshState::Failed {
+                            message: error.to_string(),
+                            details: details.clone(),
+                        };
+                        repository.status_message = "Error al actualizar".to_owned();
+                        repository.error = Some(details);
+                    }
+                }
                 RefreshOutcome {
                     should_notify: true,
                     continuation,
@@ -1344,10 +1357,19 @@ impl MainWindow {
                                 GitError::StagedStateChanged => {
                                     GenerationPreparationError::StagedChanged
                                 }
-                                error => GenerationPreparationError::Message(error.to_string()),
+                                error => GenerationPreparationError::Message {
+                                    timed_out: matches!(
+                                        classify_git_process_failure(&error),
+                                        ProcessFailure::TimedOut(_)
+                                    ),
+                                    message: error.to_string(),
+                                },
                             })?;
                         build_cursor_context(&data)
-                            .map_err(|error| GenerationPreparationError::Message(error.to_string()))
+                            .map_err(|error| GenerationPreparationError::Message {
+                                message: error.to_string(),
+                                timed_out: false,
+                            })
                             .map(|context| (context, data.index_identity))
                     }
                 })
@@ -1366,6 +1388,7 @@ impl MainWindow {
                                 ),
                                 current_index_identity: None,
                                 was_cancelled: false,
+                                timed_out: false,
                                 staged_changed: true,
                             },
                             cx,
@@ -1374,15 +1397,16 @@ impl MainWindow {
                     .ok();
                     return;
                 }
-                Err(GenerationPreparationError::Message(error)) => {
+                Err(GenerationPreparationError::Message { message, timed_out }) => {
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: None,
-                                result: Err(error),
+                                result: Err(message),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
+                                timed_out,
                                 staged_changed: false,
                             },
                             cx,
@@ -1414,6 +1438,7 @@ impl MainWindow {
                                 ),
                                 current_index_identity: None,
                                 was_cancelled: false,
+                                timed_out: false,
                                 staged_changed: true,
                             },
                             cx,
@@ -1423,6 +1448,10 @@ impl MainWindow {
                     return;
                 }
                 Err(error) => {
+                    let timed_out = matches!(
+                        classify_git_process_failure(&error),
+                        ProcessFailure::TimedOut(_)
+                    );
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
                             GenerationCompletion {
@@ -1431,6 +1460,7 @@ impl MainWindow {
                                 result: Err(error.to_string()),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
+                                timed_out,
                                 staged_changed: false,
                             },
                             cx,
@@ -1474,6 +1504,7 @@ impl MainWindow {
                                 ),
                                 current_index_identity: None,
                                 was_cancelled: true,
+                                timed_out: false,
                                 staged_changed: false,
                             },
                             cx,
@@ -1493,9 +1524,14 @@ impl MainWindow {
                             context.prompt,
                             &cursor_cancellation,
                         )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| (error.to_string(), classify_cursor_failure(&error)))
                 })
                 .await;
+            let timed_out = matches!(
+                result.as_ref().err(),
+                Some((_, ProcessFailure::TimedOut(_)))
+            );
+            let result = result.map_err(|(message, _)| message);
             let was_cancelled = context_cancellation.is_cancelled();
             let current_index_identity = if result.is_ok() && !was_cancelled {
                 Some(
@@ -1522,6 +1558,7 @@ impl MainWindow {
                         result,
                         current_index_identity,
                         was_cancelled,
+                        timed_out,
                         staged_changed: false,
                     },
                     cx,
@@ -1599,17 +1636,22 @@ impl MainWindow {
                 }
             }
             Err(error) => {
+                let timed_out = completion.timed_out;
                 let cancelled = completion.was_cancelled
                     || completion.staged_changed
-                    || error.to_lowercase().contains("cancel");
+                    || (!timed_out && error.to_lowercase().contains("cancel"));
                 status_message = if cancelled {
                     "Generación cancelada; se conserva el borrador".to_owned()
+                } else if timed_out {
+                    "Tiempo agotado al generar el mensaje".to_owned()
                 } else {
                     "No se pudo generar el mensaje".to_owned()
                 };
                 error_message = Some(if completion.staged_changed {
                     "El staging area cambió; la propuesta quedó obsoleta. Revisa los cambios y pulsa «Generar con Cursor» para reintentar."
                         .to_owned()
+                } else if timed_out {
+                    format!("{error}; revisa el estado antes de reintentar.")
                 } else {
                     error
                 });
@@ -1621,7 +1663,11 @@ impl MainWindow {
                 } else {
                     MutationState::Failed {
                         kind: OperationKind::GenerateCommitMessage,
-                        message: "No se pudo generar el mensaje".to_owned(),
+                        message: if timed_out {
+                            "Tiempo agotado al generar el mensaje".to_owned()
+                        } else {
+                            "No se pudo generar el mensaje".to_owned()
+                        },
                         details: error_message.clone().unwrap_or_default(),
                     }
                 };
@@ -1962,13 +2008,7 @@ impl MainWindow {
                             repository.status_message = operation_success_message(kind).to_owned();
                             repository.error = None;
                         }
-                        if matches!(
-                            kind,
-                            OperationKind::Commit
-                                | OperationKind::Fetch
-                                | OperationKind::Pull
-                                | OperationKind::Push
-                        ) {
+                        if kind_can_move_references(kind) {
                             this.invalidate_history(repository_id);
                         }
                         let feedback_timer =
@@ -1990,25 +2030,44 @@ impl MainWindow {
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
-                            let is_cancelled = is_cancelled_error(&error);
-                            repository.mutation_state = if is_cancelled {
-                                MutationState::Cancelled {
-                                    kind,
-                                    message: "Operación cancelada".to_owned(),
+                            match classify_git_process_failure(&error) {
+                                ProcessFailure::Cancelled => {
+                                    repository.mutation_state = MutationState::Cancelled {
+                                        kind,
+                                        message: "Operación cancelada".to_owned(),
+                                    };
+                                    repository.status_message = "Operación cancelada".to_owned();
+                                    repository.error = None;
                                 }
-                            } else {
-                                MutationState::Failed {
-                                    kind,
-                                    message: error.to_string(),
-                                    details: error.technical_details(),
+                                ProcessFailure::TimedOut(timeout) => {
+                                    repository.mutation_state = MutationState::Failed {
+                                        kind,
+                                        message: format!(
+                                            "La operación agotó el tiempo máximo de {}",
+                                            format_timeout(timeout)
+                                        ),
+                                        details: error.technical_details(),
+                                    };
+                                    repository.status_message =
+                                        "Tiempo agotado en la operación".to_owned();
+                                    repository.error = Some(error.technical_details());
                                 }
-                            };
-                            repository.status_message = if is_cancelled {
-                                "Operación cancelada".to_owned()
-                            } else {
-                                "La operación falló".to_owned()
-                            };
-                            repository.error = (!is_cancelled).then(|| error.technical_details());
+                                ProcessFailure::Other => {
+                                    repository.mutation_state = MutationState::Failed {
+                                        kind,
+                                        message: error.to_string(),
+                                        details: error.technical_details(),
+                                    };
+                                    repository.status_message = "La operación falló".to_owned();
+                                    repository.error = Some(error.technical_details());
+                                }
+                            }
+                        }
+                        // Una operación remota interrumpida puede haber movido
+                        // referencias antes de terminar, así que el historial
+                        // cacheado es tan sospechoso como en el caso correcto.
+                        if kind_can_move_references(kind) {
+                            this.invalidate_history(repository_id);
                         }
                     }
                 }
@@ -3312,14 +3371,63 @@ fn operation_success_message(kind: OperationKind) -> &'static str {
     }
 }
 
-fn is_cancelled_error(error: &GitError) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessFailure {
+    Cancelled,
+    TimedOut(Duration),
+    Other,
+}
+
+fn classify_process_failure(error: &crate::process::ProcessError) -> ProcessFailure {
+    match error {
+        crate::process::ProcessError::Cancelled => ProcessFailure::Cancelled,
+        crate::process::ProcessError::TimedOut(timeout) => ProcessFailure::TimedOut(*timeout),
+        _ => ProcessFailure::Other,
+    }
+}
+
+fn classify_git_process_failure(error: &GitError) -> ProcessFailure {
+    match error {
+        GitError::Process(process_error) => classify_process_failure(process_error),
+        GitError::NotInstalled { source } => classify_process_failure(source),
+        _ => ProcessFailure::Other,
+    }
+}
+
+/// Operaciones que pueden mover referencias y, por tanto, invalidar el
+/// historial cacheado tanto si terminan bien como si se cancelan o agotan el
+/// tiempo: el proceso puede haber actualizado refs antes de ser terminado.
+const fn kind_can_move_references(kind: OperationKind) -> bool {
     matches!(
-        error,
-        GitError::Process(crate::process::ProcessError::Cancelled)
-            | GitError::NotInstalled {
-                source: crate::process::ProcessError::Cancelled
-            }
+        kind,
+        OperationKind::Commit | OperationKind::Fetch | OperationKind::Pull | OperationKind::Push
     )
+}
+
+fn classify_cursor_failure(error: &crate::cursor::CursorError) -> ProcessFailure {
+    match error {
+        crate::cursor::CursorError::Process(process_error) => {
+            classify_process_failure(process_error)
+        }
+        crate::cursor::CursorError::NotInstalled { source } => classify_process_failure(source),
+        _ => ProcessFailure::Other,
+    }
+}
+
+/// Formatea un timeout para texto visible: `Duration` en `Debug` produce
+/// unidades inconsistentes (`2s`, `1.5s`, `350ms`) dentro de una misma frase.
+fn format_timeout(timeout: Duration) -> String {
+    let seconds = timeout.as_secs_f64();
+    if seconds >= 1.0 {
+        let rounded = seconds.round();
+        if (seconds - rounded).abs() < 0.05 {
+            format!("{rounded:.0} s")
+        } else {
+            format!("{seconds:.1} s")
+        }
+    } else {
+        format!("{} ms", timeout.as_millis())
+    }
 }
 
 fn action_button(
@@ -3765,7 +3873,144 @@ mod tests {
             stderr: "hook rejected the commit".to_owned(),
         };
 
-        assert!(is_cancelled_error(&cancelled));
-        assert!(!is_cancelled_error(&failed));
+        assert_eq!(
+            classify_git_process_failure(&cancelled),
+            ProcessFailure::Cancelled
+        );
+        assert_eq!(classify_git_process_failure(&failed), ProcessFailure::Other);
+    }
+
+    #[test]
+    fn interrupted_reference_moving_operations_invalidate_the_cached_history() {
+        for kind in [
+            OperationKind::Commit,
+            OperationKind::Fetch,
+            OperationKind::Pull,
+            OperationKind::Push,
+        ] {
+            assert!(kind_can_move_references(kind));
+        }
+        for kind in [
+            OperationKind::Refresh,
+            OperationKind::Stage,
+            OperationKind::Unstage,
+            OperationKind::Discard,
+            OperationKind::GenerateCommitMessage,
+        ] {
+            assert!(!kind_can_move_references(kind));
+        }
+    }
+
+    #[test]
+    fn timeouts_are_formatted_with_consistent_units() {
+        assert_eq!(format_timeout(Duration::from_secs(2)), "2 s");
+        assert_eq!(format_timeout(Duration::from_millis(1500)), "1.5 s");
+        assert_eq!(format_timeout(Duration::from_millis(350)), "350 ms");
+    }
+
+    #[test]
+    fn process_failure_classification_preserves_cancelled_and_timed_out() {
+        assert_eq!(
+            classify_git_process_failure(&GitError::Process(
+                crate::process::ProcessError::Cancelled
+            )),
+            ProcessFailure::Cancelled
+        );
+        assert_eq!(
+            classify_git_process_failure(&GitError::Process(
+                crate::process::ProcessError::TimedOut(Duration::from_secs(3))
+            )),
+            ProcessFailure::TimedOut(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn refresh_failures_leave_cancelled_and_timed_out_states_distinct() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].refresh_generation = 1;
+
+        let cancelled_outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            Err(GitError::Process(crate::process::ProcessError::Cancelled)),
+        );
+        assert!(cancelled_outcome.should_notify);
+        assert!(matches!(
+            &window.state.repositories[0].refresh_state,
+            RefreshState::Cancelled {
+                message,
+            } if message == "Actualización cancelada"
+        ));
+
+        window.state.repositories[0].refresh_generation = 1;
+        let timed_out_outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            Err(GitError::Process(crate::process::ProcessError::TimedOut(
+                Duration::from_secs(2),
+            ))),
+        );
+        assert!(timed_out_outcome.should_notify);
+        assert!(matches!(
+            &window.state.repositories[0].refresh_state,
+            RefreshState::Failed { message, .. }
+                if message == "La actualización agotó el tiempo máximo de 2 s"
+        ));
+    }
+
+    #[test]
+    fn reconciled_snapshot_replaces_the_state_left_by_a_failed_or_cancelled_mutation() {
+        let previous_change = FileChange {
+            path: PathBuf::from("old.txt"),
+            original_path: None,
+            index_status: ChangeKind::Unmodified,
+            worktree_status: ChangeKind::Modified,
+            is_conflicted: false,
+        };
+        let actual_change = FileChange {
+            path: PathBuf::from("new.txt"),
+            original_path: None,
+            index_status: ChangeKind::Unmodified,
+            worktree_status: ChangeKind::Untracked,
+            is_conflicted: false,
+        };
+        let refreshed_snapshot = RepositorySnapshot {
+            changes: vec![actual_change],
+            ..RepositorySnapshot::default()
+        };
+
+        for failure in [
+            MutationState::Cancelled {
+                kind: OperationKind::Commit,
+                message: "Operación cancelada".to_owned(),
+            },
+            MutationState::Failed {
+                kind: OperationKind::Commit,
+                message: "La operación agotó el tiempo máximo de 2 s".to_owned(),
+                details: "timeout".to_owned(),
+            },
+        ] {
+            let repository = RepositorySession::new(PathBuf::from("repo"));
+            let repository_id = repository.id;
+            let mut window = test_window(GitClient::default(), vec![repository]);
+            window.state.repositories[0].mutation_state = failure;
+            window.state.repositories[0].refresh_generation = 1;
+            Arc::make_mut(&mut window.state.repositories[0].snapshot).changes =
+                vec![previous_change.clone()];
+
+            let outcome =
+                window.finish_refresh(repository_id, 1, false, Ok(refreshed_snapshot.clone()));
+
+            assert!(outcome.succeeded);
+            assert_eq!(*window.state.repositories[0].snapshot, refreshed_snapshot);
+            assert!(matches!(
+                window.state.repositories[0].refresh_state,
+                RefreshState::Succeeded { .. }
+            ));
+        }
     }
 }
