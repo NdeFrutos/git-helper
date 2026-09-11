@@ -3399,11 +3399,12 @@ impl MainWindow {
                 let action_path = path.clone();
                 div()
                     .flex()
-                    .flex_wrap()
+                    .flex_nowrap()
                     .items_center()
                     .w_full()
                     .gap_x_2()
                     .h(row_height)
+                    .overflow_hidden()
                     .px_3()
                     .py_1()
                     .border_b_1()
@@ -3421,7 +3422,7 @@ impl MainWindow {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w(px(120.0))
+                            .min_w_0()
                             .overflow_hidden()
                             .child(
                                 div()

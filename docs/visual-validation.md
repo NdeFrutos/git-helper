@@ -40,8 +40,9 @@ credenciales ni contenido sensible.
 
 - [ ] Los grupos (staged, unstaged, conflictos) muestran contador y se pueden colapsar o expandir.
 - [ ] Cada fila muestra código de estado, nombre de archivo y ruta padre truncada si aplica.
-- [ ] Al estrechar la ventana, el nombre y la ruta conservan un ancho legible y las acciones bajan
-  juntas a una segunda línea sin solaparse con el fichero.
+- [ ] Al estrechar la ventana, el nombre y la ruta se truncan con elipsis y las acciones de la fila
+  siguen en la misma línea: las filas tienen altura fija, así que nada debe desbordar hacia la fila
+  siguiente.
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
@@ -78,8 +79,9 @@ credenciales ni contenido sensible.
 
 - [ ] El texto es legible con escala del sistema al 100 %.
 - [ ] Con escala 125 % o 150 %, los botones y filas no se solapan de forma inaceptable.
-- [ ] Con escala 200 %, las acciones principales siguen visibles y las acciones de cada fila pueden
-  pasar juntas a una segunda línea sin solaparse con la ruta.
+- [ ] Con escala 200 %, las acciones principales siguen visibles: la barra de rama y acciones puede
+  repartirse en varias líneas (crece en alto), mientras que las filas de archivo mantienen su altura
+  y truncan el nombre y la ruta en lugar de desbordarse.
 - [ ] Los colores de estado no son el único indicador (también hay letras/códigos).
 
 ## Instalador (si aplica)
