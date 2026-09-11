@@ -123,6 +123,26 @@ impl GitClient {
         )?))
     }
 
+    /// Obtiene el directorio común de Git, que contiene refs compartidas por worktrees.
+    pub fn git_common_directory(
+        &self,
+        repository_root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, GitError> {
+        let output = self.run_git_read_only(
+            "git-common-directory",
+            repository_root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        Ok(PathBuf::from(decode_trimmed_stdout(
+            &require_success(output)?,
+            "git rev-parse --git-common-dir",
+        )?))
+    }
+
     /// Lee status, remotes y referencias de ramas como un snapshot ligero para la UI.
     pub fn snapshot(
         &self,
