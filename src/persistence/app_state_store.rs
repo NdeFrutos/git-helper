@@ -278,8 +278,43 @@ impl AppStateStore {
     }
 }
 
+/// Aplica cada paso de esquema por separado y deja los datos consistentes aunque el
+/// archivo ya venga marcado con una versión que otro cambio haya escrito antes.
 fn migrate(mut state: PersistedAppState) -> PersistedAppState {
+    while state.schema_version < CURRENT_SCHEMA_VERSION {
+        state = apply_migration_step(state);
+    }
+    // Los pasos son idempotentes: se reejecutan sobre estados ya marcados para
+    // tolerar versiones escritas por otras migraciones de la misma numeración.
+    state = normalize_ssh_clone_mappings(state);
     state.schema_version = CURRENT_SCHEMA_VERSION;
+    state
+}
+
+fn apply_migration_step(mut state: PersistedAppState) -> PersistedAppState {
+    match state.schema_version {
+        0 | 1 => {
+            state = normalize_ssh_clone_mappings(state);
+            state.schema_version = 2;
+        }
+        _ => state.schema_version = CURRENT_SCHEMA_VERSION,
+    }
+    state
+}
+
+/// Descarta mapeos SSH incompletos o duplicados heredados de versiones previas.
+fn normalize_ssh_clone_mappings(mut state: PersistedAppState) -> PersistedAppState {
+    let mut seen = Vec::new();
+    state.ssh_clone_mappings.retain(|mapping| {
+        if mapping.ssh_url_normalized.trim().is_empty()
+            || mapping.local_path.as_os_str().is_empty()
+            || seen.contains(&mapping.ssh_url_normalized)
+        {
+            return false;
+        }
+        seen.push(mapping.ssh_url_normalized.clone());
+        true
+    });
     state
 }
 
@@ -348,6 +383,23 @@ mod tests {
         let store = AppStateStore::new(state_path);
 
         let loaded = store.load().expect("debe migrar");
+
+        assert_eq!(loaded.state.schema_version, 2);
+        assert!(loaded.state.ssh_clone_mappings.is_empty());
+    }
+
+    #[test]
+    fn migration_is_idempotent_for_state_already_marked_as_v2() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{"schema_version":2,"repositories":[],"recent_repositories":[],"settings":{}}"#,
+        )
+        .expect("debe escribir el fixture v2 de otro cambio");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe cargar sin perder datos");
 
         assert_eq!(loaded.state.schema_version, 2);
         assert!(loaded.state.ssh_clone_mappings.is_empty());

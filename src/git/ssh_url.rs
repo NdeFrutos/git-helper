@@ -24,6 +24,20 @@ pub fn parse_ssh_url(input: &str) -> Result<ParsedSshUrl, GitError> {
             message: "La URL SSH no puede estar vacía".to_owned(),
         });
     }
+    if trimmed.starts_with('-') {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no puede empezar por '-'; git la interpretaría como una opción"
+                .to_owned(),
+        });
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(GitError::InvalidSshUrl {
+            message: "La URL SSH no puede contener espacios ni caracteres de control".to_owned(),
+        });
+    }
     let lower = trimmed.to_ascii_lowercase();
     for scheme in UNSUPPORTED_SCHEMES {
         if lower.starts_with(scheme) {
@@ -165,12 +179,13 @@ fn normalize_repository_path(path: &str) -> String {
         .replace('\\', "/")
 }
 
+/// Conserva el caso de la ruta: los servidores SSH genéricos distinguen `Team/App` de `team/app`.
 fn canonical_repository_path(path: &str) -> String {
     let normalized = normalize_repository_path(path);
     normalized
         .strip_suffix(".git")
         .unwrap_or(normalized.as_str())
-        .to_ascii_lowercase()
+        .to_owned()
 }
 
 fn sanitize_directory_name(name: &str) -> String {
@@ -222,9 +237,36 @@ mod tests {
 
     #[test]
     fn normalizes_equivalent_urls() {
-        let left = normalize_ssh_url("git@github.com:Org/Repo.git").expect("left");
-        let right = normalize_ssh_url("ssh://git@github.com/org/repo").expect("right");
+        let left = normalize_ssh_url("git@GitHub.com:Org/Repo.git").expect("left");
+        let right = normalize_ssh_url("ssh://git@github.com/Org/Repo").expect("right");
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn keeps_repository_path_case_sensitive() {
+        let parsed = parse_ssh_url("git@host.example:Team/App.git").expect("debe parsear");
+        assert_eq!(parsed.repository_path, "Team/App");
+        assert_eq!(parsed.repository_name, "App");
+        assert!(
+            !ssh_urls_equivalent("git@host.example:Team/App", "git@host.example:team/app")
+                .expect("debe comparar")
+        );
+    }
+
+    #[test]
+    fn rejects_urls_that_look_like_git_options() {
+        assert!(matches!(
+            parse_ssh_url("--upload-pack=calc.exe git@host.example:org/repo.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+        assert!(matches!(
+            parse_ssh_url("--upload-pack=calc.exe"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
+        assert!(matches!(
+            parse_ssh_url("git@host.example:org/re po.git"),
+            Err(GitError::InvalidSshUrl { .. })
+        ));
     }
 
     #[test]

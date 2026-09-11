@@ -858,6 +858,8 @@ impl GitClient {
         destination: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), GitError> {
+        validate_clone_argument(url)?;
+        validate_clone_argument(&destination.to_string_lossy())?;
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|source| GitError::Io {
                 path: parent.to_path_buf(),
@@ -868,6 +870,8 @@ impl GitClient {
             "git-clone",
             vec![
                 OsString::from("clone"),
+                // `--` evita que una URL o un destino con guion inicial se lean como opción de git.
+                OsString::from("--"),
                 OsString::from(url),
                 destination.as_os_str().to_os_string(),
             ],
@@ -1207,6 +1211,18 @@ fn validate_history_ref(reference: &str) -> Result<(), GitError> {
     {
         return Err(GitError::InvalidReferenceName {
             value: reference.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Rechaza URLs y destinos que git podría interpretar como opciones aunque exista `--`.
+fn validate_clone_argument(value: &str) -> Result<(), GitError> {
+    if value.is_empty() || value.starts_with('-') || value.contains('\0') {
+        return Err(GitError::InvalidSshUrl {
+            message: format!(
+                "Argumento de clonado no admitido porque git lo interpretaría como opción: {value}"
+            ),
         });
     }
     Ok(())
