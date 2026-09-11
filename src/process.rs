@@ -271,6 +271,24 @@ fn taskkill_executable() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
+fn wait_for_exit_after_kill(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<(), ProcessError> {
+    let started_at = Instant::now();
+    let mut poll_interval = Duration::from_millis(1);
+    let maximum_poll_interval = Duration::from_millis(25);
+    while started_at.elapsed() < timeout {
+        if child.try_wait().map_err(ProcessError::Wait)?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(poll_interval);
+        poll_interval = poll_interval.saturating_mul(2).min(maximum_poll_interval);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn wait_for_process(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -284,7 +302,7 @@ fn wait_for_process(
         }
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = wait_for_exit_after_kill(child, timeout);
             return Err(ProcessError::Wait(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "taskkill no terminó dentro del límite de cleanup",
@@ -341,8 +359,10 @@ mod tests {
 
         assert!(matches!(result, Err(ProcessError::TimedOut(_))));
         assert!(started_at.elapsed() < Duration::from_secs(2));
-        std::thread::sleep(Duration::from_secs(1));
-        assert!(!temporary.path().join("marker.txt").exists());
+        assert!(
+            wait_for_absent_file(&temporary.path().join("marker.txt"), Duration::from_secs(3)),
+            "el descendiente no debe sobrevivir al timeout"
+        );
     }
 
     #[cfg(windows)]
@@ -360,7 +380,11 @@ mod tests {
         let worker =
             std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
 
-        std::thread::sleep(Duration::from_millis(100));
+        let pid_path = temporary.path().join("child.pid");
+        assert!(
+            wait_for_file(&pid_path, Duration::from_secs(3)),
+            "el fixture debe iniciar el descendiente antes de cancelar"
+        );
         cancellation.cancel();
         let result = worker
             .join()
@@ -368,8 +392,10 @@ mod tests {
 
         assert!(matches!(result, Err(ProcessError::Cancelled)));
         assert!(started_at.elapsed() < Duration::from_secs(3));
-        std::thread::sleep(Duration::from_secs(1));
-        assert!(!temporary.path().join("marker.txt").exists());
+        assert!(
+            wait_for_absent_file(&temporary.path().join("marker.txt"), Duration::from_secs(3)),
+            "el descendiente no debe sobrevivir a la cancelación"
+        );
     }
 
     #[cfg(windows)]
@@ -386,8 +412,10 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(started_at.elapsed() < Duration::from_secs(3));
-        std::thread::sleep(Duration::from_secs(3));
-        assert!(temporary.path().join("marker.txt").exists());
+        assert!(
+            wait_for_file(&temporary.path().join("marker.txt"), Duration::from_secs(5)),
+            "el descendiente heredado debe terminar sin bloquear al padre"
+        );
     }
 
     #[cfg(windows)]
@@ -464,6 +492,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    #[cfg(windows)]
+    fn wait_for_absent_file(path: &Path, timeout: Duration) -> bool {
+        let started_at = std::time::Instant::now();
+        while started_at.elapsed() < timeout {
+            if !path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        !path.exists()
     }
 
     #[cfg(windows)]

@@ -90,10 +90,6 @@ pub enum MutationState {
         message: String,
         details: String,
     },
-    Cancelled {
-        kind: OperationKind,
-        message: String,
-    },
 }
 
 /// Coordina los refreshes solicitados para una sesión de repositorio.
