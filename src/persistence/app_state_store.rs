@@ -18,8 +18,9 @@ use crate::domain::{
     RepositorySession, RepositorySnapshot, RepositoryView,
 };
 
+/// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
+/// su brazo en `migrate`; nunca reutilices un número ya publicado por otra rama.
 const CURRENT_SCHEMA_VERSION: u32 = 2;
-const LEGACY_SCHEMA_VERSION: u32 = 1;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -299,20 +300,41 @@ impl AppStateStore {
     }
 }
 
+/// Aplica los pasos de migración uno a uno hasta alcanzar la versión actual.
+///
+/// Cada paso solo conoce su propia transición (`n` → `n + 1`), de modo que una rama
+/// que añada otro paso encima solo tiene que registrar su brazo y subir
+/// `CURRENT_SCHEMA_VERSION`; no hay comparaciones contra una versión heredada fija.
 fn migrate(mut state: PersistedAppState) -> PersistedAppState {
-    if state.schema_version <= LEGACY_SCHEMA_VERSION {
-        for repository in &mut state.repositories {
-            if repository
-                .commit_draft
-                .as_deref()
-                .is_some_and(str::is_empty)
-            {
-                repository.commit_draft = None;
+    while state.schema_version < CURRENT_SCHEMA_VERSION {
+        match state.schema_version {
+            0 | 1 => {
+                migrate_v1_to_v2(&mut state);
+                state.schema_version = 2;
+            }
+            unknown => {
+                warn!(
+                    version = unknown,
+                    "No hay paso de migración registrado; se adopta la versión actual"
+                );
+                state.schema_version = CURRENT_SCHEMA_VERSION;
             }
         }
     }
-    state.schema_version = CURRENT_SCHEMA_VERSION;
     state
+}
+
+/// v1 → v2: los borradores de commit pasan a persistirse; normaliza los vacíos a `None`.
+fn migrate_v1_to_v2(state: &mut PersistedAppState) {
+    for repository in &mut state.repositories {
+        if repository
+            .commit_draft
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            repository.commit_draft = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +420,61 @@ mod tests {
         assert_eq!(loaded.state.schema_version, 2);
         assert_eq!(loaded.state.repositories.len(), 1);
         assert!(loaded.state.repositories[0].commit_draft.is_none());
+    }
+
+    #[test]
+    fn migration_ladder_advances_step_by_step_to_the_current_version() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let persisted = PersistedAppState::from_app_state(
+            &AppState::default(),
+            &HashMap::new(),
+            Some(WindowPlacement {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+        );
+        store.save(&persisted).expect("debe guardar");
+
+        for stored_version in 0..super::CURRENT_SCHEMA_VERSION {
+            let mut stored = serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(&state_path).expect("debe leer el estado"),
+            )
+            .expect("debe parsear el estado guardado");
+            stored["schema_version"] = stored_version.into();
+            fs::write(
+                &state_path,
+                serde_json::to_string_pretty(&stored).expect("debe serializar"),
+            )
+            .expect("debe escribir el fixture");
+
+            let loaded = store.load().expect("debe migrar");
+
+            assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+            assert_eq!(loaded.state.window_placement, persisted.window_placement);
+        }
+    }
+
+    #[test]
+    fn rejects_state_written_by_a_newer_schema() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let persisted = PersistedAppState {
+            schema_version: super::CURRENT_SCHEMA_VERSION + 1,
+            ..PersistedAppState::default()
+        };
+        store.save(&persisted).expect("debe guardar");
+
+        let error = store.load().expect_err("no debe aceptar un esquema futuro");
+
+        assert!(matches!(
+            error,
+            super::PersistenceError::UnsupportedSchema { .. }
+        ));
     }
 
     #[test]

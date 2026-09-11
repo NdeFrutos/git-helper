@@ -25,7 +25,7 @@ use crate::{
         RepositorySession, RepositorySnapshot, RepositoryView,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
-    persistence::{AppStateStore, PersistedAppState, StateWriter, WindowPlacement},
+    persistence::{AppStateStore, LoadedState, PersistedAppState, StateWriter, WindowPlacement},
     process::CancellationToken,
     watcher::RepositoryWatcher,
 };
@@ -118,12 +118,19 @@ struct GenerationCompletion {
     staged_changed: bool,
 }
 
+/// Estado leído una sola vez durante el arranque junto al almacén que lo produjo.
+pub struct StartupState {
+    pub store: AppStateStore,
+    pub loaded: LoadedState,
+}
+
 /// Modelo y presentación de la ventana principal.
 pub struct MainWindow {
+    /// Estado leído una sola vez en el arranque; `initialize` lo consume.
+    loaded_state: Option<LoadedState>,
     state: AppState,
     git_client: GitClient,
     cursor_client: CursorClient,
-    state_store: Option<AppStateStore>,
     state_writer: Option<StateWriter>,
     window_placement: Option<WindowPlacement>,
     commit_inputs: HashMap<RepositoryId, Entity<CommitInput>>,
@@ -151,19 +158,21 @@ pub struct MainWindow {
     reason = "La entidad GPUI conserva métodos listener y render cohesionados; los mensajes cortos priorizan legibilidad"
 )]
 impl MainWindow {
-    /// Restaura sesiones persistidas sin bloquear la creación de la ventana.
+    /// Crea la ventana con el estado ya leído en el arranque; no vuelve a tocar disco.
+    ///
+    /// `startup` procede de la única lectura de `state.json` que hace `app::run`,
+    /// de modo que el respaldo por corrupción se detecta y se muestra una sola vez.
     #[must_use]
-    pub fn new(_cx: &mut Context<Self>) -> Self {
-        let state_store = AppStateStore::default_location().ok();
-        let state_writer = state_store
-            .as_ref()
-            .map(|store| StateWriter::new(store.clone()));
+    pub fn new(startup: Option<StartupState>, _cx: &mut Context<Self>) -> Self {
+        let (state_writer, loaded_state) = startup.map_or((None, None), |startup| {
+            (Some(StateWriter::new(startup.store)), Some(startup.loaded))
+        });
         let state = AppState::default();
         Self {
+            loaded_state,
             state,
             git_client: GitClient::default(),
             cursor_client: CursorClient::new(PathBuf::from("agent")),
-            state_store,
             state_writer,
             window_placement: None,
             commit_inputs: HashMap::new(),
@@ -218,11 +227,12 @@ impl MainWindow {
             true
         });
 
-        if let Some(state_store) = self.state_store.clone() {
+        if let Some(loaded) = self.loaded_state.take() {
+            let corruption_backup = loaded.corruption_backup;
+            let persisted = loaded.state;
             cx.spawn(async move |this, cx| {
-                let loaded = cx
+                let (mut loaded_state, commit_drafts, cursor_executable) = cx
                     .background_spawn(async move {
-                        let persisted = state_store.load()?.state;
                         let (mut state, commit_drafts) = persisted.into_app_state();
                         for repository in &mut state.repositories {
                             repository.path_accessible = repository.root_path.is_dir();
@@ -247,56 +257,51 @@ impl MainWindow {
                         }
                         let cursor_executable =
                             resolve_cursor_executable(state.settings.cursor_cli_path.clone());
-                        Ok::<_, crate::persistence::PersistenceError>((
-                            state,
-                            commit_drafts,
-                            cursor_executable,
-                        ))
+                        (state, commit_drafts, cursor_executable)
                     })
                     .await;
-                this.update(cx, |this, cx| match loaded {
-                    Ok((mut loaded_state, commit_drafts, cursor_executable)) => {
-                        let current_active = this.state.active_repository_id;
-                        loaded_state.repositories.retain(|loaded_repository| {
-                            !this.state.repositories.iter().any(|current_repository| {
-                                normalized_path_key(&current_repository.root_path)
-                                    == normalized_path_key(&loaded_repository.root_path)
-                            })
-                        });
-                        let restored = loaded_state
-                            .repositories
-                            .iter()
-                            .map(|repository| (repository.id, repository.path_accessible))
-                            .collect::<Vec<_>>();
-                        this.state
-                            .repositories
-                            .append(&mut loaded_state.repositories);
-                        if current_active.is_none() {
-                            this.state.active_repository_id = loaded_state.active_repository_id;
-                        }
-                        this.state.recent_repositories = loaded_state.recent_repositories;
-                        this.state.settings = loaded_state.settings;
-                        this.cursor_client = CursorClient::new(cursor_executable);
-                        for (repository_id, path_accessible) in restored {
-                            let draft = commit_drafts.get(&repository_id).cloned();
-                            this.create_commit_input(repository_id, draft, cx);
-                            if path_accessible {
-                                if this.state.active_repository_id == Some(repository_id) {
-                                    this.refresh_repository(repository_id, cx);
-                                } else {
-                                    this.pending_refreshes.insert(repository_id);
-                                }
+                this.update(cx, |this, cx| {
+                    let current_active = this.state.active_repository_id;
+                    loaded_state.repositories.retain(|loaded_repository| {
+                        !this.state.repositories.iter().any(|current_repository| {
+                            normalized_path_key(&current_repository.root_path)
+                                == normalized_path_key(&loaded_repository.root_path)
+                        })
+                    });
+                    let restored = loaded_state
+                        .repositories
+                        .iter()
+                        .map(|repository| (repository.id, repository.path_accessible))
+                        .collect::<Vec<_>>();
+                    this.state
+                        .repositories
+                        .append(&mut loaded_state.repositories);
+                    if current_active.is_none() {
+                        this.state.active_repository_id = loaded_state.active_repository_id;
+                    }
+                    this.state.recent_repositories = loaded_state.recent_repositories;
+                    this.state.settings = loaded_state.settings;
+                    this.cursor_client = CursorClient::new(cursor_executable);
+                    for (repository_id, path_accessible) in restored {
+                        let draft = commit_drafts.get(&repository_id).cloned();
+                        this.create_commit_input(repository_id, draft, cx);
+                        if path_accessible {
+                            if this.state.active_repository_id == Some(repository_id) {
+                                this.refresh_repository(repository_id, cx);
+                            } else {
+                                this.pending_refreshes.insert(repository_id);
                             }
                         }
-                        this.save_state(cx);
-                        this.global_status_message = "Sesión restaurada".to_owned();
-                        cx.notify();
                     }
-                    Err(error) => {
-                        this.global_error =
-                            Some(format!("No se pudo restaurar el estado: {error}"));
-                        cx.notify();
+                    this.save_state(cx);
+                    this.global_status_message = "Sesión restaurada".to_owned();
+                    if let Some(backup_path) = corruption_backup {
+                        this.global_error = Some(format!(
+                            "El estado guardado estaba dañado; se empezó de cero y se conservó una copia en {}",
+                            backup_path.display()
+                        ));
                     }
+                    cx.notify();
                 })
                 .ok();
             })
@@ -3619,6 +3624,7 @@ mod tests {
 
     fn test_window(git_client: GitClient, repositories: Vec<RepositorySession>) -> MainWindow {
         MainWindow {
+            loaded_state: None,
             state: AppState {
                 active_repository_id: repositories.first().map(|repository| repository.id),
                 repositories,
@@ -3626,7 +3632,6 @@ mod tests {
             },
             git_client,
             cursor_client: CursorClient::new(PathBuf::from("agent")),
-            state_store: None,
             state_writer: None,
             window_placement: None,
             commit_inputs: HashMap::new(),

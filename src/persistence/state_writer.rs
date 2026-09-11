@@ -1,34 +1,102 @@
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
-    thread,
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use super::{AppStateStore, PersistedAppState, PersistenceError};
 
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Petición pendiente de escritura; solo existe una a la vez.
+#[derive(Debug)]
+struct Pending {
+    state: Option<PersistedAppState>,
+    deadline: Option<Instant>,
+    /// Se incrementa en cada `schedule`/`flush` para descartar escrituras obsoletas.
+    generation: u64,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct Shared {
+    pending: Mutex<Pending>,
+    signal: Condvar,
+    write_lock: Mutex<()>,
+    /// Hilos creados por este escritor; debe quedarse en uno salvo en los cierres.
+    spawned_threads: AtomicUsize,
+}
+
+/// Hilo trabajador único; se detiene al soltar el último clon de `StateWriter`.
+#[derive(Debug)]
+struct Worker {
+    shared: Arc<Shared>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        {
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .expect("el mutex del estado pendiente no debe envenenarse");
+            pending.shutdown = true;
+        }
+        self.shared.signal.notify_all();
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .expect("el mutex del hilo trabajador no debe envenenarse")
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Escritor único con coalescencia: la última versión programada siempre gana.
+///
+/// Todas las escrituras diferidas las realiza **un solo** hilo trabajador, de modo
+/// que pulsar teclas en el mensaje de commit o arrastrar la ventana solo actualiza
+/// el estado pendiente y reprograma el vencimiento en lugar de crear hilos.
 #[derive(Clone, Debug)]
 pub struct StateWriter {
     store: AppStateStore,
-    sequence: Arc<AtomicU64>,
-    pending: Arc<Mutex<Option<PersistedAppState>>>,
-    write_lock: Arc<Mutex<()>>,
+    /// Mantiene vivo el hilo trabajador y da acceso al estado compartido.
+    worker: Arc<Worker>,
 }
 
 impl StateWriter {
     #[must_use]
     pub fn new(store: AppStateStore) -> Self {
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(Pending {
+                state: None,
+                deadline: None,
+                generation: 0,
+                shutdown: false,
+            }),
+            signal: Condvar::new(),
+            write_lock: Mutex::new(()),
+            spawned_threads: AtomicUsize::new(0),
+        });
+        let handle = spawn_worker(store.clone(), Arc::clone(&shared));
         Self {
             store,
-            sequence: Arc::new(AtomicU64::new(0)),
-            pending: Arc::new(Mutex::new(None)),
-            write_lock: Arc::new(Mutex::new(())),
+            worker: Arc::new(Worker {
+                shared,
+                handle: Mutex::new(Some(handle)),
+            }),
         }
+    }
+
+    fn shared(&self) -> &Shared {
+        &self.worker.shared
     }
 
     /// Programa una escritura diferida; descarta peticiones obsoletas antes de tocar disco.
@@ -37,44 +105,17 @@ impl StateWriter {
     ///
     /// Si un mutex interno se envenena, lo que no debería ocurrir en uso normal.
     pub fn schedule(&self, state: PersistedAppState, debounce: Duration) {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut pending = self
+                .shared()
                 .pending
                 .lock()
                 .expect("el mutex del estado pendiente no debe envenenarse");
-            *pending = Some(state);
+            pending.state = Some(state);
+            pending.deadline = Some(Instant::now() + debounce);
+            pending.generation += 1;
         }
-
-        let store = self.store.clone();
-        let sequence_counter = Arc::clone(&self.sequence);
-        let pending_state = Arc::clone(&self.pending);
-        let write_lock = Arc::clone(&self.write_lock);
-
-        thread::spawn(move || {
-            thread::sleep(debounce);
-            if sequence_counter.load(Ordering::SeqCst) != sequence {
-                return;
-            }
-            let Some(state) = pending_state
-                .lock()
-                .expect("el mutex del estado pendiente no debe envenenarse")
-                .take()
-            else {
-                return;
-            };
-            let _guard = write_lock
-                .lock()
-                .expect("el mutex de escritura no debe envenenarse");
-            if sequence_counter.load(Ordering::SeqCst) != sequence {
-                let mut pending = pending_state
-                    .lock()
-                    .expect("el mutex del estado pendiente no debe envenenarse");
-                *pending = Some(state);
-                return;
-            }
-            let _ = store.save(&state);
-        });
+        self.shared().signal.notify_all();
     }
 
     /// Persiste de inmediato con tiempo de espera acotado; pensado para el cierre de ventana.
@@ -83,21 +124,26 @@ impl StateWriter {
     ///
     /// Si un mutex interno se envenena, lo que no debería ocurrir en uso normal.
     pub fn flush(&self, state: PersistedAppState) -> Result<(), PersistenceError> {
-        self.sequence.fetch_add(1, Ordering::SeqCst);
         {
             let mut pending = self
+                .shared()
                 .pending
                 .lock()
                 .expect("el mutex del estado pendiente no debe envenenarse");
-            *pending = None;
+            pending.state = None;
+            pending.deadline = None;
+            pending.generation += 1;
         }
+        self.shared().signal.notify_all();
 
         let store = self.store.clone();
-        let write_lock = Arc::clone(&self.write_lock);
+        let shared = Arc::clone(&self.worker.shared);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
 
+        shared.spawned_threads.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
-            let _guard = write_lock
+            let _guard = shared
+                .write_lock
                 .lock()
                 .expect("el mutex de escritura no debe envenenarse");
             let result = store.save(&state);
@@ -115,6 +161,12 @@ impl StateWriter {
             })?
     }
 
+    /// Número de hilos creados por este escritor; `schedule` nunca debe aumentarlo.
+    #[must_use]
+    pub fn spawned_threads(&self) -> usize {
+        self.shared().spawned_threads.load(Ordering::SeqCst)
+    }
+
     /// Tiempo máximo usado por `flush` en el cierre; útil para documentar el comportamiento.
     #[must_use]
     pub const fn close_flush_timeout() -> Duration {
@@ -122,9 +174,77 @@ impl StateWriter {
     }
 }
 
+/// Espera vencimientos en un único hilo y escribe siempre la última versión programada.
+fn spawn_worker(store: AppStateStore, shared: Arc<Shared>) -> JoinHandle<()> {
+    shared.spawned_threads.fetch_add(1, Ordering::SeqCst);
+    thread::spawn(move || {
+        loop {
+            let Some((state, generation)) = wait_for_due_state(&shared) else {
+                return;
+            };
+            let _guard = shared
+                .write_lock
+                .lock()
+                .expect("el mutex de escritura no debe envenenarse");
+            let is_stale = shared
+                .pending
+                .lock()
+                .expect("el mutex del estado pendiente no debe envenenarse")
+                .generation
+                != generation;
+            if is_stale {
+                continue;
+            }
+            let _ = store.save(&state);
+        }
+    })
+}
+
+/// Bloquea hasta que hay estado pendiente vencido; devuelve `None` al apagar el escritor.
+fn wait_for_due_state(shared: &Shared) -> Option<(PersistedAppState, u64)> {
+    let mut pending = shared
+        .pending
+        .lock()
+        .expect("el mutex del estado pendiente no debe envenenarse");
+    loop {
+        if pending.shutdown {
+            return None;
+        }
+        match (pending.state.is_some(), pending.deadline) {
+            (true, Some(deadline)) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    pending.deadline = None;
+                    let generation = pending.generation;
+                    let state = pending
+                        .state
+                        .take()
+                        .expect("la rama solo se toma con estado pendiente");
+                    return Some((state, generation));
+                }
+                pending = shared
+                    .signal
+                    .wait_timeout(pending, deadline - now)
+                    .expect("el mutex del estado pendiente no debe envenenarse")
+                    .0;
+            }
+            _ => {
+                pending = shared
+                    .signal
+                    .wait(pending)
+                    .expect("el mutex del estado pendiente no debe envenenarse");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, thread, time::Duration};
+    use std::{
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use tempfile::tempdir;
 
@@ -149,13 +269,62 @@ mod tests {
         writer.schedule(first, Duration::from_millis(30));
         thread::sleep(Duration::from_millis(5));
         writer.schedule(second, Duration::from_millis(30));
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(150));
 
         let loaded = store.load().expect("debe cargar");
         assert_eq!(
             loaded.state.recent_repositories,
             vec![PathBuf::from("second")]
         );
+    }
+
+    #[test]
+    fn high_frequency_scheduling_reuses_a_single_worker_thread() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let writer = StateWriter::new(store.clone());
+        assert_eq!(writer.spawned_threads(), 1);
+
+        for index in 0..500 {
+            writer.schedule(
+                PersistedAppState {
+                    recent_repositories: vec![PathBuf::from(format!("repo-{index}"))],
+                    ..PersistedAppState::default()
+                },
+                Duration::from_millis(20),
+            );
+        }
+
+        assert_eq!(
+            writer.spawned_threads(),
+            1,
+            "schedule no debe crear un hilo por evento"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let loaded = store.load().expect("debe cargar");
+            if loaded.state.recent_repositories == vec![PathBuf::from("repo-499")] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "el escritor no llegó a persistir"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn dropping_the_last_clone_stops_the_worker_thread() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let writer = StateWriter::new(store);
+        let clone = writer.clone();
+
+        drop(writer);
+        // El hilo sigue vivo mientras exista un clon; soltarlo debe terminar sin bloquear.
+        drop(clone);
     }
 
     #[test]

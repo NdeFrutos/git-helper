@@ -11,9 +11,10 @@ use crate::{
         PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
     },
     persistence::{
-        AppStateStore, DisplayBounds, default_window_placement, validate_window_placement,
+        AppStateStore, DisplayBounds, LoadedState, PersistedAppState, WindowPlacement,
+        default_window_placement, validate_window_placement,
     },
-    ui::{CommitInput, MainWindow},
+    ui::{CommitInput, MainWindow, StartupState},
 };
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
@@ -35,13 +36,19 @@ pub fn run() {
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);
-        let bounds = initial_window_bounds(cx);
+        let startup = load_startup_state();
+        let bounds = initial_window_bounds(
+            cx,
+            startup
+                .as_ref()
+                .and_then(|startup| startup.loaded.state.window_placement),
+        );
         let window_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(MainWindow::new),
+            |_, cx| cx.new(|cx| MainWindow::new(startup, cx)),
         );
 
         match window_result {
@@ -66,13 +73,30 @@ pub fn run() {
     });
 }
 
-/// Restaura la geometría persistida sin bloquear el primer frame con comprobaciones de disco.
-fn initial_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+/// Lee `state.json` una única vez en el arranque; la ventana reutiliza este resultado.
+///
+/// Leer aquí (y no también en `MainWindow`) conserva el respaldo por corrupción,
+/// que solo lo observa la primera lectura porque esta renombra el archivo dañado.
+fn load_startup_state() -> Option<StartupState> {
+    let store = AppStateStore::default_location()
+        .inspect_err(|error| error!(error = %error, "No se pudo localizar el estado persistido"))
+        .ok()?;
+    let loaded = match store.load() {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            error!(error = %error, "No se pudo leer el estado persistido");
+            LoadedState {
+                state: PersistedAppState::default(),
+                corruption_backup: None,
+            }
+        }
+    };
+    Some(StartupState { store, loaded })
+}
+
+/// Ajusta la geometría ya leída a los monitores visibles; no vuelve a tocar disco.
+fn initial_window_bounds(cx: &App, persisted: Option<WindowPlacement>) -> Bounds<gpui::Pixels> {
     let displays = display_bounds(cx);
-    let persisted = AppStateStore::default_location()
-        .ok()
-        .and_then(|store| store.load().ok())
-        .and_then(|loaded| loaded.state.window_placement);
     let placement = persisted.map_or_else(
         || default_window_placement(&displays),
         |placement| validate_window_placement(placement, &displays),
