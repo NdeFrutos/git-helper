@@ -179,6 +179,7 @@ mod tests {
             numstat: "1\t0\tsrc/main.rs\0".to_owned(),
             textual_diff: diff,
             recent_subjects: vec!["feat: añade base".to_owned()],
+            index_identity: b"identity".to_vec(),
         }
     }
 

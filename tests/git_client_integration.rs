@@ -134,6 +134,47 @@ fn stages_commits_and_preserves_dual_index_worktree_state() {
 }
 
 #[test]
+fn staged_identity_tracks_index_content_but_ignores_unstaged_only_changes() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let file_path = temporary.path().join("tracked.txt");
+    fs::write(&file_path, "inicial\n").expect("debe crear el archivo");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage inicial debe funcionar");
+    client
+        .commit(temporary.path(), "test: base", &cancellation)
+        .expect("commit inicial debe funcionar");
+
+    fs::write(&file_path, "staged-a\n").expect("debe modificar el archivo");
+    client
+        .stage(temporary.path(), Path::new("tracked.txt"), &cancellation)
+        .expect("stage a debe funcionar");
+    let identity_a = client
+        .staged_identity(temporary.path(), &cancellation)
+        .expect("debe leer la identidad staged");
+
+    fs::write(&file_path, "staged-b\n").expect("debe cambiar el contenido staged");
+    client
+        .stage(temporary.path(), Path::new("tracked.txt"), &cancellation)
+        .expect("stage b debe funcionar");
+    let identity_b = client
+        .staged_identity(temporary.path(), &cancellation)
+        .expect("debe releer la identidad staged");
+    assert_ne!(identity_a, identity_b);
+
+    fs::write(&file_path, "staged-b\nworktree-only\n")
+        .expect("debe crear un cambio solo en el working tree");
+    let identity_after_unstaged_change = client
+        .staged_identity(temporary.path(), &cancellation)
+        .expect("debe conservar la identidad del index");
+    assert_eq!(identity_b, identity_after_unstaged_change);
+}
+
+#[test]
 fn discards_tracked_and_revalidates_untracked_files() {
     let temporary = tempdir().expect("debe crear el directorio temporal");
     initialize_repository(temporary.path());

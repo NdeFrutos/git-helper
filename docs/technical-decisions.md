@@ -56,6 +56,16 @@ seleccionar una rama no hace checkout ni modifica `HEAD`, el índice o el workin
 paginada conserva la referencia, el OID, el repositorio y una generación de sesión; los resultados
 que llegan tarde después de cambiar de rama o de pestaña se descartan.
 
+## Generación segura de mensajes de commit
+
+Cada propuesta de Cursor queda asociada a la sesión, a un identificador de solicitud y a la versión
+del borrador visible. Antes de aplicar la respuesta se comprueba que la solicitud siga activa, que
+el usuario no haya editado el borrador y que la identidad de `git diff --cached --raw -z` coincida
+con la que originó el prompt. Así, cambiar el contenido staged de un archivo invalida la propuesta
+aunque no cambien sus nombres ni el número de archivos; los cambios exclusivamente unstaged no la
+invalidan. Las respuestas obsoletas, canceladas o de pestañas cerradas se descartan sin tocar el
+texto actual. La generación solo propone texto: nunca hace stage ni commit.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado

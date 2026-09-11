@@ -15,7 +15,10 @@ use crate::{
         CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
         PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
     },
-    cursor::{CursorClient, build_cursor_context, resolve_cursor_executable},
+    cursor::{
+        CommitMessageRequest, CursorClient, GenerationApplyDecision, build_cursor_context,
+        resolve_cursor_executable, validate_generation_result,
+    },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
         FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
@@ -101,6 +104,20 @@ struct PreparedRefresh {
     cancellation: CancellationToken,
 }
 
+enum GenerationPreparationError {
+    StagedChanged,
+    Message(String),
+}
+
+struct GenerationCompletion {
+    request: CommitMessageRequest,
+    expected_index_identity: Option<Vec<u8>>,
+    result: Result<String, String>,
+    current_index_identity: Option<Result<Vec<u8>, String>>,
+    was_cancelled: bool,
+    staged_changed: bool,
+}
+
 /// Modelo y presentación de la ventana principal.
 pub struct MainWindow {
     state: AppState,
@@ -113,6 +130,8 @@ pub struct MainWindow {
     window_subscriptions: Vec<Subscription>,
     active_refresh_cancellations: HashMap<RepositoryId, CancellationToken>,
     active_mutation_cancellations: HashMap<RepositoryId, CancellationToken>,
+    generation_requests: HashMap<RepositoryId, CommitMessageRequest>,
+    next_generation_request_id: u64,
     repository_watchers: HashMap<RepositoryId, RepositoryWatcher>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
     change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
@@ -145,6 +164,8 @@ impl MainWindow {
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
             active_mutation_cancellations: HashMap::new(),
+            generation_requests: HashMap::new(),
+            next_generation_request_id: 0,
             repository_watchers: HashMap::new(),
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
@@ -418,6 +439,7 @@ impl MainWindow {
         self.state.repositories.remove(index);
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
+        self.generation_requests.remove(&repository_id);
         self.selected_commit_details.remove(&repository_id);
         self.repository_watchers.remove(&repository_id);
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
@@ -1208,6 +1230,19 @@ impl MainWindow {
             cx.notify();
             return;
         }
+        let draft_version = self
+            .commit_inputs
+            .get(&repository_id)
+            .map(|input| input.read(cx).content_version())
+            .unwrap_or_default();
+        self.next_generation_request_id = self.next_generation_request_id.saturating_add(1);
+        let request = CommitMessageRequest {
+            session_id: repository_id,
+            request_id: self.next_generation_request_id,
+            draft_version,
+        };
+        self.generation_requests
+            .insert(repository_id, request.clone());
         if let Some(repository) = self
             .state
             .repositories
@@ -1218,7 +1253,7 @@ impl MainWindow {
                 kind: OperationKind::GenerateCommitMessage,
                 generation: repository.refresh_generation,
             };
-            repository.status_message = "Generando mensaje con Cursor (máximo 60 s)…".to_owned();
+            repository.status_message = "Preparando contexto staged…".to_owned();
             repository.error = None;
         }
         let git_client = self.git_client.clone();
@@ -1233,24 +1268,125 @@ impl MainWindow {
         cx.spawn_in(window, async move |this, cx| {
             let context_root = root_path.clone();
             let context_cancellation = cancellation.clone();
+            let context_git_client = git_client.clone();
             let context_result = cx
-                .background_spawn(async move {
-                    let data = git_client
-                        .staged_context(&context_root, &context_cancellation)
-                        .map_err(|error| error.to_string())?;
-                    build_cursor_context(&data).map_err(|error| error.to_string())
+                .background_spawn({
+                    let context_cancellation = context_cancellation.clone();
+                    async move {
+                        let data = context_git_client
+                            .staged_context(&context_root, &context_cancellation)
+                            .map_err(|error| match error {
+                                GitError::StagedStateChanged => {
+                                    GenerationPreparationError::StagedChanged
+                                }
+                                error => GenerationPreparationError::Message(error.to_string()),
+                            })?;
+                        build_cursor_context(&data)
+                            .map_err(|error| GenerationPreparationError::Message(error.to_string()))
+                            .map(|context| (context, data.index_identity))
+                    }
                 })
                 .await;
-            let context = match context_result {
+            let (context, expected_index_identity) = match context_result {
                 Ok(context) => context,
-                Err(error) => {
+                Err(GenerationPreparationError::StagedChanged) => {
                     this.update_in(cx, |this, _, cx| {
-                        this.finish_message_generation(repository_id, Err(error), cx);
+                        this.finish_message_generation(
+                            GenerationCompletion {
+                                request: request.clone(),
+                                expected_index_identity: None,
+                                result: Err(
+                                    "El staging area cambió mientras se preparaba el contexto"
+                                        .to_owned(),
+                                ),
+                                current_index_identity: None,
+                                was_cancelled: false,
+                                staged_changed: true,
+                            },
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+                Err(GenerationPreparationError::Message(error)) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.finish_message_generation(
+                            GenerationCompletion {
+                                request: request.clone(),
+                                expected_index_identity: None,
+                                result: Err(error),
+                                current_index_identity: None,
+                                was_cancelled: context_cancellation.is_cancelled(),
+                                staged_changed: false,
+                            },
+                            cx,
+                        );
                     })
                     .ok();
                     return;
                 }
             };
+            let identity_before_send = cx
+                .background_spawn({
+                    let git_client = git_client.clone();
+                    let root_path = root_path.clone();
+                    let cancellation = context_cancellation.clone();
+                    async move { git_client.staged_identity(&root_path, &cancellation) }
+                })
+                .await;
+            match identity_before_send {
+                Ok(identity) if identity == expected_index_identity => {}
+                Ok(_) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.finish_message_generation(
+                            GenerationCompletion {
+                                request: request.clone(),
+                                expected_index_identity: Some(expected_index_identity.clone()),
+                                result: Err(
+                                    "La propuesta quedó obsoleta porque cambió el staging area"
+                                        .to_owned(),
+                                ),
+                                current_index_identity: None,
+                                was_cancelled: false,
+                                staged_changed: true,
+                            },
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+                Err(error) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.finish_message_generation(
+                            GenerationCompletion {
+                                request: request.clone(),
+                                expected_index_identity: Some(expected_index_identity.clone()),
+                                result: Err(error.to_string()),
+                                current_index_identity: None,
+                                was_cancelled: context_cancellation.is_cancelled(),
+                                staged_changed: false,
+                            },
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+            }
+            this.update_in(cx, |this, _, _| {
+                if let Some(repository) = this
+                    .state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                {
+                    repository.status_message =
+                        "Generando mensaje con Cursor (máximo 60 s)…".to_owned();
+                }
+            })
+            .ok();
             if !context.sensitive_patterns.is_empty() {
                 let details = format!(
                     "La detección básica encontró {} tipos de patrón sensible. Esta detección no es completa. Revisa los cambios antes de enviarlos.",
@@ -1265,8 +1401,16 @@ impl MainWindow {
                 if !matches!(prompt.await, Ok(0)) {
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
-                            repository_id,
-                            Err("Generación cancelada antes de enviar el contexto".to_owned()),
+                            GenerationCompletion {
+                                request: request.clone(),
+                                expected_index_identity: Some(expected_index_identity.clone()),
+                                result: Err(
+                                    "Generación cancelada antes de enviar el contexto".to_owned(),
+                                ),
+                                current_index_identity: None,
+                                was_cancelled: true,
+                                staged_changed: false,
+                            },
                             cx,
                         );
                     })
@@ -1274,15 +1418,49 @@ impl MainWindow {
                     return;
                 }
             }
+            let cursor_root = root_path.clone();
+            let cursor_cancellation = cancellation.clone();
             let result = cx
                 .background_spawn(async move {
                     cursor_client
-                        .generate_commit_message(&root_path, context.prompt, &cancellation)
+                        .generate_commit_message(
+                            &cursor_root,
+                            context.prompt,
+                            &cursor_cancellation,
+                        )
                         .map_err(|error| error.to_string())
                 })
                 .await;
+            let was_cancelled = context_cancellation.is_cancelled();
+            let current_index_identity = if result.is_ok() && !was_cancelled {
+                Some(
+                    cx.background_spawn({
+                        let git_client = git_client.clone();
+                        let root_path = root_path.clone();
+                        let cancellation = context_cancellation.clone();
+                        async move {
+                            git_client
+                                .staged_identity(&root_path, &cancellation)
+                                .map_err(|error| error.to_string())
+                        }
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
             this.update_in(cx, |this, _, cx| {
-                this.finish_message_generation(repository_id, result, cx);
+                this.finish_message_generation(
+                    GenerationCompletion {
+                        request,
+                        expected_index_identity: Some(expected_index_identity),
+                        result,
+                        current_index_identity,
+                        was_cancelled,
+                        staged_changed: false,
+                    },
+                    cx,
+                );
             })
             .ok();
         })
@@ -1291,65 +1469,120 @@ impl MainWindow {
 
     fn finish_message_generation(
         &mut self,
-        repository_id: RepositoryId,
-        result: Result<String, String>,
+        mut completion: GenerationCompletion,
         cx: &mut Context<Self>,
     ) {
+        let repository_id = completion.request.session_id;
+        if self.generation_requests.get(&repository_id) != Some(&completion.request) {
+            return;
+        }
         self.active_mutation_cancellations.remove(&repository_id);
-        match result {
+        let input = self.commit_inputs.get(&repository_id).cloned();
+        if let Some(input) = &input {
+            input.update(cx, |input, cx| input.set_generating(false, cx));
+        }
+        let mut status_message = String::new();
+        let mut error_message = None;
+        let mut mutation_state = MutationState::Cancelled {
+            kind: OperationKind::GenerateCommitMessage,
+            message: "Generación cancelada".to_owned(),
+        };
+        match completion.result {
             Ok(message) => {
-                if let Some(input) = self.commit_inputs.get(&repository_id) {
-                    input.update(cx, |input, cx| {
-                        input.set_generating(false, cx);
-                        input.set_content(message, cx);
-                    });
-                }
-                if let Some(repository) = self
-                    .state
-                    .repositories
-                    .iter_mut()
-                    .find(|repository| repository.id == repository_id)
-                {
-                    repository.status_message =
-                        "Mensaje generado; revísalo antes del commit".to_owned();
-                    repository.error = None;
-                    repository.mutation_state = MutationState::Succeeded {
-                        kind: OperationKind::GenerateCommitMessage,
-                        message: "Mensaje generado".to_owned(),
-                    };
+                let decision = match (
+                    completion.expected_index_identity.as_deref(),
+                    completion.current_index_identity.as_ref(),
+                    input.as_ref(),
+                ) {
+                    (Some(expected), Some(Ok(current)), Some(input)) => validate_generation_result(
+                        &completion.request,
+                        self.generation_requests.get(&repository_id),
+                        input.read(cx).content_version(),
+                        expected,
+                        current,
+                    ),
+                    (_, Some(Err(error)), _) => {
+                        error_message = Some(error.clone());
+                        GenerationApplyDecision::IndexChanged
+                    }
+                    _ => GenerationApplyDecision::IndexChanged,
+                };
+                match decision {
+                    GenerationApplyDecision::Apply => {
+                        if let Some(input) = input {
+                            input.update(cx, |input, cx| input.set_content(message, cx));
+                        }
+                        status_message = "Mensaje generado; revísalo antes del commit".to_owned();
+                        mutation_state = MutationState::Succeeded {
+                            kind: OperationKind::GenerateCommitMessage,
+                            message: "Mensaje generado".to_owned(),
+                        };
+                    }
+                    GenerationApplyDecision::DraftChanged => {
+                        status_message = "Propuesta no aplicada; el borrador cambió".to_owned();
+                        error_message = Some(
+                            "Se conserva tu borrador actual. Pulsa «Generar con Cursor» para reintentar."
+                                .to_owned(),
+                        );
+                        mutation_state = MutationState::Cancelled {
+                            kind: OperationKind::GenerateCommitMessage,
+                            message: "El borrador cambió durante la generación".to_owned(),
+                        };
+                    }
+                    GenerationApplyDecision::IndexChanged => completion.staged_changed = true,
+                    GenerationApplyDecision::StaleRequest => return,
                 }
             }
             Err(error) => {
-                if let Some(input) = self.commit_inputs.get(&repository_id) {
-                    input.update(cx, |input, cx| input.set_generating(false, cx));
-                }
-                if let Some(repository) = self
-                    .state
-                    .repositories
-                    .iter_mut()
-                    .find(|repository| repository.id == repository_id)
-                {
-                    let is_cancelled = error.to_lowercase().contains("cancel");
-                    repository.status_message = if is_cancelled {
-                        "Generación cancelada".to_owned()
-                    } else {
-                        "No se pudo generar el mensaje".to_owned()
-                    };
-                    repository.error = (!is_cancelled).then_some(error.clone());
-                    repository.mutation_state = if is_cancelled {
-                        MutationState::Cancelled {
-                            kind: OperationKind::GenerateCommitMessage,
-                            message: "Generación cancelada".to_owned(),
-                        }
-                    } else {
-                        MutationState::Failed {
-                            kind: OperationKind::GenerateCommitMessage,
-                            message: error.clone(),
-                            details: error,
-                        }
-                    };
-                }
+                let cancelled = completion.was_cancelled
+                    || completion.staged_changed
+                    || error.to_lowercase().contains("cancel");
+                status_message = if cancelled {
+                    "Generación cancelada; se conserva el borrador".to_owned()
+                } else {
+                    "No se pudo generar el mensaje".to_owned()
+                };
+                error_message = Some(if completion.staged_changed {
+                    "El staging area cambió; la propuesta quedó obsoleta. Revisa los cambios y pulsa «Generar con Cursor» para reintentar."
+                        .to_owned()
+                } else {
+                    error
+                });
+                mutation_state = if cancelled {
+                    MutationState::Cancelled {
+                        kind: OperationKind::GenerateCommitMessage,
+                        message: "Generación cancelada".to_owned(),
+                    }
+                } else {
+                    MutationState::Failed {
+                        kind: OperationKind::GenerateCommitMessage,
+                        message: "No se pudo generar el mensaje".to_owned(),
+                        details: error_message.clone().unwrap_or_default(),
+                    }
+                };
             }
+        }
+        self.generation_requests.remove(&repository_id);
+        if completion.staged_changed {
+            status_message = "Propuesta obsoleta; revisa el staging area".to_owned();
+            error_message = Some(
+                "El staging area cambió durante la generación. La propuesta no se aplicó; pulsa «Generar con Cursor» para reintentar."
+                    .to_owned(),
+            );
+            mutation_state = MutationState::Cancelled {
+                kind: OperationKind::GenerateCommitMessage,
+                message: "El staging area cambió durante la generación".to_owned(),
+            };
+        }
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = status_message;
+            repository.error = error_message;
+            repository.mutation_state = mutation_state;
         }
         self.refresh_repository(repository_id, cx);
         cx.notify();
@@ -3131,6 +3364,8 @@ mod tests {
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
             active_mutation_cancellations: HashMap::new(),
+            generation_requests: HashMap::new(),
+            next_generation_request_id: 0,
             repository_watchers: HashMap::new(),
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),

@@ -59,6 +59,8 @@ pub enum GitError {
     StagedDiscardWithoutHead,
     #[error("la ruta ya no es untracked y no se eliminará: {path:?}")]
     UntrackedStateChanged { path: PathBuf },
+    #[error("el index cambió mientras se preparaba el contexto staged")]
+    StagedStateChanged,
 }
 
 impl GitError {
