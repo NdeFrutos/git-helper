@@ -32,7 +32,10 @@ use crate::{
         default_clone_destination, default_clone_root, parse_ssh_url, plan_clone_destination,
         plan_discard, plan_fetch, plan_pull, plan_push,
     },
-    persistence::{AppStateStore, PersistedAppState, StateWriter, WindowPlacement},
+    persistence::{
+        AppStateStore, DisplayBounds, PersistedAppState, StateWriter, WindowPlacement,
+        validate_window_placement,
+    },
     process::CancellationToken,
     watcher::RepositoryWatcher,
 };
@@ -227,17 +230,14 @@ impl MainWindow {
         instance_request_receiver: InstanceRequestReceiver,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (state_writer, startup_store) = persisted_startup.map_or((None, None), |startup| {
-            let store = startup.store;
-            (Some(StateWriter::new(store.clone())), Some(store))
-        });
+        let startup_store = persisted_startup.map(|startup| startup.store);
         let state = AppState::default();
         Self {
             startup_store,
             state,
             git_client: GitClient::default(),
             cursor_client: CursorClient::new(PathBuf::from("agent")),
-            state_writer,
+            state_writer: None,
             window_placement: None,
             commit_inputs: HashMap::new(),
             commit_details_cache: HashMap::new(),
@@ -311,11 +311,17 @@ impl MainWindow {
 
         if let Some(store) = self.startup_store.take() {
             cx.spawn(async move |this, cx| {
-                let loaded = cx.background_spawn(async move { store.load() }).await;
+                let (store, loaded) = cx
+                    .background_spawn(async move {
+                        let loaded = store.load();
+                        (store, loaded)
+                    })
+                    .await;
                 let loaded = match loaded {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         this.update(cx, |this, cx| {
+                            this.state_writer = Some(StateWriter::new(store));
                             this.global_error =
                                 Some(format!("No se pudo restaurar el estado: {error}"));
                             this.apply_pending_startup_repository(cx);
@@ -358,7 +364,22 @@ impl MainWindow {
                     })
                     .await;
                 this.update_in(cx, |this, window, cx| {
+                    this.state_writer = Some(StateWriter::new(store));
                     if let Some(placement) = restored_placement {
+                        let displays = cx
+                            .displays()
+                            .iter()
+                            .map(|display| {
+                                let bounds = display.visible_bounds();
+                                DisplayBounds {
+                                    x: f32::from(bounds.origin.x),
+                                    y: f32::from(bounds.origin.y),
+                                    width: f32::from(bounds.size.width),
+                                    height: f32::from(bounds.size.height),
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let placement = validate_window_placement(placement, &displays);
                         window.resize(size(px(placement.width), px(placement.height)));
                         this.window_placement = Some(placement);
                     }
