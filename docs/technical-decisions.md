@@ -101,3 +101,21 @@ el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión c
 último `status_message` y el error accionable; los errores globales quedan reservados para fallos
 de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
 un estado distinto de un fallo para que la UI no la presente como error.
+
+## Canal de instancia única
+
+`ghelper` y `git-helper.exe` se comunican por un socket TCP en `127.0.0.1` con puerto **efímero**:
+el servidor enlaza el puerto 0 y publica `{version, port, token}` en
+`%LOCALAPPDATA%\GitHelper\instance-endpoint.json`, privado por usuario (en Unix se escribe con
+permisos `0600`). Así cada sesión de Windows tiene su propia instancia y ningún programa ajeno
+puede ocupar un puerto fijo y secuestrar el arranque.
+
+Cada solicitud viaja en una trama `GHLP` + versión + token + longitud (`u32`) + payload UTF-8. El
+servidor rechaza marcas o versiones desconocidas, compara el token en tiempo constante y limita el
+payload a 4 KiB antes de reservar memoria. Tras aceptar, revalida la ruta recibida con
+`git rev-parse --show-toplevel` —la validación del proceso `ghelper` no es suficiente, porque el
+receptor no controla quién escribe en el socket— y solo entonces entrega la solicitud a la UI.
+
+El cliente únicamente da el reenvío por bueno si recibe el ACK del protocolo; si no hay endpoint
+publicado, la conexión falla o la confirmación no llega, abre su propia ventana en lugar de
+terminar en silencio.

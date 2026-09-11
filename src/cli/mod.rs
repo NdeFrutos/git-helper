@@ -1,11 +1,12 @@
 mod args;
+mod endpoint;
 mod instance;
 mod path;
 
 pub use args::{InternalStartupArgs, parse_internal_startup_args};
 pub use instance::{
-    InstanceRequest, InstanceRequestReceiver, InstanceServer, forward_to_running_instance,
-    is_instance_running,
+    ForwardError, InstanceRequest, InstanceRequestReceiver, InstanceServer,
+    forward_to_running_instance,
 };
 
 use std::{
@@ -55,39 +56,32 @@ where
         None => None,
     };
 
-    if is_instance_running() {
-        let request = match &resolved_repository {
-            Some(path) => InstanceRequest::OpenRepository(path.clone()),
-            None => InstanceRequest::Activate,
-        };
-        if let Err(error) = forward_to_running_instance(&request) {
-            eprintln!("No se pudo contactar con Git Helper en ejecución: {error}");
-            return ExitCode::from(1);
+    let request = match &resolved_repository {
+        Some(path) => InstanceRequest::OpenRepository(path.clone()),
+        None => InstanceRequest::Activate,
+    };
+    match forward_to_running_instance(&request) {
+        Ok(()) => return ExitCode::SUCCESS,
+        Err(ForwardError::NoInstance(_)) => {}
+        Err(error) => {
+            // No hay instancia utilizable: se arranca una nueva en lugar de fallar.
+            eprintln!("Aviso: {error}. Se iniciará una nueva ventana de Git Helper.");
         }
-        return ExitCode::SUCCESS;
     }
 
-    if let Some(path) = resolved_repository {
-        if let Err(error) = launch_git_helper(Some(path)) {
-            eprintln!("No se pudo iniciar Git Helper: {error}");
-            return ExitCode::from(1);
-        }
-        return ExitCode::SUCCESS;
-    }
-
-    if let Err(error) = launch_git_helper(None) {
+    if let Err(error) = launch_git_helper(resolved_repository) {
         eprintln!("No se pudo iniciar Git Helper: {error}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 
-/// Intenta reenviar una solicitud a otra instancia o devuelve `false` si no hay ninguna.
+/// Intenta reenviar una solicitud a otra instancia.
+///
+/// Devuelve `false` si no hay instancia publicada o si no confirma la solicitud,
+/// de modo que la llamada continúe abriendo su propia ventana.
 #[must_use]
 pub fn try_forward_or_continue(request: &InstanceRequest) -> bool {
-    if !is_instance_running() {
-        return false;
-    }
     forward_to_running_instance(request).is_ok()
 }
 

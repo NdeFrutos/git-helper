@@ -7,10 +7,10 @@ use git_helper::{
 
 fn main() {
     let startup_args = parse_internal_startup_args(std::env::args());
-    let request = startup_args.open_repository.clone().map_or(
-        InstanceRequest::Activate,
-        InstanceRequest::OpenRepository,
-    );
+    let request = startup_args
+        .open_repository
+        .clone()
+        .map_or(InstanceRequest::Activate, InstanceRequest::OpenRepository);
     if try_forward_or_continue(&request) {
         return;
     }

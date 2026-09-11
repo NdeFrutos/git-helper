@@ -33,8 +33,7 @@ pub fn run(startup: AppStartup) {
         .inspect_err(
             |error| error!(error = %error, "No se pudo iniciar el servidor de instancia única"),
         )
-        .ok()
-        .flatten();
+        .ok();
 
     gpui_platform::application().run(move |cx: &mut App| {
         CommitInput::bind_keys(cx);
