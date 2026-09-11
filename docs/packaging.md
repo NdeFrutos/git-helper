@@ -89,6 +89,74 @@ gh workflow run release.yml \
 Repita con `failure_mode=package` y, para medir tiempos, con `failure_mode=none` en una ejecución
 fría y otra caliente del mismo SHA.
 
+## Diseño de la caché de Cargo
+
+CI y release comparten el mismo diseño de caché, definido en `.github/workflows/ci.yml` y
+`.github/workflows/release.yml`. Se cachean `~/.cargo/registry`, `~/.cargo/git`, `~/.cargo/bin`,
+`~/.cargo/.crates.toml`, `~/.cargo/.crates2.json` y `target`.
+
+Existen dos claves independientes porque los perfiles no comparten artefactos:
+
+Clave | Quién la escribe | Quién la lee
+--- | --- | ---
+`…-cargo-checks-…` | job `checks` de CI y de release | los mismos jobs (perfil dev)
+`…-cargo-release-…` | job `warm-release-cache` en `main` | job `package` de release (perfil release)
+
+Ambas claves tienen esta forma:
+
+```
+<os>-<arch>-cargo-<checks|release>-<CARGO_CACHE_VERSION>[-wix<CARGO_WIX_VERSION>]-<hash entorno>-<hash entradas>
+```
+
+- `CARGO_CACHE_VERSION` es una variable de entorno del workflow. Se sube a mano cuando cambia el
+  diseño de la caché (rutas, pasos o flags del runner) y no hay ningún fichero cuyo hash lo refleje.
+- `CARGO_WIX_VERSION` solo forma parte de la clave de release, que es la única que reutiliza el
+  binario de `~/.cargo/bin`.
+- El *hash de entorno* es `hashFiles('rust-toolchain.toml', '.cargo/config.toml')`: versión del
+  toolchain y flags del linker.
+- El *hash de entradas* es `hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs')`. `Cargo.toml` entra en
+  la clave porque contiene `[profile.*]`, features y la metadata de WiX: cambiarlos altera los
+  artefactos de `target` sin tocar `Cargo.lock`.
+
+Las `restore-keys` degradan por prefijo, de modo que un cambio de lockfile aún reutiliza el registro
+y los artefactos del toolchain anterior en lugar de partir de cero. Ninguna clave incluye
+`github.ref`: así una PR o una release pueden restaurar la caché escrita en `main`.
+
+`.github/scripts/ensure-cargo-wix.ps1` comprueba la versión real de `cargo-wix.exe` antes de decidir
+si instala. Con `restore-keys` una restauración parcial puede traer un binario de otra versión, así
+que no basta con comprobar que el fichero existe: si la versión no coincide se reinstala con
+`--force` y se verifica después. Cambiar `CARGO_WIX_VERSION` invalida además la clave exacta.
+
+### Qué invalida qué
+
+Cambio | Efecto
+--- | ---
+`rust-toolchain.toml` o `.cargo/config.toml` | invalida ambas claves por completo (compilador o linker distintos)
+`Cargo.lock`, `Cargo.toml` o `build.rs` | invalida la clave exacta; se restaura por prefijo la caché del mismo toolchain
+`CARGO_WIX_VERSION` | invalida la clave de release y fuerza la reinstalación verificada de `cargo-wix`
+`CARGO_CACHE_VERSION` | invalida todas las cachés a propósito
+
+## Medición de la caché
+
+`.github/scripts/report-cargo-cache.ps1` se ejecuta al final de cada job cacheado y publica en el
+resumen de Actions la duración del job, si hubo acierto exacto, la clave primaria, la clave
+realmente restaurada y el tamaño en disco de cada ruta cacheada. Los tamaños son del contenido
+descomprimido; el archivo que GitHub almacena es menor, y el límite del repositorio es de 10 GB.
+
+Mediciones tomadas en la PR de esta issue (`windows-latest`, job `Checks`, perfil dev):
+
+Ejecución | Acierto exacto | Duración del job | Tamaño en disco de las rutas cacheadas
+--- | --- | ---: | ---:
+Fría (clave `v2` recién estrenada) | PENDIENTE_FRIA_HIT | PENDIENTE_FRIA_TIEMPO | PENDIENTE_FRIA_TAMANO
+Caliente (mismo lockfile y toolchain) | PENDIENTE_CALIENTE_HIT | PENDIENTE_CALIENTE_TIEMPO | PENDIENTE_CALIENTE_TAMANO
+
+Enlaces a los resúmenes: PENDIENTE_ENLACES
+
+Para repetir la medición en el perfil release sin publicar nada, lanzar `Release` con
+`workflow_dispatch`, `dry_run=true` y `failure_mode=none` sobre `main`: el job `package` debe
+indicar acierto exacto contra la caché que dejó `warm-release-cache` y reutilizar `cargo-wix` sin
+reinstalarlo cuando la versión coincide.
+
 ## Medición del pipeline de release
 
 Cada job registra su duración y si obtuvo una coincidencia exacta de caché. El resumen final muestra

@@ -13,16 +13,28 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Subir esta versión invalida toda la caché de Cargo cuando cambia el diseño
+  # de la propia caché (rutas cacheadas, pasos o flags del runner).
+  CARGO_CACHE_VERSION: v2
+  CARGO_WIX_VERSION: 0.3.9
+
 jobs:
   checks:
     name: Checks
     runs-on: windows-latest
 
     steps:
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Cache Cargo checks
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
@@ -34,10 +46,13 @@ jobs:
             target
           # Do not include github.ref: the default branch cache is available
           # to pull requests and release/tag workflows through this key.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          # El primer hash cubre el entorno de compilación (toolchain y flags del
+          # linker); el segundo, las entradas que determinan qué se compila y con
+          # qué perfil (Cargo.toml incluye [profile.*] y la metadata de WiX).
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -48,16 +63,32 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
+      - name: Record checks cache metrics
+        if: always()
+        shell: pwsh
+        env:
+          STARTED_AT: ${{ steps.clock.outputs.started_at }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Checks" -StartedAt $env:STARTED_AT
+
   warm-release-cache:
     name: Warm release cache
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
 
     steps:
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Cache Cargo release
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
@@ -68,18 +99,24 @@ jobs:
             ~/.cargo/.crates2.json
             target
           # This is intentionally the same key and path used by releases.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-
 
       - name: Build release executable
         run: cargo build --release --locked
 
       - name: Install cargo-wix
         shell: pwsh
-        run: |
-          $cargoWix = Join-Path $env:USERPROFILE ".cargo\bin\cargo-wix.exe"
-          if (-not (Test-Path -LiteralPath $cargoWix -PathType Leaf)) {
-            cargo install cargo-wix --version 0.3.9 --locked
-          }
+        run: ./.github/scripts/ensure-cargo-wix.ps1 -Version $env:CARGO_WIX_VERSION
+
+      - name: Record warm-up cache metrics
+        if: always()
+        shell: pwsh
+        env:
+          STARTED_AT: ${{ steps.clock.outputs.started_at }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Warm release cache" -StartedAt $env:STARTED_AT
