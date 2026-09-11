@@ -15,7 +15,12 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
 - [ ] La ventana abre sin bloquearse y muestra el estado vacío si no hay repositorios guardados.
 - [ ] Al abrir un repositorio, la pestaña superior muestra el nombre del directorio y el tooltip o
   etiqueta accesible incluye la ruta completa.
-- [ ] Al cerrar y volver a abrir la aplicación, se restauran las pestañas y la pestaña activa.
+- [ ] Al cerrar y volver a abrir la aplicación, se restauran las pestañas, la pestaña activa, la
+  geometría de ventana y el borrador del mensaje de commit.
+- [ ] Un commit fallido conserva el borrador; un commit exitoso lo limpia.
+- [ ] Si un repositorio guardado no está accesible (disco desconectado), la pestaña permanece con
+  aviso, botón Reintentar y Cerrar; al recuperar la ruta, el estado vuelve a cargarse.
+- [ ] El estado vacío muestra repositorios recientes persistidos.
 
 ## Pestañas y navegación
 

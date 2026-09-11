@@ -6,8 +6,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel, Render,
-    Subscription, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel,
+    Render, Subscription, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
         RepositorySession, RepositorySnapshot, RepositoryView,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
-    persistence::{AppStateStore, PersistedAppState},
+    persistence::{AppStateStore, PersistedAppState, StateWriter, WindowPlacement},
     process::CancellationToken,
     watcher::RepositoryWatcher,
 };
@@ -124,6 +124,8 @@ pub struct MainWindow {
     git_client: GitClient,
     cursor_client: CursorClient,
     state_store: Option<AppStateStore>,
+    state_writer: Option<StateWriter>,
+    window_placement: Option<WindowPlacement>,
     commit_inputs: HashMap<RepositoryId, Entity<CommitInput>>,
     selected_commit_details: HashMap<RepositoryId, CommitDetails>,
     commit_input_subscriptions: HashMap<RepositoryId, Subscription>,
@@ -137,7 +139,6 @@ pub struct MainWindow {
     global_refresh_in_flight: Option<RepositoryId>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
     change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
-    save_generation: u64,
     git_version: Option<String>,
     global_status_message: String,
     global_error: Option<String>,
@@ -154,12 +155,17 @@ impl MainWindow {
     #[must_use]
     pub fn new(_cx: &mut Context<Self>) -> Self {
         let state_store = AppStateStore::default_location().ok();
+        let state_writer = state_store
+            .as_ref()
+            .map(|store| StateWriter::new(store.clone()));
         let state = AppState::default();
         Self {
             state,
             git_client: GitClient::default(),
             cursor_client: CursorClient::new(PathBuf::from("agent")),
             state_store,
+            state_writer,
+            window_placement: None,
             commit_inputs: HashMap::new(),
             selected_commit_details: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
@@ -173,7 +179,6 @@ impl MainWindow {
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
-            save_generation: 0,
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
             global_error: None,
@@ -182,25 +187,55 @@ impl MainWindow {
 
     /// Detecta Git y refresca todas las pestañas restauradas en background.
     pub fn initialize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_placement = Some(capture_window_placement(window));
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() {
+            if window.is_window_active() {
+                let Some(repository_id) = this.state.active_repository_id else {
+                    return;
+                };
+                this.force_refresh_repository(repository_id, cx);
                 return;
             }
-            let Some(repository_id) = this.state.active_repository_id else {
-                return;
-            };
-            this.force_refresh_repository(repository_id, cx);
+            this.save_state(cx);
         });
         self.window_subscriptions.push(activation_subscription);
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_placement = Some(capture_window_placement(window));
+            this.save_state(cx);
+        });
+        self.window_subscriptions.push(bounds_subscription);
+        let entity = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            entity
+                .update(cx, |this, cx| {
+                    this.window_placement = Some(capture_window_placement(window));
+                    if let Err(error) = this.flush_state(cx) {
+                        this.global_error =
+                            Some(format!("No se pudo guardar el estado al cerrar: {error}"));
+                    }
+                })
+                .ok();
+            true
+        });
 
         if let Some(state_store) = self.state_store.clone() {
             cx.spawn(async move |this, cx| {
                 let loaded = cx
                     .background_spawn(async move {
-                        let mut state = state_store.load()?.state.into_app_state();
-                        state
-                            .repositories
-                            .retain(|repository| repository.root_path.is_dir());
+                        let persisted = state_store.load()?.state;
+                        let (mut state, commit_drafts) = persisted.into_app_state();
+                        for repository in &mut state.repositories {
+                            repository.path_accessible = repository.root_path.is_dir();
+                            if !repository.path_accessible {
+                                repository.status_message =
+                                    "Repositorio no disponible; comprueba la ruta o el disco"
+                                        .to_owned();
+                                repository.error = Some(
+                                    "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
+                                        .to_owned(),
+                                );
+                            }
+                        }
                         if state.active_repository_id.is_some_and(|active_id| {
                             !state
                                 .repositories
@@ -212,11 +247,15 @@ impl MainWindow {
                         }
                         let cursor_executable =
                             resolve_cursor_executable(state.settings.cursor_cli_path.clone());
-                        Ok::<_, crate::persistence::PersistenceError>((state, cursor_executable))
+                        Ok::<_, crate::persistence::PersistenceError>((
+                            state,
+                            commit_drafts,
+                            cursor_executable,
+                        ))
                     })
                     .await;
                 this.update(cx, |this, cx| match loaded {
-                    Ok((mut loaded_state, cursor_executable)) => {
+                    Ok((mut loaded_state, commit_drafts, cursor_executable)) => {
                         let current_active = this.state.active_repository_id;
                         loaded_state.repositories.retain(|loaded_repository| {
                             !this.state.repositories.iter().any(|current_repository| {
@@ -224,10 +263,10 @@ impl MainWindow {
                                     == normalized_path_key(&loaded_repository.root_path)
                             })
                         });
-                        let restored_ids = loaded_state
+                        let restored = loaded_state
                             .repositories
                             .iter()
-                            .map(|repository| repository.id)
+                            .map(|repository| (repository.id, repository.path_accessible))
                             .collect::<Vec<_>>();
                         this.state
                             .repositories
@@ -238,12 +277,15 @@ impl MainWindow {
                         this.state.recent_repositories = loaded_state.recent_repositories;
                         this.state.settings = loaded_state.settings;
                         this.cursor_client = CursorClient::new(cursor_executable);
-                        for repository_id in restored_ids {
-                            this.create_commit_input(repository_id, cx);
-                            if this.state.active_repository_id == Some(repository_id) {
-                                this.refresh_repository(repository_id, cx);
-                            } else {
-                                this.pending_refreshes.insert(repository_id);
+                        for (repository_id, path_accessible) in restored {
+                            let draft = commit_drafts.get(&repository_id).cloned();
+                            this.create_commit_input(repository_id, draft, cx);
+                            if path_accessible {
+                                if this.state.active_repository_id == Some(repository_id) {
+                                    this.refresh_repository(repository_id, cx);
+                                } else {
+                                    this.pending_refreshes.insert(repository_id);
+                                }
                             }
                         }
                         this.save_state(cx);
@@ -304,9 +346,18 @@ impl MainWindow {
             .find(|repository| repository.id == active_id)
     }
 
-    fn create_commit_input(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+    fn create_commit_input(
+        &mut self,
+        repository_id: RepositoryId,
+        draft: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let input = cx.new(CommitInput::new);
-        let subscription = cx.subscribe(&input, |_this, _input, _: &CommitMessageChanged, cx| {
+        if let Some(draft) = draft {
+            input.update(cx, |input, cx| input.set_content(draft, cx));
+        }
+        let subscription = cx.subscribe(&input, |this, _input, _: &CommitMessageChanged, cx| {
+            this.save_state(cx);
             cx.notify();
         });
         self.commit_inputs.insert(repository_id, input);
@@ -314,30 +365,85 @@ impl MainWindow {
             .insert(repository_id, subscription);
     }
 
+    fn commit_drafts(&self, cx: &App) -> HashMap<RepositoryId, String> {
+        self.commit_inputs
+            .iter()
+            .map(|(repository_id, input)| (*repository_id, input.read(cx).content().to_owned()))
+            .collect()
+    }
+
+    fn build_persisted_state(&self, cx: &App) -> PersistedAppState {
+        PersistedAppState::from_app_state(
+            &self.state,
+            &self.commit_drafts(cx),
+            self.window_placement,
+        )
+    }
+
     fn save_state(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.state_store.clone() else {
+        let Some(writer) = self.state_writer.clone() else {
             return;
         };
-        self.save_generation = self.save_generation.saturating_add(1);
-        let generation = self.save_generation;
-        let state = PersistedAppState::from_app_state(&self.state, None);
-        let timer = cx.background_executor().timer(SAVE_DEBOUNCE_DURATION);
+        let state = self.build_persisted_state(cx);
+        writer.schedule(state, SAVE_DEBOUNCE_DURATION);
+    }
+
+    fn flush_state(&self, cx: &App) -> Result<(), crate::persistence::PersistenceError> {
+        let Some(writer) = self.state_writer.clone() else {
+            return Ok(());
+        };
+        let state = self.build_persisted_state(cx);
+        writer.flush(state)
+    }
+
+    fn retry_repository_access(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        repository.path_accessible = repository.root_path.is_dir();
+        if repository.path_accessible {
+            repository.error = None;
+            repository.status_message = "Preparando repositorio…".to_owned();
+            self.pending_refreshes.insert(repository_id);
+            self.refresh_repository(repository_id, cx);
+        } else {
+            repository.error = Some(
+                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
+                    .to_owned(),
+            );
+            repository.status_message =
+                "Repositorio no disponible; comprueba la ruta o el disco".to_owned();
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn open_recent_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+        let git_client = self.git_client.clone();
+        self.global_status_message = "Abriendo repositorio reciente…".to_owned();
         cx.spawn(async move |this, cx| {
-            timer.await;
-            let is_latest = this
-                .update(cx, |this, _| this.save_generation == generation)
-                .unwrap_or(false);
-            if !is_latest {
-                return;
-            }
-            let result = cx.background_spawn(async move { store.save(&state) }).await;
-            if let Err(error) = result {
-                this.update(cx, |this, cx| {
-                    this.global_error = Some(format!("No se pudo guardar el estado: {error}"));
-                    cx.notify();
+            let result = cx
+                .background_spawn(async move {
+                    git_client.discover_repository(&root_path, &CancellationToken::default())
                 })
-                .ok();
-            }
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(discovered_path) => this.finish_open_repository(discovered_path, cx),
+                    Err(error) => {
+                        this.global_error = Some(error.to_string());
+                        this.global_status_message =
+                            "No se pudo abrir el repositorio reciente".to_owned();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -401,7 +507,7 @@ impl MainWindow {
             .retain(|recent| normalized_path_key(recent) != path_key);
         self.state.recent_repositories.insert(0, root_path);
         self.state.recent_repositories.truncate(10);
-        self.create_commit_input(repository_id, cx);
+        self.create_commit_input(repository_id, None, cx);
         self.global_status_message = "Repositorio abierto".to_owned();
         self.global_error = None;
         self.save_state(cx);
@@ -611,6 +717,9 @@ impl MainWindow {
             .repositories
             .iter_mut()
             .find(|repository| repository.id == repository_id)?;
+        if !repository.path_accessible {
+            return None;
+        }
         if repository.is_refreshing() || repository.is_mutating() {
             repository.refresh_coordinator.mark_dirty();
             self.pending_refreshes.insert(repository_id);
@@ -2081,6 +2190,9 @@ impl MainWindow {
                         matches!(repository.refresh_state, RefreshState::Running { .. }),
                         |tab| tab.child(div().text_xs().text_color(ACCENT_COLOR).child("⟳")),
                     )
+                    .when(!repository.path_accessible, |tab| {
+                        tab.child(div().text_xs().text_color(WARNING_COLOR).child("⛔"))
+                    })
                     .when(repository.error.is_some(), |tab| {
                         tab.child(div().text_xs().text_color(ERROR_COLOR).child("!"))
                     })
@@ -3057,6 +3169,81 @@ impl MainWindow {
                     },
                 )),
             )
+            .when(!self.state.recent_repositories.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .mt_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(MUTED_TEXT_COLOR)
+                                .child("Recientes"),
+                        )
+                        .children(self.state.recent_repositories.iter().enumerate().map(
+                            |(index, recent)| {
+                                let label = recent
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Repositorio")
+                                    .to_owned();
+                                let path = recent.clone();
+                                action_button(format!("recent-{index}"), label, true).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_recent_repository(path.clone(), cx);
+                                    }),
+                                )
+                            },
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_inaccessible_repository(
+        &self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let repository_id = repository.id;
+        let path = repository.root_path.display().to_string();
+        div()
+            .flex()
+            .flex_1()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_4()
+            .child(div().text_xl().child("Repositorio no disponible"))
+            .child(div().text_sm().text_color(MUTED_TEXT_COLOR).child(path))
+            .child(div().text_sm().text_color(MUTED_TEXT_COLOR).child(
+                repository.error.clone().unwrap_or_else(|| {
+                    "La ruta no responde. Comprueba el disco o la red.".to_owned()
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        action_button("retry-repository", "Reintentar", true).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.retry_repository_access(repository_id, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        action_button("close-inaccessible", "Cerrar pestaña", true).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.close_repository(repository_id, cx);
+                            }),
+                        ),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -3082,12 +3269,16 @@ impl Render for MainWindow {
             .text_color(PRIMARY_TEXT_COLOR)
             .child(self.render_repository_tabs(cx))
             .when_some(active_repository.clone(), |root, repository| {
-                root.child(self.render_toolbar(&repository, cx))
-                    .child(self.render_internal_tabs(&repository, cx))
-                    .child(match repository.selected_view {
-                        RepositoryView::Changes => self.render_changes(&repository, cx),
-                        RepositoryView::History => self.render_history(&repository, cx),
-                    })
+                if repository.path_accessible {
+                    root.child(self.render_toolbar(&repository, cx))
+                        .child(self.render_internal_tabs(&repository, cx))
+                        .child(match repository.selected_view {
+                            RepositoryView::Changes => self.render_changes(&repository, cx),
+                            RepositoryView::History => self.render_history(&repository, cx),
+                        })
+                } else {
+                    root.child(self.render_inaccessible_repository(&repository, cx))
+                }
             })
             .when(active_repository.is_none(), |root| {
                 root.child(self.render_empty_state(cx))
@@ -3267,6 +3458,16 @@ fn status_color(representation: ChangeRepresentation) -> gpui::Rgba {
     }
 }
 
+fn capture_window_placement(window: &Window) -> WindowPlacement {
+    let bounds = window.bounds();
+    WindowPlacement {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+    }
+}
+
 fn normalized_path_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
@@ -3426,6 +3627,8 @@ mod tests {
             git_client,
             cursor_client: CursorClient::new(PathBuf::from("agent")),
             state_store: None,
+            state_writer: None,
+            window_placement: None,
             commit_inputs: HashMap::new(),
             selected_commit_details: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
@@ -3439,7 +3642,6 @@ mod tests {
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
-            save_generation: 0,
             git_version: None,
             global_status_message: String::new(),
             global_error: None,

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,7 +18,8 @@ use crate::domain::{
     RepositorySession, RepositorySnapshot, RepositoryView,
 };
 
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -36,6 +38,9 @@ pub struct PersistedRepository {
     pub id: RepositoryId,
     pub root_path: PathBuf,
     pub selected_view: RepositoryView,
+    /// Borrador local del mensaje de commit; solo se limpia tras un commit exitoso.
+    #[serde(default)]
+    pub commit_draft: Option<String>,
 }
 
 /// Esquema versionado escrito en `%LOCALAPPDATA%`.
@@ -68,16 +73,27 @@ impl Default for PersistedAppState {
 impl PersistedAppState {
     /// Extrae únicamente datos permitidos del modelo en ejecución.
     #[must_use]
-    pub fn from_app_state(app_state: &AppState, window_placement: Option<WindowPlacement>) -> Self {
+    pub fn from_app_state(
+        app_state: &AppState,
+        commit_drafts: &HashMap<RepositoryId, String>,
+        window_placement: Option<WindowPlacement>,
+    ) -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             repositories: app_state
                 .repositories
                 .iter()
-                .map(|repository| PersistedRepository {
-                    id: repository.id,
-                    root_path: repository.root_path.clone(),
-                    selected_view: repository.selected_view,
+                .map(|repository| {
+                    let commit_draft = commit_drafts
+                        .get(&repository.id)
+                        .filter(|draft| !draft.is_empty())
+                        .cloned();
+                    PersistedRepository {
+                        id: repository.id,
+                        root_path: repository.root_path.clone(),
+                        selected_view: repository.selected_view,
+                        commit_draft,
+                    }
                 })
                 .collect(),
             active_repository_id: app_state.active_repository_id,
@@ -89,35 +105,45 @@ impl PersistedAppState {
 
     /// Reconstruye sesiones vacías que recibirán un refresh posterior.
     #[must_use]
-    pub fn into_app_state(self) -> AppState {
+    pub fn into_app_state(self) -> (AppState, HashMap<RepositoryId, String>) {
+        let mut commit_drafts = HashMap::new();
         let repositories = self
             .repositories
             .into_iter()
-            .map(|repository| RepositorySession {
-                id: repository.id,
-                root_path: repository.root_path,
-                snapshot: Arc::new(RepositorySnapshot::default()),
-                selected_view: repository.selected_view,
-                selected_change: None,
-                selected_commit: None,
-                refresh_state: RefreshState::default(),
-                mutation_state: MutationState::default(),
-                status_message: "Preparando repositorio…".to_owned(),
-                error: None,
-                refresh_generation: 0,
-                history_generation: 0,
-                history_loaded: false,
-                history_loading: false,
-                refresh_coordinator: RefreshCoordinator::default(),
-                history_invalidated_during_refresh: false,
+            .map(|repository| {
+                if let Some(draft) = repository.commit_draft.filter(|draft| !draft.is_empty()) {
+                    commit_drafts.insert(repository.id, draft);
+                }
+                RepositorySession {
+                    id: repository.id,
+                    root_path: repository.root_path,
+                    snapshot: Arc::new(RepositorySnapshot::default()),
+                    selected_view: repository.selected_view,
+                    selected_change: None,
+                    selected_commit: None,
+                    refresh_state: RefreshState::default(),
+                    mutation_state: MutationState::default(),
+                    status_message: "Preparando repositorio…".to_owned(),
+                    error: None,
+                    refresh_generation: 0,
+                    history_generation: 0,
+                    history_loaded: false,
+                    history_loading: false,
+                    refresh_coordinator: RefreshCoordinator::default(),
+                    history_invalidated_during_refresh: false,
+                    path_accessible: true,
+                }
             })
             .collect();
-        AppState {
-            repositories,
-            active_repository_id: self.active_repository_id,
-            recent_repositories: self.recent_repositories,
-            settings: self.settings,
-        }
+        (
+            AppState {
+                repositories,
+                active_repository_id: self.active_repository_id,
+                recent_repositories: self.recent_repositories,
+                settings: self.settings,
+            },
+            commit_drafts,
+        )
     }
 }
 
@@ -274,13 +300,24 @@ impl AppStateStore {
 }
 
 fn migrate(mut state: PersistedAppState) -> PersistedAppState {
+    if state.schema_version <= LEGACY_SCHEMA_VERSION {
+        for repository in &mut state.repositories {
+            if repository
+                .commit_draft
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                repository.commit_draft = None;
+            }
+        }
+    }
     state.schema_version = CURRENT_SCHEMA_VERSION;
     state
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::HashMap, fs, path::PathBuf};
 
     use tempfile::tempdir;
 
@@ -297,8 +334,14 @@ mod tests {
         repository.selected_view = RepositoryView::History;
         app_state.active_repository_id = Some(repository.id);
         app_state.repositories.push(repository);
+        let mut commit_drafts = HashMap::new();
+        commit_drafts.insert(
+            app_state.repositories[0].id,
+            "feat: borrador persistido".to_owned(),
+        );
         let persisted = PersistedAppState::from_app_state(
             &app_state,
+            &commit_drafts,
             Some(WindowPlacement {
                 x: 10.0,
                 y: 20.0,
@@ -315,6 +358,46 @@ mod tests {
 
         assert_eq!(loaded.state, persisted);
         assert!(loaded.corruption_backup.is_none());
+    }
+
+    #[test]
+    fn migrates_legacy_schema_without_commit_drafts() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let mut app_state = AppState::default();
+        let repository = RepositorySession::new(PathBuf::from("legacy-repo"));
+        let repository_id = repository.id;
+        app_state.repositories.push(repository);
+        app_state.active_repository_id = Some(repository_id);
+        let persisted = PersistedAppState::from_app_state(&app_state, &HashMap::new(), None);
+        store.save(&persisted).expect("debe guardar");
+
+        let mut legacy =
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&state_path).unwrap())
+                .expect("debe parsear el estado guardado");
+        legacy["schema_version"] = 1.into();
+        if let Some(repositories) = legacy
+            .get_mut("repositories")
+            .and_then(|value| value.as_array_mut())
+        {
+            for repository in repositories {
+                if let Some(fields) = repository.as_object_mut() {
+                    fields.remove("commit_draft");
+                }
+            }
+        }
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy).expect("debe serializar"),
+        )
+        .expect("debe escribir el fixture legacy");
+
+        let loaded = store.load().expect("debe migrar");
+
+        assert_eq!(loaded.state.schema_version, 2);
+        assert_eq!(loaded.state.repositories.len(), 1);
+        assert!(loaded.state.repositories[0].commit_draft.is_none());
     }
 
     #[test]

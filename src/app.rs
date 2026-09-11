@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::OnceLock};
 
-use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, point, px, size};
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -9,6 +9,9 @@ use crate::{
     actions::{
         CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
         PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+    },
+    persistence::{
+        AppStateStore, DisplayBounds, default_window_placement, validate_window_placement,
     },
     ui::{CommitInput, MainWindow},
 };
@@ -32,7 +35,7 @@ pub fn run() {
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+        let bounds = initial_window_bounds(cx);
         let window_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -61,6 +64,38 @@ pub fn run() {
         info!("Git Helper iniciado");
         cx.activate(true);
     });
+}
+
+/// Restaura la geometría persistida sin bloquear el primer frame con comprobaciones de disco.
+fn initial_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+    let displays = display_bounds(cx);
+    let persisted = AppStateStore::default_location()
+        .ok()
+        .and_then(|store| store.load().ok())
+        .and_then(|loaded| loaded.state.window_placement);
+    let placement = persisted.map_or_else(
+        || default_window_placement(&displays),
+        |placement| validate_window_placement(placement, &displays),
+    );
+    Bounds::new(
+        point(px(placement.x), px(placement.y)),
+        size(px(placement.width), px(placement.height)),
+    )
+}
+
+fn display_bounds(cx: &App) -> Vec<DisplayBounds> {
+    cx.displays()
+        .iter()
+        .map(|display| {
+            let bounds = display.visible_bounds();
+            DisplayBounds {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            }
+        })
+        .collect()
 }
 
 /// Configura consola y rotación diaria sin registrar contenido del repositorio.
