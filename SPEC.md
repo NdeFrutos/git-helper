@@ -358,6 +358,17 @@ se ejecuta con `git log` sobre el OID de la referencia, sin hacer checkout ni mo
 referencias simbólicas se excluyen del inventario. Las referencias remotas representan el último
 `fetch` disponible localmente.
 
+La selección se conservará al refrescar mientras el commit siga en la referencia consultada. Si ya
+no está disponible, el fallback será dejar la selección vacía y retirar sus detalles; en ese caso no
+se ofrecerá reintento, porque la acción que corresponde es elegir otra fila. El refresco respetará
+la referencia fijada solo mientras exista y tenga nombre: un HEAD desacoplado seguirá a HEAD para
+que los commits nuevos aparezcan, y si la referencia fijada desaparece el historial volverá a HEAD
+sin invalidar el resto del estado del repositorio. La selección
+visual se actualiza antes de leer los detalles; durante la lectura se indicará la carga y, si falla,
+se mostrará el error de esa sesión con una acción de reintento. Las respuestas de selecciones
+anteriores, pestañas cerradas o referencias que hayan cambiado se descartarán. La caché de detalles
+será LRU, acotada y se identificará por el hash del commit; los errores no se cachearán.
+
 ### 4.10 Atajos
 
 | Atajo | Acción |

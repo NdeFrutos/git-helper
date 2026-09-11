@@ -24,8 +24,9 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
-        FileChange, HeadState, HistorySnapshot, MutationState, OperationKind, RefreshState,
-        RepositoryId, RepositorySession, RepositoryView, SshCloneMapping, WorkingTreeSnapshot,
+        FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState, OperationKind,
+        RefreshState, RepositoryId, RepositorySession, RepositoryView, SshCloneMapping,
+        WorkingTreeSnapshot,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -42,6 +43,9 @@ use crate::{
 
 use super::{
     commit_input::{CommitInput, CommitMessageChanged},
+    history_selection::{
+        BeginDetailsSelection, DetailsCompletion, HistoryDetailsController, HistoryDetailsKey,
+    },
     theme::{
         ACCENT_COLOR, BACKGROUND_COLOR, BORDER_COLOR, ELEVATED_BACKGROUND_COLOR, ERROR_COLOR,
         HOVER_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR, SELECTED_BACKGROUND_COLOR,
@@ -50,7 +54,6 @@ use super::{
 };
 
 const INITIAL_HISTORY_LIMIT: usize = 200;
-const MAX_CACHED_COMMIT_DETAILS: usize = 32;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
 const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 40;
 const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 40;
@@ -111,6 +114,7 @@ enum RefreshContinuation {
 struct PreparedRefresh {
     generation: u64,
     include_history: bool,
+    history_target: Option<(String, String)>,
     root_path: PathBuf,
     cancellation: CancellationToken,
 }
@@ -121,43 +125,6 @@ enum RefreshPayload {
         working_tree: WorkingTreeSnapshot,
         history: HistorySnapshot,
     },
-}
-
-/// Caché acotada de detalles de commit por repositorio.
-#[derive(Clone, Debug, Default)]
-struct CommitDetailsCache {
-    entries: HashMap<String, CommitDetails>,
-    order: Vec<String>,
-}
-
-impl CommitDetailsCache {
-    fn get(&mut self, commit_id: &str) -> Option<&CommitDetails> {
-        if !self.entries.contains_key(commit_id) {
-            return None;
-        }
-        self.order.retain(|existing| existing != commit_id);
-        self.order.push(commit_id.to_owned());
-        self.entries.get(commit_id)
-    }
-
-    fn insert(&mut self, details: CommitDetails) {
-        let commit_id = details.summary.id.clone();
-        if self.entries.contains_key(&commit_id) {
-            self.entries.insert(commit_id.clone(), details);
-            self.order.retain(|existing| existing != &commit_id);
-            self.order.push(commit_id);
-            return;
-        }
-        while self.entries.len() >= MAX_CACHED_COMMIT_DETAILS {
-            let Some(oldest) = self.order.first().cloned() else {
-                break;
-            };
-            self.order.remove(0);
-            self.entries.remove(&oldest);
-        }
-        self.order.push(commit_id.clone());
-        self.entries.insert(commit_id, details);
-    }
 }
 
 enum GenerationPreparationError {
@@ -191,7 +158,10 @@ pub struct MainWindow {
     state_writer: Option<StateWriter>,
     window_placement: Option<WindowPlacement>,
     commit_inputs: HashMap<RepositoryId, Entity<CommitInput>>,
-    commit_details_cache: HashMap<RepositoryId, CommitDetailsCache>,
+    selected_commit_details: HashMap<RepositoryId, CommitDetails>,
+    history_details: HistoryDetailsController,
+    history_detail_errors: HashMap<RepositoryId, String>,
+    history_detail_cancellations: HashMap<RepositoryId, (u64, CancellationToken)>,
     commit_input_subscriptions: HashMap<RepositoryId, Subscription>,
     window_subscriptions: Vec<Subscription>,
     active_refresh_cancellations: HashMap<RepositoryId, CancellationToken>,
@@ -240,7 +210,10 @@ impl MainWindow {
             state_writer: None,
             window_placement: None,
             commit_inputs: HashMap::new(),
-            commit_details_cache: HashMap::new(),
+            selected_commit_details: HashMap::new(),
+            history_details: HistoryDetailsController::default(),
+            history_detail_errors: HashMap::new(),
+            history_detail_cancellations: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -1103,6 +1076,7 @@ impl MainWindow {
 
     fn close_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
         let was_active = self.state.active_repository_id == Some(repository_id);
+        self.invalidate_history_details(repository_id);
         if let Some(cancellation) = self.active_refresh_cancellations.remove(&repository_id) {
             cancellation.cancel();
         }
@@ -1121,7 +1095,6 @@ impl MainWindow {
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
-        self.commit_details_cache.remove(&repository_id);
         self.repository_watchers.remove(&repository_id);
         self.pending_refreshes.remove(&repository_id);
         if self.global_refresh_in_flight == Some(repository_id) {
@@ -1148,6 +1121,38 @@ impl MainWindow {
         self.global_status_message = "Pestaña cerrada".to_owned();
         self.save_state(cx);
         cx.notify();
+    }
+
+    fn invalidate_history_details(&mut self, repository_id: RepositoryId) {
+        if let Some((_, cancellation)) = self.history_detail_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
+        self.history_details.cancel(repository_id);
+        self.selected_commit_details.remove(&repository_id);
+        self.history_detail_errors.remove(&repository_id);
+    }
+
+    /// El estado de la carga de detalles pertenece a la sesión: la barra solo
+    /// muestra `global_status_message` cuando no hay ningún repositorio activo.
+    fn set_session_status(&mut self, repository_id: RepositoryId, message: &str) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.to_owned();
+        }
+    }
+
+    fn clear_history_details_cancellation(&mut self, repository_id: RepositoryId, request_id: u64) {
+        if self
+            .history_detail_cancellations
+            .get(&repository_id)
+            .is_some_and(|(active_request_id, _)| *active_request_id == request_id)
+        {
+            self.history_detail_cancellations.remove(&repository_id);
+        }
     }
 
     fn next_repository(&mut self, _: &NextRepository, _: &mut Window, cx: &mut Context<Self>) {
@@ -1230,6 +1235,7 @@ impl MainWindow {
         let PreparedRefresh {
             generation,
             include_history,
+            history_target,
             root_path,
             cancellation,
         } = refresh;
@@ -1240,12 +1246,13 @@ impl MainWindow {
             let (result, path_accessible) = cx
                 .background_spawn(async move {
                     let result = if include_history {
-                        git_client
-                            .snapshot_with_history(&root_path, INITIAL_HISTORY_LIMIT, &cancellation)
-                            .map(|(working_tree, history)| RefreshPayload::WithHistory {
-                                working_tree,
-                                history,
-                            })
+                        snapshot_with_history_target(
+                            &git_client,
+                            &root_path,
+                            history_target,
+                            INITIAL_HISTORY_LIMIT,
+                            &cancellation,
+                        )
                     } else {
                         git_client
                             .snapshot(&root_path, &cancellation)
@@ -1262,6 +1269,13 @@ impl MainWindow {
                     path_accessible,
                     result,
                 );
+                let needs_history_reload =
+                    outcome.reload_history && outcome.continuation == RefreshContinuation::Complete;
+                let selected_commit_to_reload = (outcome.succeeded
+                    && outcome.continuation == RefreshContinuation::Complete
+                    && !needs_history_reload)
+                    .then(|| this.reconcile_selected_commit(repository_id))
+                    .flatten();
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
@@ -1274,10 +1288,11 @@ impl MainWindow {
                     .filter(|active_id| this.pending_refreshes.contains(active_id));
                 if let Some(next_refresh) = next_refresh {
                     this.refresh_repository(next_refresh, cx);
-                } else if outcome.reload_history
-                    && outcome.continuation == RefreshContinuation::Complete
-                {
+                } else if needs_history_reload {
                     this.ensure_history_loaded(repository_id, cx);
+                }
+                if let Some(commit_id) = selected_commit_to_reload {
+                    this.select_commit(repository_id, commit_id, cx);
                 }
                 if outcome.should_notify {
                     cx.notify();
@@ -1322,6 +1337,13 @@ impl MainWindow {
         repository.error = None;
         let include_history =
             repository.selected_view == RepositoryView::History && !repository.history_loaded;
+        let history_target = include_history.then(|| {
+            repository
+                .history
+                .history_reference
+                .clone()
+                .zip(repository.history.history_oid.clone())
+        });
         if include_history {
             repository.history_generation = repository.history_generation.saturating_add(1);
             repository.history_loading = true;
@@ -1333,6 +1355,7 @@ impl MainWindow {
         Some(PreparedRefresh {
             generation,
             include_history,
+            history_target: history_target.flatten(),
             root_path,
             cancellation,
         })
@@ -1513,7 +1536,7 @@ impl MainWindow {
                 ..RefreshOutcome::default()
             };
         }
-        match result {
+        let (outcome, invalidate_details) = match result {
             Ok(payload) => {
                 let (working_tree, incoming_history) = match payload {
                     RefreshPayload::WorkingTree(working_tree) => (working_tree, None),
@@ -1538,26 +1561,24 @@ impl MainWindow {
                     repository.history_generation = repository.history_generation.saturating_add(1);
                     repository.history_loaded = false;
                     repository.history_loading = false;
-                    repository.history = Arc::new(HistorySnapshot::empty());
-                    self.commit_details_cache.remove(&repository_id);
                 }
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
                 };
                 repository.status_message = "Estado actualizado".to_owned();
                 repository.error = None;
-                if history_changed {
-                    self.commit_details_cache.remove(&repository_id);
-                }
-                RefreshOutcome {
-                    succeeded: true,
-                    // El fin de la operación también es una transición visible si
-                    // Git devolvió exactamente el mismo snapshot.
-                    should_notify: true,
-                    reload_history: !repository.history_loaded
-                        && repository.selected_view == RepositoryView::History,
-                    continuation,
-                }
+                (
+                    RefreshOutcome {
+                        succeeded: true,
+                        // El fin de la operación también es una transición visible si
+                        // Git devolvió exactamente el mismo snapshot.
+                        should_notify: true,
+                        reload_history: !repository.history_loaded
+                            && repository.selected_view == RepositoryView::History,
+                        continuation,
+                    },
+                    history_changed || history_invalidated_during_refresh,
+                )
             }
             Err(error) => {
                 let details = error.technical_details();
@@ -1592,13 +1613,57 @@ impl MainWindow {
                         repository.error = Some(details);
                     }
                 }
-                RefreshOutcome {
-                    should_notify: true,
-                    continuation,
-                    ..RefreshOutcome::default()
-                }
+                (
+                    RefreshOutcome {
+                        should_notify: true,
+                        continuation,
+                        ..RefreshOutcome::default()
+                    },
+                    false,
+                )
             }
+        };
+        if invalidate_details {
+            self.invalidate_history_details(repository_id);
         }
+        outcome
+    }
+
+    fn reconcile_selected_commit(&mut self, repository_id: RepositoryId) -> Option<String> {
+        let repository = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)?;
+        let selected_commit = repository.selected_commit.clone();
+        let is_visible = selected_commit.as_ref().is_some_and(|selected| {
+            repository
+                .history
+                .commits
+                .iter()
+                .any(|commit| &commit.id == selected)
+        });
+        if !is_visible {
+            // Si la referencia ya no contiene el commit, el fallback explícito es
+            // dejar la selección vacía; nunca se muestra un detalle ajeno al historial.
+            repository.selected_commit = None;
+            self.selected_commit_details.remove(&repository_id);
+            if repository.history.has_more_commits {
+                self.history_detail_errors.insert(
+                    repository_id,
+                    "La selección quedó fuera de la primera página tras actualizar el historial; elige de nuevo el commit."
+                        .to_owned(),
+                );
+            } else {
+                self.history_detail_errors.remove(&repository_id);
+            }
+            return None;
+        }
+        selected_commit.filter(|_| {
+            repository.selected_view == RepositoryView::History
+                && !self.selected_commit_details.contains_key(&repository_id)
+                && !self.history_details.is_loading(repository_id)
+        })
     }
 
     fn select_view(&mut self, view: RepositoryView, cx: &mut Context<Self>) {
@@ -1610,11 +1675,16 @@ impl MainWindow {
         self.save_state(cx);
         if view == RepositoryView::History {
             self.ensure_history_loaded(repository_id, cx);
+        } else {
+            // Al salir de Historial los errores de detalle ya no son accionables
+            // ni fiables: evita mostrar mensajes obsoletos al volver.
+            self.history_detail_errors.remove(&repository_id);
         }
         cx.notify();
     }
 
     fn invalidate_history(&mut self, repository_id: RepositoryId) {
+        self.invalidate_history_details(repository_id);
         let Some(repository) = self
             .state
             .repositories
@@ -1629,8 +1699,6 @@ impl MainWindow {
         if repository.refresh_coordinator.in_flight() {
             repository.history_invalidated_during_refresh = true;
         }
-        repository.history = Arc::new(HistorySnapshot::empty());
-        self.commit_details_cache.remove(&repository_id);
     }
 
     fn ensure_history_loaded(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -1648,9 +1716,7 @@ impl MainWindow {
         {
             return;
         }
-        let Some((reference, expected_oid)) =
-            history_target_for_head(&repository.working_tree.head)
-        else {
+        let Some((reference, expected_oid)) = history_reload_target(repository) else {
             repository.history_loaded = true;
             return;
         };
@@ -1659,23 +1725,20 @@ impl MainWindow {
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
         repository.error = None;
-        {
-            let history = Arc::make_mut(&mut repository.history);
-            history.history_reference = Some(reference.clone());
-            history.history_oid = Some(expected_oid.clone());
-        }
+        let head = repository.working_tree.head.clone();
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.history_for_oid(
+                    load_history_page(
+                        &git_client,
                         &root_path,
+                        &head,
                         &reference,
                         &expected_oid,
-                        INITIAL_HISTORY_LIMIT + 1,
-                        0,
+                        INITIAL_HISTORY_LIMIT,
                         &CancellationToken::default(),
                     )
                 })
@@ -1702,6 +1765,9 @@ impl MainWindow {
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
                         repository.error = None;
+                        if let Some(commit_id) = this.reconcile_selected_commit(repository_id) {
+                            this.select_commit(repository_id, commit_id, cx);
+                        }
                     }
                     Ok(_) => {
                         repository.history_loaded = false;
@@ -3339,6 +3405,7 @@ impl MainWindow {
         branch: BranchReference,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_history_details(repository_id);
         let Some(repository) = self
             .state
             .repositories
@@ -3374,7 +3441,6 @@ impl MainWindow {
             history_reference: Some(branch.full_name.clone()),
             history_oid: branch.oid.clone(),
         });
-        self.commit_details_cache.remove(&repository_id);
         let Some(expected_oid) = branch.oid else {
             repository.status_message = "La rama no tiene commits".to_owned();
             repository.error = None;
@@ -3455,6 +3521,7 @@ impl MainWindow {
         commit_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_history_details(repository_id);
         let Some(repository) = self
             .state
             .repositories
@@ -3463,49 +3530,101 @@ impl MainWindow {
         else {
             return;
         };
-        repository.selected_commit = Some(commit_id.clone());
-        let has_cached_details = self
-            .commit_details_cache
-            .get_mut(&repository_id)
-            .and_then(|cache| cache.get(&commit_id))
-            .is_some();
-        if has_cached_details {
+        if !repository
+            .history
+            .commits
+            .iter()
+            .any(|commit| commit.id == commit_id)
+        {
+            repository.selected_commit = None;
+            self.history_detail_errors.insert(
+                repository_id,
+                "El commit ya no está en el historial visible; actualiza el repositorio."
+                    .to_owned(),
+            );
             cx.notify();
             return;
         }
+        repository.selected_commit = Some(commit_id.clone());
+        let Some(history_key) = history_details_key(repository) else {
+            repository.selected_commit = None;
+            self.history_detail_errors.insert(
+                repository_id,
+                "No hay una referencia de historial válida para este repositorio.".to_owned(),
+            );
+            cx.notify();
+            return;
+        };
         let root_path = repository.root_path.clone();
+        let history_generation = repository.history_generation;
         let git_client = self.git_client.clone();
+        let selection = self
+            .history_details
+            .begin(repository_id, history_generation, history_key);
+        let request = match selection {
+            BeginDetailsSelection::Cached(details) => {
+                self.selected_commit_details.insert(repository_id, details);
+                self.history_detail_errors.remove(&repository_id);
+                self.set_session_status(repository_id, "Detalles del commit cargados");
+                cx.notify();
+                return;
+            }
+            BeginDetailsSelection::Loading(request) => request,
+        };
+        let cancellation = CancellationToken::default();
+        self.history_detail_cancellations
+            .insert(repository_id, (request.request_id, cancellation.clone()));
+        self.set_session_status(repository_id, "Cargando detalles del commit…");
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.commit_details(&root_path, &commit_id, &CancellationToken::default())
+                    git_client
+                        .commit_details(&root_path, &commit_id, &cancellation)
+                        .map_err(|error| error.technical_details())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match result {
-                    Ok(details) => {
-                        this.commit_details_cache
-                            .entry(repository_id)
-                            .or_default()
-                            .insert(details);
-                        if let Some(repository) = this
-                            .state
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.id == repository_id)
-                        {
-                            repository.error = None;
-                        }
+                let current = this
+                    .state
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.id == request.repository_id)
+                    .map(|repository| {
+                        (
+                            repository.history_generation,
+                            history_details_key(repository),
+                            repository.selected_commit.clone(),
+                        )
+                    });
+                let Some((current_generation, current_key, selected_commit)) = current else {
+                    return;
+                };
+                match this.history_details.complete(
+                    &request,
+                    result,
+                    current_generation,
+                    current_key.as_ref(),
+                    selected_commit.as_deref(),
+                ) {
+                    DetailsCompletion::Applied(details) => {
+                        this.selected_commit_details.insert(repository_id, *details);
+                        this.history_detail_errors.remove(&repository_id);
+                        this.set_session_status(repository_id, "Detalles del commit cargados");
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
                     }
-                    Err(error) => {
-                        if let Some(repository) = this
-                            .state
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.id == repository_id)
-                        {
-                            repository.error = Some(error.to_string());
-                        }
+                    DetailsCompletion::Failed(error) => {
+                        this.selected_commit_details.remove(&repository_id);
+                        this.history_detail_errors.insert(repository_id, error);
+                        this.set_session_status(
+                            repository_id,
+                            "No se pudieron cargar los detalles",
+                        );
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
+                    }
+                    DetailsCompletion::Stale => {
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
+                        return;
                     }
                 }
                 cx.notify();
@@ -3513,6 +3632,18 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    fn retry_selected_commit(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let commit_id = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .and_then(|repository| repository.selected_commit.clone());
+        if let Some(commit_id) = commit_id {
+            self.select_commit(repository_id, commit_id, cx);
+        }
     }
 
     fn load_more_history(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -3620,11 +3751,7 @@ impl MainWindow {
         .detach();
     }
 
-    fn render_history(
-        &mut self,
-        repository: &RepositorySession,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_history(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
         let commits = Arc::clone(&repository.history.commits);
         let count = commits.len();
         let repository_id = repository.id;
@@ -3632,12 +3759,14 @@ impl MainWindow {
         let has_more = repository.history.has_more_commits;
         let selected_reference = repository.history.history_reference.clone();
         let branches = repository.working_tree.branches.clone();
-        let details = repository.selected_commit.as_ref().and_then(|commit_id| {
-            self.commit_details_cache
-                .get_mut(&repository_id)?
-                .get(commit_id)
-                .cloned()
-        });
+        let details = self.selected_commit_details.get(&repository_id).cloned();
+        let details_loading = self.history_details.is_loading(repository_id);
+        let detail_error = self.history_detail_errors.get(&repository_id).cloned();
+        // Los errores que dejan la selección vacía (el commit salió del
+        // historial visible) no se pueden reintentar: el usuario tiene que
+        // elegir otra fila, así que no se ofrece un botón que no haría nada.
+        let can_retry_details = detail_error.is_some() && selected_commit.is_some();
+        let has_details_panel = details_loading || detail_error.is_some() || details.is_some();
         div()
             .flex()
             .flex_col()
@@ -3774,7 +3903,7 @@ impl MainWindow {
                         ),
                 )
             })
-            .when_some(details, |history, details| {
+            .when(has_details_panel, |history| {
                 history.child(
                     div()
                         .id("commit-details")
@@ -3787,15 +3916,33 @@ impl MainWindow {
                         .border_t_1()
                         .border_color(BORDER_COLOR)
                         .text_xs()
-                        .child(format!("Commit {}", details.summary.id))
-                        .child(format!(
-                            "Autor: {} <{}> · {}",
-                            details.summary.author_name,
-                            details.summary.author_email,
-                            details.summary.authored_at
-                        ))
-                        .child(format!("Padres: {}", details.parent_ids.join(" ")))
-                        .when(!details.body.is_empty(), |panel| panel.child(details.body)),
+                        .when(details_loading, |panel| {
+                            panel.child("Cargando detalles del commit…")
+                        })
+                        .when_some(detail_error, |panel, error| {
+                            panel
+                                .child(div().text_color(ERROR_COLOR).child(error))
+                                .when(can_retry_details, |panel| {
+                                    panel.child(
+                                        action_button("retry-commit-details", "Reintentar", true)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.retry_selected_commit(repository_id, cx);
+                                            })),
+                                    )
+                                })
+                        })
+                        .when_some(details, |panel, details| {
+                            panel
+                                .child(format!("Commit {}", details.summary.id))
+                                .child(format!(
+                                    "Autor: {} <{}> · {}",
+                                    details.summary.author_name,
+                                    details.summary.author_email,
+                                    details.summary.authored_at
+                                ))
+                                .child(format!("Padres: {}", details.parent_ids.join(" ")))
+                                .when(!details.body.is_empty(), |panel| panel.child(details.body))
+                        }),
                 )
             })
             .into_any_element()
@@ -4163,6 +4310,130 @@ fn history_target_is_current(repository: &RepositorySession, reference: &str, oi
         && repository.history.history_oid.as_deref() == Some(oid)
 }
 
+/// Objetivo de recarga cuando el historial visible quedó invalidado.
+///
+/// Respeta referencias fijadas con nombre; un OID suelto o HEAD desacoplado
+/// sigue al commit actual en lugar de quedar anclado.
+fn history_reload_target(repository: &RepositorySession) -> Option<(String, String)> {
+    if let Some(reference) = repository
+        .history
+        .history_reference
+        .as_ref()
+        .filter(|reference| reference.starts_with("refs/"))
+        .cloned()
+    {
+        return repository
+            .history
+            .history_oid
+            .clone()
+            .map(|oid| (reference, oid));
+    }
+    history_target_for_head(&repository.working_tree.head)
+}
+
+fn load_history_page(
+    git_client: &GitClient,
+    root_path: &Path,
+    head: &HeadState,
+    reference: &str,
+    expected_oid: &str,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<HistoryPage, GitError> {
+    let load = |reference: &str, expected_oid: &str| -> Result<HistoryPage, GitError> {
+        if reference.starts_with("refs/") {
+            git_client.history_for_ref(root_path, reference, history_limit + 1, 0, cancellation)
+        } else {
+            git_client.history_for_oid(
+                root_path,
+                reference,
+                expected_oid,
+                history_limit + 1,
+                0,
+                cancellation,
+            )
+        }
+    };
+    match load(reference, expected_oid) {
+        Ok(page) => Ok(page),
+        Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. })
+            if reference.starts_with("refs/") =>
+        {
+            let Some((fallback_reference, fallback_oid)) = history_target_for_head(head) else {
+                return Err(GitError::ReferenceNotFound {
+                    value: reference.to_owned(),
+                });
+            };
+            load(&fallback_reference, &fallback_oid)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Lee el working tree y el historial de la referencia fijada por la vista.
+///
+/// La fijación solo se respeta si es una referencia con nombre. Un OID suelto
+/// —HEAD desacoplado— no puede fijarse: se quedaría anclado al commit anterior
+/// y los commits nuevos no aparecerían nunca.
+///
+/// Si la referencia fijada ya no existe, el historial vuelve a HEAD en lugar de
+/// hacer fallar todo el refresco: el estado del repositorio sigue siendo válido
+/// y una rama borrada no debe dejar la sesión en error de forma permanente.
+fn snapshot_with_history_target(
+    git_client: &GitClient,
+    root_path: &Path,
+    history_target: Option<(String, String)>,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<RefreshPayload, GitError> {
+    let working_tree = git_client.snapshot(root_path, cancellation)?;
+    let pinned_reference = history_target
+        .map(|(reference, _)| reference)
+        .filter(|reference| reference.starts_with("refs/"));
+    let history = match pinned_reference {
+        Some(reference) => {
+            match git_client.history_for_ref(
+                root_path,
+                &reference,
+                history_limit + 1,
+                0,
+                cancellation,
+            ) {
+                Ok(page) => history_snapshot_from_page(page, history_limit),
+                Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. }) => {
+                    git_client.history_page_as_snapshot(
+                        root_path,
+                        &working_tree.head,
+                        history_limit,
+                        0,
+                        cancellation,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => git_client.history_page_as_snapshot(
+            root_path,
+            &working_tree.head,
+            history_limit,
+            0,
+            cancellation,
+        )?,
+    };
+    Ok(RefreshPayload::WithHistory {
+        working_tree,
+        history,
+    })
+}
+
+fn history_details_key(repository: &RepositorySession) -> Option<HistoryDetailsKey> {
+    Some(HistoryDetailsKey {
+        reference: repository.history.history_reference.clone()?,
+        oid: repository.history.history_oid.clone()?,
+        commit_id: repository.selected_commit.clone()?,
+    })
+}
+
 fn history_snapshot_from_page(page: crate::domain::HistoryPage, limit: usize) -> HistorySnapshot {
     let has_more_commits = page.commits.len() > limit;
     HistorySnapshot {
@@ -4474,8 +4745,12 @@ mod tests {
     };
 
     use crate::{
-        domain::CommitSummary,
+        domain::{CommitDetails, CommitSummary},
         process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner},
+    };
+
+    use crate::ui::history_selection::{
+        BeginDetailsSelection, DetailsCompletion, HistoryDetailsKey,
     };
 
     use super::*;
@@ -4527,7 +4802,10 @@ mod tests {
             state_writer: None,
             window_placement: None,
             commit_inputs: HashMap::new(),
-            commit_details_cache: HashMap::new(),
+            selected_commit_details: HashMap::new(),
+            history_details: HistoryDetailsController::default(),
+            history_detail_errors: HashMap::new(),
+            history_detail_cancellations: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -4997,34 +5275,193 @@ mod tests {
     }
 
     #[test]
-    fn commit_details_cache_evicts_least_recently_used_entry() {
-        let mut cache = CommitDetailsCache::default();
-        for index in 0..MAX_CACHED_COMMIT_DETAILS {
-            cache.insert(CommitDetails {
-                summary: sample_commit_summary(index),
-                body: String::new(),
-                committer_name: String::new(),
-                committer_email: String::new(),
-                committed_at: 0,
-                parent_ids: Vec::new(),
-            });
-        }
-
-        assert!(cache.get("commit-00000").is_some());
-        cache.insert(CommitDetails {
-            summary: sample_commit_summary(MAX_CACHED_COMMIT_DETAILS),
-            body: String::new(),
-            committer_name: String::new(),
-            committer_email: String::new(),
-            committed_at: 0,
-            parent_ids: Vec::new(),
+    fn history_reload_target_honours_a_pinned_branch() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("abc123".to_owned()),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            history_reference: Some("refs/heads/feature".to_owned()),
+            history_oid: Some("def456".to_owned()),
+            ..HistorySnapshot::empty()
         });
 
-        assert_eq!(cache.entries.len(), MAX_CACHED_COMMIT_DETAILS);
-        assert!(cache.entries.contains_key("commit-00000"));
-        assert!(!cache.entries.contains_key("commit-00001"));
-        assert!(cache.entries.contains_key("commit-00031"));
-        assert!(cache.entries.contains_key("commit-00032"));
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("refs/heads/feature".to_owned(), "def456".to_owned()))
+        );
+    }
+
+    #[test]
+    fn history_reload_target_ignores_a_detached_oid_pin() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Detached {
+                oid: "new-head".to_owned(),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            history_reference: Some("old-head".to_owned()),
+            history_oid: Some("old-head".to_owned()),
+            ..HistorySnapshot::empty()
+        });
+
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("new-head".to_owned(), "new-head".to_owned()))
+        );
+    }
+
+    fn summary(id: &str) -> CommitSummary {
+        CommitSummary {
+            id: id.to_owned(),
+            short_id: id.to_owned(),
+            subject: String::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            authored_at: 0,
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_a_selected_commit_that_is_still_visible() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("keep".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("keep")]),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(
+            window.reconcile_selected_commit(repository_id),
+            Some("keep".to_owned())
+        );
+        assert_eq!(
+            window.state.repositories[0].selected_commit.as_deref(),
+            Some("keep")
+        );
+    }
+
+    #[test]
+    fn refresh_clears_a_selected_commit_that_left_the_visible_history() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("gone".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("other")]),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(window.reconcile_selected_commit(repository_id), None);
+        assert!(window.state.repositories[0].selected_commit.is_none());
+    }
+
+    #[test]
+    fn refresh_clears_paginated_selection_with_explicit_fallback() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("deep".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("recent")]),
+            has_more_commits: true,
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(window.reconcile_selected_commit(repository_id), None);
+        assert!(window.state.repositories[0].selected_commit.is_none());
+        assert!(window.history_detail_errors.contains_key(&repository_id));
+    }
+
+    #[test]
+    fn head_change_during_details_load_cancels_active_request() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.history_loaded = true;
+        repository.refresh_generation = 1;
+        repository.selected_commit = Some("commit-a".to_owned());
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("old-oid".to_owned()),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("commit-a")]),
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("old-oid".to_owned()),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        let history_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "old-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        let request = match window
+            .history_details
+            .begin(repository_id, 1, history_key.clone())
+        {
+            BeginDetailsSelection::Loading(request) => request,
+            BeginDetailsSelection::Cached(_) => panic!("la prueba necesita una carga en curso"),
+        };
+        assert!(window.history_details.is_loading(repository_id));
+
+        let outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            true,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
+                head: HeadState::Branch {
+                    name: "main".to_owned(),
+                    oid: Some("new-oid".to_owned()),
+                },
+                ..WorkingTreeSnapshot::default()
+            })),
+        );
+        assert!(outcome.succeeded);
+
+        assert!(!window.history_details.is_loading(repository_id));
+        let current_generation = window.state.repositories[0].history_generation;
+        let current_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "old-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        assert!(matches!(
+            window.history_details.complete(
+                &request,
+                Ok(CommitDetails {
+                    summary: summary("commit-a"),
+                    body: String::new(),
+                    committer_name: String::new(),
+                    committer_email: String::new(),
+                    committed_at: 0,
+                    parent_ids: Vec::new(),
+                }),
+                current_generation,
+                Some(&current_key),
+                Some("commit-a"),
+            ),
+            DetailsCompletion::Stale
+        ));
+        assert!(!window.history_details.is_loading(repository_id));
     }
 
     #[test]

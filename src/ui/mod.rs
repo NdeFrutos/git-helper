@@ -1,4 +1,5 @@
 mod commit_input;
+pub(crate) mod history_selection;
 mod main_window;
 mod theme;
 
