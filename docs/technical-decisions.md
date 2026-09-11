@@ -126,9 +126,11 @@ no se registra ni procesa eventos.
 
 ## Persistencia
 
-El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
-y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
-continúa con estado vacío.
+El esquema actual es la versión 3: v2 incorpora los mapeos de clones SSH y v3 los borradores y la
+geometría de ventana. `state.json` se lee una sola vez en background después de crear la ventana,
+para que un almacenamiento lento no bloquee el primer frame. Se escribe mediante un archivo
+temporal sincronizado y reemplazo atómico. Un JSON corrupto se mueve a
+`state.corrupt-<timestamp>.json` y el arranque continúa con estado vacío.
 
 ## Working tree e historial desacoplados (PERF-03)
 

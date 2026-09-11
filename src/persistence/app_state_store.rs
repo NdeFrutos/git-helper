@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -18,7 +19,9 @@ use crate::domain::{
     WorkingTreeSnapshot,
 };
 
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
+/// su brazo en `migrate`; nunca reutilices un número ya publicado por otra rama.
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -37,6 +40,9 @@ pub struct PersistedRepository {
     pub id: RepositoryId,
     pub root_path: PathBuf,
     pub selected_view: RepositoryView,
+    /// Borrador local del mensaje de commit; solo se limpia tras un commit exitoso.
+    #[serde(default)]
+    pub commit_draft: Option<String>,
 }
 
 /// Esquema versionado escrito en `%LOCALAPPDATA%`.
@@ -72,16 +78,27 @@ impl Default for PersistedAppState {
 impl PersistedAppState {
     /// Extrae únicamente datos permitidos del modelo en ejecución.
     #[must_use]
-    pub fn from_app_state(app_state: &AppState, window_placement: Option<WindowPlacement>) -> Self {
+    pub fn from_app_state(
+        app_state: &AppState,
+        commit_drafts: &HashMap<RepositoryId, String>,
+        window_placement: Option<WindowPlacement>,
+    ) -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             repositories: app_state
                 .repositories
                 .iter()
-                .map(|repository| PersistedRepository {
-                    id: repository.id,
-                    root_path: repository.root_path.clone(),
-                    selected_view: repository.selected_view,
+                .map(|repository| {
+                    let commit_draft = commit_drafts
+                        .get(&repository.id)
+                        .filter(|draft| !draft.is_empty())
+                        .cloned();
+                    PersistedRepository {
+                        id: repository.id,
+                        root_path: repository.root_path.clone(),
+                        selected_view: repository.selected_view,
+                        commit_draft,
+                    }
                 })
                 .collect(),
             active_repository_id: app_state.active_repository_id,
@@ -94,38 +111,48 @@ impl PersistedAppState {
 
     /// Reconstruye sesiones vacías que recibirán un refresh posterior.
     #[must_use]
-    pub fn into_app_state(self) -> AppState {
+    pub fn into_app_state(self) -> (AppState, HashMap<RepositoryId, String>) {
+        let mut commit_drafts = HashMap::new();
         let repositories = self
             .repositories
             .into_iter()
-            .map(|repository| RepositorySession {
-                id: repository.id,
-                root_path: repository.root_path,
-                working_tree: Arc::new(WorkingTreeSnapshot::default()),
-                history: Arc::new(HistorySnapshot::empty()),
-                change_counters: ChangeCounters::default(),
-                selected_view: repository.selected_view,
-                selected_change: None,
-                selected_commit: None,
-                refresh_state: RefreshState::default(),
-                mutation_state: MutationState::default(),
-                status_message: "Preparando repositorio…".to_owned(),
-                error: None,
-                refresh_generation: 0,
-                history_generation: 0,
-                history_loaded: false,
-                history_loading: false,
-                refresh_coordinator: RefreshCoordinator::default(),
-                history_invalidated_during_refresh: false,
+            .map(|repository| {
+                if let Some(draft) = repository.commit_draft.filter(|draft| !draft.is_empty()) {
+                    commit_drafts.insert(repository.id, draft);
+                }
+                RepositorySession {
+                    id: repository.id,
+                    root_path: repository.root_path,
+                    working_tree: Arc::new(WorkingTreeSnapshot::default()),
+                    history: Arc::new(HistorySnapshot::empty()),
+                    change_counters: ChangeCounters::default(),
+                    selected_view: repository.selected_view,
+                    selected_change: None,
+                    selected_commit: None,
+                    refresh_state: RefreshState::default(),
+                    mutation_state: MutationState::default(),
+                    status_message: "Preparando repositorio…".to_owned(),
+                    error: None,
+                    refresh_generation: 0,
+                    history_generation: 0,
+                    history_loaded: false,
+                    history_loading: false,
+                    refresh_coordinator: RefreshCoordinator::default(),
+                    history_invalidated_during_refresh: false,
+                    path_accessible: true,
+                }
             })
             .collect();
-        AppState {
-            repositories,
-            active_repository_id: self.active_repository_id,
-            recent_repositories: self.recent_repositories,
-            ssh_clone_mappings: self.ssh_clone_mappings,
-            settings: self.settings,
-        }
+        (
+            AppState {
+                repositories,
+                active_repository_id: self.active_repository_id,
+                recent_repositories: self.recent_repositories,
+                ssh_clone_mappings: self.ssh_clone_mappings,
+                settings: self.settings,
+            },
+            commit_drafts,
+        )
     }
 }
 
@@ -281,32 +308,53 @@ impl AppStateStore {
     }
 }
 
-/// Aplica cada paso de esquema por separado y deja los datos consistentes aunque el
-/// archivo ya venga marcado con una versión que otro cambio haya escrito antes.
+/// Aplica los pasos de migración uno a uno hasta alcanzar la versión actual.
+///
+/// Cada paso solo conoce su propia transición (`n` → `n + 1`), de modo que una rama
+/// que añada otro paso encima solo tiene que registrar su brazo y subir
+/// `CURRENT_SCHEMA_VERSION`; no hay comparaciones contra una versión heredada fija.
 fn migrate(mut state: PersistedAppState) -> PersistedAppState {
     while state.schema_version < CURRENT_SCHEMA_VERSION {
-        state = apply_migration_step(state);
+        match state.schema_version {
+            0 | 1 => {
+                normalize_ssh_clone_mappings(&mut state);
+                state.schema_version = 2;
+            }
+            2 => {
+                normalize_commit_drafts(&mut state);
+                state.schema_version = 3;
+            }
+            unknown => {
+                warn!(
+                    version = unknown,
+                    "No hay paso de migración registrado; se adopta la versión actual"
+                );
+                state.schema_version = CURRENT_SCHEMA_VERSION;
+            }
+        }
     }
-    // Los pasos son idempotentes: se reejecutan sobre estados ya marcados para
-    // tolerar versiones escritas por otras migraciones de la misma numeración.
-    state = normalize_ssh_clone_mappings(state);
-    state.schema_version = CURRENT_SCHEMA_VERSION;
+    // Ambas normalizaciones son idempotentes y reparan estados escritos por
+    // builds intermedias que compartieron temporalmente el mismo número.
+    normalize_ssh_clone_mappings(&mut state);
+    normalize_commit_drafts(&mut state);
     state
 }
 
-fn apply_migration_step(mut state: PersistedAppState) -> PersistedAppState {
-    match state.schema_version {
-        0 | 1 => {
-            state = normalize_ssh_clone_mappings(state);
-            state.schema_version = 2;
+/// v2 → v3: los borradores de commit pasan a persistirse; normaliza los vacíos a `None`.
+fn normalize_commit_drafts(state: &mut PersistedAppState) {
+    for repository in &mut state.repositories {
+        if repository
+            .commit_draft
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            repository.commit_draft = None;
         }
-        _ => state.schema_version = CURRENT_SCHEMA_VERSION,
     }
-    state
 }
 
 /// Descarta mapeos SSH incompletos o duplicados heredados de versiones previas.
-fn normalize_ssh_clone_mappings(mut state: PersistedAppState) -> PersistedAppState {
+fn normalize_ssh_clone_mappings(state: &mut PersistedAppState) {
     let mut seen = Vec::new();
     state.ssh_clone_mappings.retain(|mapping| {
         if mapping.ssh_url_normalized.trim().is_empty()
@@ -318,12 +366,11 @@ fn normalize_ssh_clone_mappings(mut state: PersistedAppState) -> PersistedAppSta
         seen.push(mapping.ssh_url_normalized.clone());
         true
     });
-    state
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::HashMap, fs, path::PathBuf};
 
     use tempfile::tempdir;
 
@@ -340,8 +387,14 @@ mod tests {
         repository.selected_view = RepositoryView::History;
         app_state.active_repository_id = Some(repository.id);
         app_state.repositories.push(repository);
+        let mut commit_drafts = HashMap::new();
+        commit_drafts.insert(
+            app_state.repositories[0].id,
+            "feat: borrador persistido".to_owned(),
+        );
         let persisted = PersistedAppState::from_app_state(
             &app_state,
+            &commit_drafts,
             Some(WindowPlacement {
                 x: 10.0,
                 y: 20.0,
@@ -358,6 +411,101 @@ mod tests {
 
         assert_eq!(loaded.state, persisted);
         assert!(loaded.corruption_backup.is_none());
+    }
+
+    #[test]
+    fn migrates_legacy_schema_without_commit_drafts() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let mut app_state = AppState::default();
+        let repository = RepositorySession::new(PathBuf::from("legacy-repo"));
+        let repository_id = repository.id;
+        app_state.repositories.push(repository);
+        app_state.active_repository_id = Some(repository_id);
+        let persisted = PersistedAppState::from_app_state(&app_state, &HashMap::new(), None);
+        store.save(&persisted).expect("debe guardar");
+
+        let mut legacy =
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&state_path).unwrap())
+                .expect("debe parsear el estado guardado");
+        legacy["schema_version"] = 1.into();
+        if let Some(repositories) = legacy
+            .get_mut("repositories")
+            .and_then(|value| value.as_array_mut())
+        {
+            for repository in repositories {
+                if let Some(fields) = repository.as_object_mut() {
+                    fields.remove("commit_draft");
+                }
+            }
+        }
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&legacy).expect("debe serializar"),
+        )
+        .expect("debe escribir el fixture legacy");
+
+        let loaded = store.load().expect("debe migrar");
+
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.state.repositories.len(), 1);
+        assert!(loaded.state.repositories[0].commit_draft.is_none());
+    }
+
+    #[test]
+    fn migration_ladder_advances_step_by_step_to_the_current_version() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let persisted = PersistedAppState::from_app_state(
+            &AppState::default(),
+            &HashMap::new(),
+            Some(WindowPlacement {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+        );
+        store.save(&persisted).expect("debe guardar");
+
+        for stored_version in 0..super::CURRENT_SCHEMA_VERSION {
+            let mut stored = serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(&state_path).expect("debe leer el estado"),
+            )
+            .expect("debe parsear el estado guardado");
+            stored["schema_version"] = stored_version.into();
+            fs::write(
+                &state_path,
+                serde_json::to_string_pretty(&stored).expect("debe serializar"),
+            )
+            .expect("debe escribir el fixture");
+
+            let loaded = store.load().expect("debe migrar");
+
+            assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+            assert_eq!(loaded.state.window_placement, persisted.window_placement);
+        }
+    }
+
+    #[test]
+    fn rejects_state_written_by_a_newer_schema() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        let store = AppStateStore::new(state_path.clone());
+        let persisted = PersistedAppState {
+            schema_version: super::CURRENT_SCHEMA_VERSION + 1,
+            ..PersistedAppState::default()
+        };
+        store.save(&persisted).expect("debe guardar");
+
+        let error = store.load().expect_err("no debe aceptar un esquema futuro");
+
+        assert!(matches!(
+            error,
+            super::PersistenceError::UnsupportedSchema { .. }
+        ));
     }
 
     #[test]
@@ -387,12 +535,12 @@ mod tests {
 
         let loaded = store.load().expect("debe migrar");
 
-        assert_eq!(loaded.state.schema_version, 2);
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
         assert!(loaded.state.ssh_clone_mappings.is_empty());
     }
 
     #[test]
-    fn migration_is_idempotent_for_state_already_marked_as_v2() {
+    fn migrates_v2_state_without_losing_ssh_defaults() {
         let temporary_directory = tempdir().expect("debe crear el temporal");
         let state_path = temporary_directory.path().join("state.json");
         fs::write(
@@ -404,7 +552,7 @@ mod tests {
 
         let loaded = store.load().expect("debe cargar sin perder datos");
 
-        assert_eq!(loaded.state.schema_version, 2);
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
         assert!(loaded.state.ssh_clone_mappings.is_empty());
     }
 
@@ -417,7 +565,7 @@ mod tests {
             ssh_url_normalized: "ssh://github.com/org/repo".to_owned(),
             local_path: PathBuf::from(r"C:\GitHelper\repos\repo"),
         });
-        let persisted = PersistedAppState::from_app_state(&app_state, None);
+        let persisted = PersistedAppState::from_app_state(&app_state, &HashMap::new(), None);
         store.save(&persisted).expect("debe guardar");
         let loaded = store.load().expect("debe cargar");
         assert_eq!(

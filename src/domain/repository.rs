@@ -202,6 +202,10 @@ impl HistorySnapshot {
 
 /// Sesión independiente asociada a una pestaña superior.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Los flags reflejan estados de carga independientes ya modelados en el dominio"
+)]
 pub struct RepositorySession {
     pub id: RepositoryId,
     pub root_path: PathBuf,
@@ -221,6 +225,8 @@ pub struct RepositorySession {
     pub history_loading: bool,
     pub refresh_coordinator: RefreshCoordinator,
     pub history_invalidated_during_refresh: bool,
+    /// Se evalúa al restaurar o reintentar; no elimina la sesión si la ruta no responde.
+    pub path_accessible: bool,
 }
 
 impl RepositorySession {
@@ -246,6 +252,7 @@ impl RepositorySession {
             history_loading: false,
             refresh_coordinator: RefreshCoordinator::default(),
             history_invalidated_during_refresh: false,
+            path_accessible: true,
         }
     }
 

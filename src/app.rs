@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::OnceLock};
 
 use async_channel::unbounded;
-use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, point, px, size};
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -13,7 +13,11 @@ use crate::{
         ShowHistory,
     },
     cli::InstanceServer,
-    ui::{CommitInput, MainWindow},
+    persistence::{
+        AppStateStore, DisplayBounds, WindowPlacement, default_window_placement,
+        validate_window_placement,
+    },
+    ui::{CommitInput, MainWindow, StartupState},
 };
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
@@ -50,13 +54,23 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+        let persisted_startup = locate_startup_store();
+        let bounds = initial_window_bounds(cx, None);
         let window_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| MainWindow::new(startup.clone(), instance_receiver.clone(), cx)),
+            |_, cx| {
+                cx.new(|cx| {
+                    MainWindow::new(
+                        persisted_startup,
+                        startup.clone(),
+                        instance_receiver.clone(),
+                        cx,
+                    )
+                })
+            },
         );
 
         match window_result {
@@ -79,6 +93,42 @@ pub fn run(startup: AppStartup) {
         info!("Git Helper iniciado");
         cx.activate(true);
     });
+}
+
+/// Localiza el almacén sin leerlo; la lectura se hará en background tras el primer frame.
+fn locate_startup_store() -> Option<StartupState> {
+    let store = AppStateStore::default_location()
+        .inspect_err(|error| error!(error = %error, "No se pudo localizar el estado persistido"))
+        .ok()?;
+    Some(StartupState { store })
+}
+
+/// Ajusta la geometría ya leída a los monitores visibles; no vuelve a tocar disco.
+fn initial_window_bounds(cx: &App, persisted: Option<WindowPlacement>) -> Bounds<gpui::Pixels> {
+    let displays = display_bounds(cx);
+    let placement = persisted.map_or_else(
+        || default_window_placement(&displays),
+        |placement| validate_window_placement(placement, &displays),
+    );
+    Bounds::new(
+        point(px(placement.x), px(placement.y)),
+        size(px(placement.width), px(placement.height)),
+    )
+}
+
+fn display_bounds(cx: &App) -> Vec<DisplayBounds> {
+    cx.displays()
+        .iter()
+        .map(|display| {
+            let bounds = display.visible_bounds();
+            DisplayBounds {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            }
+        })
+        .collect()
 }
 
 /// Configura consola y rotación diaria sin registrar contenido del repositorio.
