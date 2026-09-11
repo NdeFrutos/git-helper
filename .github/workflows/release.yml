@@ -74,8 +74,11 @@ jobs:
           if ($Matches.cargoVersion -ne $version) {
             throw "La etiqueta $tag no coincide con Cargo.toml ($($Matches.cargoVersion))."
           }
-          if ($env:DRY_RUN -ne "true" -and (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
-            throw "La release $tag ya existe."
+          if ($env:DRY_RUN -ne "true") {
+            gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+            if ($LASTEXITCODE -eq 0) {
+              throw "La release $tag ya existe."
+            }
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -264,7 +267,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) { throw "La release ya existe" }
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { throw "La release ya existe" }
           $assets = Get-ChildItem -LiteralPath "dist" -File | ForEach-Object { $_.FullName }
           gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --generate-notes
           if ($LASTEXITCODE -ne 0) { throw "GitHub no pudo crear la release" }
