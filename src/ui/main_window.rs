@@ -15,7 +15,7 @@ use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
         NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        ShowHistory, ShowSummary, SummaryActivateRow, SummaryNextRow, SummaryPreviousRow,
     },
     app::AppStartup,
     cli::{InstanceRequest, InstanceRequestReceiver},
@@ -27,9 +27,11 @@ use crate::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
         FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
         OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
-        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
-        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
-        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
+        RepositorySummaryRow, RepositoryView, SnapshotPresentation, SshCloneMapping, SystemClock,
+        WorkingTreeSnapshot, build_repository_summaries, format_change_counters,
+        format_periodic_fetch_interval_label, format_sync_counters, next_periodic_fetch_interval,
+        normalized_repo_key, periodic_fetch_poll_interval, primary_remote_label,
+        select_periodic_fetch, snapshot_presentation_label,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -60,6 +62,7 @@ const INITIAL_HISTORY_LIMIT: usize = 200;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
 const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 56;
 const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 56;
+const SUMMARY_ROW_HEIGHT_PX: u16 = 52;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryContentState {
@@ -210,6 +213,9 @@ pub struct MainWindow {
     periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
     active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
     pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    summary_view_active: bool,
+    summary_focus_index: usize,
+    summary_rows: Arc<Vec<RepositorySummaryRow>>,
 }
 
 #[allow(
@@ -267,7 +273,86 @@ impl MainWindow {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            summary_view_active: false,
+            summary_focus_index: 0,
+            summary_rows: Arc::new(Vec::new()),
         }
+    }
+
+    fn rebuild_summary_rows(&mut self) {
+        self.summary_rows = Arc::new(build_repository_summaries(
+            &self.state.repositories,
+            &self.state.settings.repository_preferred_remotes,
+            SystemClock.now_secs(),
+            self.state.settings.periodic_fetch_interval_secs,
+        ));
+        if self.summary_focus_index >= self.summary_rows.len() {
+            self.summary_focus_index = self.summary_rows.len().saturating_sub(1);
+        }
+    }
+
+    fn enter_summary_view(&mut self, cx: &mut Context<Self>) {
+        if self.state.repositories.is_empty() {
+            return;
+        }
+        self.rebuild_summary_rows();
+        self.summary_view_active = true;
+        if self.summary_focus_index >= self.summary_rows.len() {
+            self.summary_focus_index = 0;
+        }
+        self.global_status_message = format!(
+            "Resumen de {} repositorios abiertos",
+            self.state.repositories.len()
+        );
+        cx.notify();
+    }
+
+    fn show_summary(&mut self, _: &ShowSummary, _: &mut Window, cx: &mut Context<Self>) {
+        self.enter_summary_view(cx);
+    }
+
+    fn summary_next_row(&mut self, _: &SummaryNextRow, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.summary_view_active || self.summary_rows.is_empty() {
+            return;
+        }
+        self.summary_focus_index = (self.summary_focus_index + 1) % self.summary_rows.len();
+        cx.notify();
+    }
+
+    fn summary_previous_row(
+        &mut self,
+        _: &SummaryPreviousRow,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.summary_view_active || self.summary_rows.is_empty() {
+            return;
+        }
+        self.summary_focus_index = self
+            .summary_focus_index
+            .checked_sub(1)
+            .unwrap_or(self.summary_rows.len() - 1);
+        cx.notify();
+    }
+
+    fn summary_activate_row(
+        &mut self,
+        _: &SummaryActivateRow,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.summary_view_active {
+            return;
+        }
+        let Some(repository_id) = self
+            .summary_rows
+            .get(self.summary_focus_index)
+            .map(|row| row.id)
+        else {
+            return;
+        };
+        self.summary_view_active = false;
+        self.select_repository(repository_id, cx);
     }
 
     /// Detecta Git y refresca todas las pestañas restauradas en background.
@@ -286,6 +371,9 @@ impl MainWindow {
         }
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
+                if this.summary_view_active {
+                    return;
+                }
                 let Some(repository_id) = this.state.active_repository_id else {
                     return;
                 };
@@ -1211,6 +1299,9 @@ impl MainWindow {
             return;
         };
         self.state.repositories.remove(index);
+        if self.state.repositories.len() <= 1 {
+            self.summary_view_active = false;
+        }
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
@@ -1296,6 +1387,7 @@ impl MainWindow {
         if self.state.repositories.is_empty() {
             return;
         }
+        self.summary_view_active = false;
         let current = self
             .state
             .active_repository_id
@@ -3139,6 +3231,7 @@ impl MainWindow {
     }
 
     fn select_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        self.summary_view_active = false;
         self.state.active_repository_id = Some(repository_id);
         if self.pending_refreshes.contains(&repository_id) {
             self.force_refresh_repository(repository_id, cx);
@@ -3149,6 +3242,9 @@ impl MainWindow {
 
     fn render_repository_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let active_id = self.state.active_repository_id;
+        let summary_active = self.summary_view_active;
+        let show_summary_tab = self.state.repositories.len() > 1;
+        let repository_count = self.state.repositories.len();
         div()
             .flex()
             .min_w(px(0.0))
@@ -3164,9 +3260,34 @@ impl MainWindow {
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_x_scroll()
+                    .when(show_summary_tab, |tabs| {
+                        tabs.child(
+                            div()
+                                .id("repository-summary-tab")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .h_full()
+                                .min_w(px(90.0))
+                                .px_3()
+                                .border_r_1()
+                                .border_color(BORDER_COLOR)
+                                .aria_label("Resumen de todos los repositorios abiertos")
+                                .when(summary_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
+                                .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.enter_summary_view(cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .child(format!("Resumen ({repository_count})")),
+                                ),
+                        )
+                    })
                     .children(self.state.repositories.iter().map(|repository| {
                         let repository_id = repository.id;
-                        let is_active = active_id == Some(repository_id);
+                        let is_active = !summary_active && active_id == Some(repository_id);
                         let name = repository
                             .root_path
                             .file_name()
@@ -4524,6 +4645,219 @@ impl MainWindow {
             .into_any_element()
     }
 
+    fn render_summary_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = Arc::clone(&self.summary_rows);
+        let row_count = rows.len();
+        let focus_index = self.summary_focus_index;
+        div()
+            .id("repository-summary-view")
+            .key_context("Summary")
+            .on_action(cx.listener(Self::summary_next_row))
+            .on_action(cx.listener(Self::summary_previous_row))
+            .on_action(cx.listener(Self::summary_activate_row))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(BORDER_COLOR)
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(
+                        "Vista de solo lectura basada en snapshots ya cargados. Las referencias remotas pueden estar desactualizadas hasta el próximo fetch.",
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(BORDER_COLOR)
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(div().w(px(180.0)).child("Repositorio"))
+                    .child(div().w(px(120.0)).child("Rama"))
+                    .child(div().flex_1().min_w(px(0.0)).child("Cambios"))
+                    .child(div().w(px(110.0)).child("Sync"))
+                    .child(div().w(px(120.0)).child("Estado"))
+                    .child(div().flex_1().min_w(px(0.0)).child("Remoto")),
+            )
+            .child(
+                uniform_list(
+                    "repository-summary-list",
+                    row_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let range_start = range.start;
+                        rows[range]
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, row)| {
+                                let index = range_start + offset;
+                                this.render_summary_row(row, index == focus_index, cx)
+                            })
+                            .collect()
+                    }),
+                )
+                .w_full()
+                .flex_1(),
+            )
+            .into_any_element()
+    }
+
+    fn render_summary_row(
+        &self,
+        row: &RepositorySummaryRow,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let repository_id = row.id;
+        let path = row.root_path.display().to_string();
+        let changes = format_change_counters(row);
+        let sync = format_sync_counters(row).unwrap_or_else(|| "—".to_owned());
+        let snapshot_label = snapshot_presentation_label(row.snapshot_presentation);
+        let snapshot_color = match row.snapshot_presentation {
+            SnapshotPresentation::Current => SUCCESS_COLOR,
+            SnapshotPresentation::Loading => ACCENT_COLOR,
+            SnapshotPresentation::Stale | SnapshotPresentation::Unknown => WARNING_COLOR,
+            SnapshotPresentation::Inaccessible => ERROR_COLOR,
+        };
+        let operation = row.operation_label.clone();
+        let error = row.error_hint.clone();
+        let remote = row.remote_freshness_label.clone();
+        div()
+            .id(format!("summary-row-{repository_id:?}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(SUMMARY_ROW_HEIGHT_PX.into()))
+            .px_3()
+            .border_b_1()
+            .border_color(BORDER_COLOR)
+            .aria_label(path.clone())
+            .when(is_focused, |row_element| {
+                row_element.bg(SELECTED_BACKGROUND_COLOR)
+            })
+            .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_repository(repository_id, cx);
+            }))
+            .child(
+                div()
+                    .w(px(180.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .child(row.display_name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(120.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(row.branch_label.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.conflict_count > 0 {
+                        ERROR_COLOR
+                    } else if row.change_count > 0 {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(changes),
+            )
+            .child(
+                div()
+                    .w(px(110.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.remote_is_stale {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(sync),
+            )
+            .child(
+                div()
+                    .w(px(120.0))
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(snapshot_color)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(snapshot_label),
+                    )
+                    .when_some(operation, |column, label| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(ACCENT_COLOR)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    })
+                    .when_some(error, |column, label| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(ERROR_COLOR)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.remote_is_stale {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(remote.unwrap_or_else(|| "Sin remote conocido".to_owned())),
+            )
+            .into_any_element()
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
         // La existencia en disco se comprueba al cargar el estado y al abrir cada clon:
         // repetirla en cada frame de render supondría un acceso a disco por fotograma.
@@ -4863,6 +5197,9 @@ fn repository_feedback(repository: &RepositorySession) -> Option<(String, String
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_pending_existing_clone_open(window, cx);
+        if self.summary_view_active && self.state.repositories.len() > 1 {
+            self.rebuild_summary_rows();
+        }
         let active_repository = self.active_repository().cloned();
         div()
             .key_context("GitHelper")
@@ -4874,6 +5211,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::refresh_active_repository))
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::show_changes))
+            .on_action(cx.listener(Self::show_summary))
             .on_action(cx.listener(Self::create_commit))
             .on_action(cx.listener(Self::generate_commit_message))
             .flex()
@@ -4882,26 +5220,34 @@ impl Render for MainWindow {
             .bg(BACKGROUND_COLOR)
             .text_color(PRIMARY_TEXT_COLOR)
             .child(self.render_repository_tabs(cx))
-            .when_some(active_repository.clone(), |root, repository| {
-                if repository.path_accessible {
-                    root.child(self.render_toolbar(&repository, cx))
-                        .child(self.render_internal_tabs(&repository, cx))
-                        .child(match repository.selected_view {
-                            RepositoryView::Changes => self.render_changes(&repository, cx),
-                            RepositoryView::History => self.render_history(&repository, cx),
-                        })
-                } else {
-                    root.child(self.render_inaccessible_repository(&repository, cx))
-                }
-            })
-            .when(active_repository.is_none(), |root| {
-                root.child(self.render_empty_state(cx))
+            .when(
+                self.summary_view_active && self.state.repositories.len() > 1,
+                |root| root.child(self.render_summary_view(cx)),
+            )
+            .when(!self.summary_view_active, |root| {
+                root.when_some(active_repository.clone(), |root, repository| {
+                    if repository.path_accessible {
+                        root.child(self.render_toolbar(&repository, cx))
+                            .child(self.render_internal_tabs(&repository, cx))
+                            .child(match repository.selected_view {
+                                RepositoryView::Changes => self.render_changes(&repository, cx),
+                                RepositoryView::History => self.render_history(&repository, cx),
+                            })
+                    } else {
+                        root.child(self.render_inaccessible_repository(&repository, cx))
+                    }
+                })
+                .when(active_repository.is_none(), |root| {
+                    root.child(self.render_empty_state(cx))
+                })
             })
             .when(self.clone_panel_visible || self.clone_in_progress, |root| {
                 root.child(self.render_clone_panel(cx))
             })
-            .when_some(active_repository.as_ref(), |root, repository| {
-                root.child(self.render_repository_feedback(repository, cx))
+            .when(!self.summary_view_active, |root| {
+                root.when_some(active_repository.as_ref(), |root, repository| {
+                    root.child(self.render_repository_feedback(repository, cx))
+                })
             })
             .when_some(self.global_error.clone(), |root, error| {
                 root.child(
@@ -4916,7 +5262,11 @@ impl Render for MainWindow {
                         .child(error),
                 )
             })
-            .child(self.render_status_bar(active_repository.as_ref()))
+            .child(self.render_status_bar(if self.summary_view_active {
+                None
+            } else {
+                active_repository.as_ref()
+            }))
     }
 }
 
@@ -5483,6 +5833,9 @@ mod tests {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            summary_view_active: false,
+            summary_focus_index: 0,
+            summary_rows: Arc::new(Vec::new()),
         }
     }
 

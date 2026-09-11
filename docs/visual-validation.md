@@ -32,6 +32,11 @@ credenciales ni contenido sensible.
 - [ ] Se pueden abrir varios repositorios en pestañas distintas.
 - [ ] Con diez pestañas abiertas, la barra conserva un control de overflow horizontal y cada pestaña
   sigue identificándose por nombre truncado y ruta completa accesible.
+- [ ] Con dos o más repositorios abiertos, la pestaña `Resumen (n)` muestra una vista compacta de
+  todos ellos sin lanzar fetch ni lecturas Git adicionales al renderizar.
+- [ ] Cada fila del resumen muestra repositorio, rama, contadores, sync, estado y frescura remota;
+  al pulsarla o usar `Enter` se abre la sesión correspondiente.
+- [ ] `Ctrl+0` abre el resumen; con el foco en la vista, `↑`/`↓`/`Enter` navegan las filas.
 - [ ] `Ctrl+Tab` / `Ctrl+Shift+Tab` cambian de pestaña.
 - [ ] El botón de cerrar en cada pestaña cierra solo esa sesión.
 - [ ] Las pestañas internas `Changes` e `History` cambian sin perder el estado de la otra.

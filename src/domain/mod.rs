@@ -4,6 +4,7 @@ mod remote;
 mod remote_freshness;
 mod repository;
 mod status;
+mod summary;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
 pub use history::{CommitDetails, CommitId, CommitSummary, HistoryPage, Reference};
@@ -21,3 +22,8 @@ pub use repository::{
     SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
 };
 pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};
+pub use summary::{
+    RepositorySummaryRow, SnapshotPresentation, build_repository_summaries,
+    build_repository_summary, format_change_counters, format_sync_counters,
+    snapshot_presentation_label,
+};
