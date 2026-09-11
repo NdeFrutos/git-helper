@@ -137,7 +137,6 @@ jobs:
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
         run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Checks" -StartedAt $env:STARTED_AT
 
   package:
@@ -222,7 +221,6 @@ jobs:
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
         run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Package" -StartedAt $env:STARTED_AT
 
   publish:

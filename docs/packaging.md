@@ -139,8 +139,9 @@ Cambio | Efecto
 ## Medición de la caché
 
 `.github/scripts/report-cargo-cache.ps1` se ejecuta al final de cada job cacheado y publica en el
-resumen de Actions la duración del job, si hubo acierto exacto, la clave realmente restaurada y el
-tamaño en disco de cada ruta cacheada. Los tamaños son del contenido descomprimido; el archivo que
+resumen de Actions la duración del job, si hubo acierto exacto y el tamaño en disco de cada ruta
+cacheada; qué clave se restauró exactamente lo registra el propio paso `Cache Cargo …`, porque
+`actions/cache@v5` solo rellena la salida `cache-hit`. Los tamaños son del contenido descomprimido; el archivo que
 GitHub almacena es bastante menor (zstd), y el límite del repositorio es de 10 GB.
 
 Mediciones tomadas en la PR de la issue #22 (`windows-latest`, job `Checks`, perfil dev, mismo
@@ -148,8 +149,13 @@ lockfile y mismo toolchain en ambas):
 
 Ejecución | Acierto exacto | Trabajo del job | Tamaño en disco
 --- | --- | ---: | ---:
-Fría ([run 34594828329](https://github.com/NdeFrutos/git-helper/actions/runs/34594828329)) | no, ninguna clave restaurada | 408 s (job completo 7 min 36 s, incluida la subida de la caché) | PENDIENTE_FRIA_TAMANO
-Caliente ([run PENDIENTE_CALIENTE_RUN](https://github.com/NdeFrutos/git-helper/actions/runs/PENDIENTE_CALIENTE_RUN)) | PENDIENTE_CALIENTE_HIT | PENDIENTE_CALIENTE_TIEMPO | PENDIENTE_CALIENTE_TAMANO
+Fría ([run 34594828329](https://github.com/NdeFrutos/git-helper/actions/runs/34594828329)) | no; el log muestra `Cache not found for input keys` | 408 s (7 min 36 s de job, incluida la subida de la caché) | 3825,1 MB
+Caliente ([run 34596276015](https://github.com/NdeFrutos/git-helper/actions/runs/34596276015)) | sí, contra la clave escrita por la ejecución fría | 88 s (1 min 36 s de job) | 4052,5 MB
+
+Con la caché caliente el trabajo del job baja de 408 s a 88 s (4,6 veces menos) ejecutando fmt,
+Clippy y los tests igual que en frío; solo se recompila el propio crate, no las dependencias. La
+caliente ocupa algo más en disco (4052,5 MB frente a 3825,1 MB) porque `target` acumula también los
+artefactos del nuevo commit.
 
 Desglose del tamaño en la ejecución fría: `target` 2448,5 MB, `~/.cargo/git` 846,6 MB,
 `~/.cargo/registry` 360,1 MB y `~/.cargo/bin` 169,9 MB (esta última la ocupa sobre todo el
