@@ -403,7 +403,8 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 if let Ok(root_path) = result {
-                    this.finish_open_repository(root_path, cx);
+                    // El gancho abre siempre una ruta local del fixture: no hay URL SSH.
+                    this.finish_open_repository(root_path, None, cx);
                 }
                 cx.notify();
             })
