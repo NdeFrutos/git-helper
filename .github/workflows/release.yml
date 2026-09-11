@@ -67,15 +67,17 @@ jobs:
             throw "La release debe usar una versión semántica estable, por ejemplo v0.2.0."
           }
           $version = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
-          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw
-          if ($manifest -notmatch '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$') {
+          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw -Encoding utf8
+          $cargoMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$')
+          if (-not $cargoMatch.Success) {
             throw "No se pudo leer package.version de Cargo.toml."
           }
-          if ($Matches.cargoVersion -ne $version) {
-            throw "La etiqueta $tag no coincide con Cargo.toml ($($Matches.cargoVersion))."
+          $cargoVersion = $cargoMatch.Groups['cargoVersion'].Value
+          if ($cargoVersion -ne $version) {
+            throw "La etiqueta $tag no coincide con Cargo.toml ($cargoVersion)."
           }
           if ($env:DRY_RUN -ne "true") {
-            gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+            & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 1>$null 2>$null
             if ($LASTEXITCODE -eq 0) {
               throw "La release $tag ya existe."
             }
@@ -267,7 +269,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 1>$null 2>$null
           if ($LASTEXITCODE -eq 0) { throw "La release ya existe" }
           $assets = Get-ChildItem -LiteralPath "dist" -File | ForEach-Object { $_.FullName }
           gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --generate-notes
