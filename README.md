@@ -104,16 +104,23 @@ La generación reproducible del MSI se documenta en [docs/packaging.md](docs/pac
 
 ## Releases
 
-El workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) valida, compila y
-publica los paquetes en GitHub Releases. Hay dos formas de iniciarlo:
+El workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) valida la versión en
+`preflight`, ejecuta checks y empaquetado en paralelo y publica solo cuando ambos jobs aprueban el
+mismo SHA. Los artefactos (MSI, ZIP portable y checksums) se transfieren como artefacto de Actions;
+`publish` no recompila. Hay dos formas de iniciarlo:
 
 - Crear y subir una etiqueta que coincida con la versión de `Cargo.toml`, por ejemplo
   `git tag v0.1.0 && git push origin v0.1.0`.
 - Ejecutar manualmente `Release` desde GitHub Actions e indicar esa misma versión sin la `v`.
 
-Si la etiqueta y `Cargo.toml` no coinciden, el workflow se detiene antes de publicar. Para preparar
-una nueva versión, actualiza `Cargo.toml` y `Cargo.lock`, integra el cambio en `main` y lanza el
-workflow. Las notas de release se generan automáticamente a partir del historial de GitHub.
+La ejecución manual admite `dry_run` (valida sin crear release) y `failure_mode=checks|package` para
+comprobar que un fallo bloquea `publish`. Detalles, grafo de dependencias y medición de tiempos en
+[docs/packaging.md](docs/packaging.md).
+
+Si la etiqueta y `Cargo.toml` no coinciden, el workflow se detiene en `preflight`, antes de los jobs
+costosos. Para preparar una nueva versión, actualiza `Cargo.toml` y `Cargo.lock`, integra el cambio
+en `main` y lanza el workflow. Las notas de release se generan automáticamente a partir del historial
+de GitHub.
 
 ## Arquitectura
 
