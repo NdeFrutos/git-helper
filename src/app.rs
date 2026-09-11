@@ -10,7 +10,7 @@ use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
         NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        ShowHistory, ShowSummary, SummaryActivateRow, SummaryNextRow, SummaryPreviousRow,
     },
     cli::InstanceServer,
     persistence::{
@@ -51,6 +51,10 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("f5", RefreshRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-1", ShowHistory, Some("GitHelper")),
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),
+            KeyBinding::new("ctrl-0", ShowSummary, Some("GitHelper")),
+            KeyBinding::new("up", SummaryPreviousRow, Some("Summary")),
+            KeyBinding::new("down", SummaryNextRow, Some("Summary")),
+            KeyBinding::new("enter", SummaryActivateRow, Some("Summary")),
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
         ]);

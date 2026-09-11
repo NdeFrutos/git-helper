@@ -11,6 +11,10 @@ actions!(
         RefreshRepository,
         ShowHistory,
         ShowChanges,
+        ShowSummary,
+        SummaryNextRow,
+        SummaryPreviousRow,
+        SummaryActivateRow,
         CreateCommit,
         GenerateCommitMessage,
     ]
