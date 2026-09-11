@@ -126,9 +126,11 @@ Los contadores de la pestaña Cambios (`change_count`, `staged_count`) se deriva
 actualizar el working tree. Los detalles de commit se cachean por repositorio con un límite fijo
 (32 entradas, LRU) para evitar clonados profundos al alternar selección.
 
-Mediciones en pruebas unitarias (`finish_refresh_comparison_cost_is_bounded_with_large_history`):
+La medición manual ignorada en la prueba unitaria
+(`finish_refresh_comparison_cost_is_bounded_with_large_history`) conserva el umbral de referencia:
 con 10 000 commits cargados, `finish_refresh` tras un cambio del working tree completa en menos de
-50 ms porque ya no recorre ni compara la lista de commits.
+50 ms porque ya no recorre ni compara la lista de commits. La garantía de regresión que se ejecuta
+en CI es determinista y comprueba que los `Arc` del historial permanecen intactos.
 
 ## Estados de interacción por repositorio
 

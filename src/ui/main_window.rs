@@ -121,7 +121,12 @@ struct CommitDetailsCache {
 }
 
 impl CommitDetailsCache {
-    fn get(&self, commit_id: &str) -> Option<&CommitDetails> {
+    fn get(&mut self, commit_id: &str) -> Option<&CommitDetails> {
+        if !self.entries.contains_key(commit_id) {
+            return None;
+        }
+        self.order.retain(|existing| existing != commit_id);
+        self.order.push(commit_id.to_owned());
         self.entries.get(commit_id)
     }
 
@@ -614,7 +619,8 @@ impl MainWindow {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let outcome = this.finish_refresh(repository_id, generation, result);
+                let outcome =
+                    this.finish_refresh(repository_id, generation, include_history, result);
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
@@ -817,6 +823,7 @@ impl MainWindow {
         &mut self,
         repository_id: RepositoryId,
         generation: u64,
+        history_included: bool,
         result: Result<RefreshPayload, GitError>,
     ) -> RefreshOutcome {
         if self.global_refresh_in_flight == Some(repository_id) {
@@ -889,7 +896,7 @@ impl MainWindow {
             }
             Err(error) => {
                 let details = error.technical_details();
-                if repository.history_loading {
+                if history_included {
                     repository.history_loading = false;
                 }
                 let is_cancelled = is_cancelled_error(&error);
@@ -2721,11 +2728,12 @@ impl MainWindow {
             return;
         };
         repository.selected_commit = Some(commit_id.clone());
-        if self
+        let has_cached_details = self
             .commit_details_cache
-            .get(&repository_id)
-            .is_some_and(|cache| cache.get(&commit_id).is_some())
-        {
+            .get_mut(&repository_id)
+            .and_then(|cache| cache.get(&commit_id))
+            .is_some();
+        if has_cached_details {
             cx.notify();
             return;
         }
@@ -2866,7 +2874,11 @@ impl MainWindow {
         .detach();
     }
 
-    fn render_history(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
+    fn render_history(
+        &mut self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let commits = Arc::clone(&repository.history.commits);
         let count = commits.len();
         let repository_id = repository.id;
@@ -2876,7 +2888,7 @@ impl MainWindow {
         let branches = repository.working_tree.branches.clone();
         let details = repository.selected_commit.as_ref().and_then(|commit_id| {
             self.commit_details_cache
-                .get(&repository_id)?
+                .get_mut(&repository_id)?
                 .get(commit_id)
                 .cloned()
         });
@@ -3517,6 +3529,7 @@ mod tests {
 
         let first = window.prepare_refresh(repository_id).unwrap();
         let first_generation = first.generation;
+        let first_include_history = first.include_history;
         let first_snapshot =
             thread::spawn(move || git_client.snapshot(&first.root_path, &first.cancellation));
         started_receiver.recv().unwrap();
@@ -3529,6 +3542,7 @@ mod tests {
         let first_outcome = window.finish_refresh(
             repository_id,
             first_generation,
+            first_include_history,
             first_result.map(RefreshPayload::WorkingTree),
         );
         assert_eq!(first_outcome.continuation, RefreshContinuation::Repeat);
@@ -3540,6 +3554,7 @@ mod tests {
         let follow_up_outcome = window.finish_refresh(
             repository_id,
             follow_up.generation,
+            follow_up.include_history,
             follow_up_result.map(RefreshPayload::WorkingTree),
         );
 
@@ -3579,6 +3594,7 @@ mod tests {
         let outcome = window.finish_refresh(
             old_id,
             pending.generation,
+            pending.include_history,
             Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
                 head: HeadState::Branch {
                     name: "stale".to_owned(),
@@ -3658,6 +3674,7 @@ mod tests {
         let outcome = window.finish_refresh(
             second_id,
             pending.generation,
+            pending.include_history,
             Err(GitError::InvalidStatus {
                 message: "respuesta rota".to_owned(),
             }),
@@ -3680,6 +3697,27 @@ mod tests {
         assert!(matches!(first.refresh_state, RefreshState::Idle));
         assert!(second.error.is_some());
         assert!(matches!(second.refresh_state, RefreshState::Failed { .. }));
+    }
+
+    #[test]
+    fn working_tree_refresh_error_does_not_clear_history_loading() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.history_loading = true;
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        assert!(!pending.include_history);
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            Err(GitError::InvalidStatus {
+                message: "respuesta rota".to_owned(),
+            }),
+        );
+
+        assert!(window.state.repositories[0].history_loading);
     }
 
     #[test]
@@ -3747,6 +3785,7 @@ mod tests {
         window.finish_refresh(
             first_id,
             first_refresh.generation,
+            first_refresh.include_history,
             Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot::default())),
         );
         let second_refresh = window.prepare_refresh(second_id).unwrap();
@@ -3793,6 +3832,7 @@ mod tests {
         let outcome = window.finish_refresh(
             repository_id,
             pending.generation,
+            pending.include_history,
             Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
                 changes: vec![FileChange {
                     path: PathBuf::from("changed.txt"),
@@ -3819,6 +3859,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "medición de rendimiento manual; no usar como puerta determinista"]
     fn finish_refresh_comparison_cost_is_bounded_with_large_history() {
         let large_commits = Arc::new(
             (0..10_000)
@@ -3850,6 +3891,7 @@ mod tests {
         window.finish_refresh(
             repository_id,
             pending.generation,
+            pending.include_history,
             Ok(RefreshPayload::WorkingTree(incoming)),
         );
         let elapsed = start.elapsed();
@@ -3861,9 +3903,9 @@ mod tests {
     }
 
     #[test]
-    fn commit_details_cache_evicts_oldest_entry() {
+    fn commit_details_cache_evicts_least_recently_used_entry() {
         let mut cache = CommitDetailsCache::default();
-        for index in 0..=MAX_CACHED_COMMIT_DETAILS {
+        for index in 0..MAX_CACHED_COMMIT_DETAILS {
             cache.insert(CommitDetails {
                 summary: sample_commit_summary(index),
                 body: String::new(),
@@ -3874,8 +3916,20 @@ mod tests {
             });
         }
 
+        assert!(cache.get("commit-00000").is_some());
+        cache.insert(CommitDetails {
+            summary: sample_commit_summary(MAX_CACHED_COMMIT_DETAILS),
+            body: String::new(),
+            committer_name: String::new(),
+            committer_email: String::new(),
+            committed_at: 0,
+            parent_ids: Vec::new(),
+        });
+
         assert_eq!(cache.entries.len(), MAX_CACHED_COMMIT_DETAILS);
-        assert!(!cache.entries.contains_key("commit-00000"));
+        assert!(cache.entries.contains_key("commit-00000"));
+        assert!(!cache.entries.contains_key("commit-00001"));
+        assert!(cache.entries.contains_key("commit-00031"));
         assert!(cache.entries.contains_key("commit-00032"));
     }
 
