@@ -43,11 +43,38 @@ permisos de administrador.
 También se publica `git-helper-<versión>-windows-x86_64-portable.zip`: basta con extraerlo y abrir
 `git-helper.exe`. Git for Windows debe estar disponible en `PATH` en ambos casos.
 
+Durante la instalación con MSI puedes marcar la feature opcional **PATH Environment Variable**
+para invocar `ghelper` desde cualquier terminal. En el ZIP portable, añade manualmente la carpeta
+`bin` (donde están `git-helper.exe` y `ghelper.exe`) al `PATH` del sistema o del usuario si quieres
+el mismo acceso por línea de comandos.
+
 ### Requisitos de uso
 
 - Windows 10 u 11 de 64 bits.
 - [Git for Windows](https://gitforwindows.org/).
 - Opcional: [Cursor CLI](https://cursor.com/cli) y una sesión iniciada para generar mensajes.
+
+## Línea de comandos
+
+Con la feature PATH del MSI (o la carpeta `bin` en el PATH del ZIP portable) puedes abrir
+repositorios desde PowerShell, Cursor o T3 Code:
+
+```powershell
+ghelper --help
+ghelper .
+ghelper "C:\Users\dev\proyectos\mi-repo"
+```
+
+- `ghelper [RUTA]` abre Git Helper con ese repositorio en la pestaña activa. La ruta puede ser
+  absoluta, relativa al directorio actual o `.` estando ya dentro del repo.
+- Sin argumentos restaura la sesión persistida, igual que abrir la aplicación desde el menú Inicio.
+- Si Git Helper ya está en ejecución, la solicitud se reenvía a la ventana existente: se activa la
+  pestaña del repositorio o se abre una nueva si aún no estaba cargado.
+- Rutas inexistentes, carpetas que no son repositorios Git o Git ausente del PATH muestran un error
+  en la consola y devuelven un código de salida distinto de cero, sin dejar procesos huérfanos.
+
+`ghelper.exe` es un launcher de consola; `git-helper.exe` sigue siendo la aplicación gráfica que
+aparece en el menú Inicio.
 
 ## Uso rápido
 
