@@ -1065,7 +1065,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.snapshot.head);
         let is_directory = repository.root_path.join(&change.path).is_dir();
         let plan = match plan_discard(change, discard_staged, has_head, is_directory) {
             Ok(plan) => plan,
@@ -1136,7 +1136,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.snapshot.head);
         let mut planned_paths = HashSet::new();
         let mut plans = Vec::new();
         for change in &repository.snapshot.changes {
@@ -3124,6 +3124,13 @@ impl Render for MainWindow {
                 )
             })
             .child(self.render_status_bar(active_repository.as_ref()))
+    }
+}
+
+fn repository_has_commits(head: &HeadState) -> bool {
+    match head {
+        HeadState::Branch { oid: Some(_), .. } | HeadState::Detached { .. } => true,
+        HeadState::Branch { oid: None, .. } | HeadState::Unborn => false,
     }
 }
 

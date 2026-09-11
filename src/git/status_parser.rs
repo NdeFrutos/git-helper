@@ -92,7 +92,11 @@ impl StatusParser {
 
     fn finish(self) -> StatusSnapshot {
         let head = if self.is_unborn {
-            HeadState::Unborn
+            if let Some(name) = self.head_name {
+                HeadState::Branch { name, oid: None }
+            } else {
+                HeadState::Unborn
+            }
         } else if self.is_detached {
             HeadState::Detached {
                 oid: self.oid.unwrap_or_default(),
@@ -320,7 +324,13 @@ mod tests {
         let detached = parse_status(b"# branch.oid deadbeef\0# branch.head (detached)\0")
             .expect("el fixture detached debe ser válido");
 
-        assert_eq!(unborn.head, HeadState::Unborn);
+        assert_eq!(
+            unborn.head,
+            HeadState::Branch {
+                name: "main".to_owned(),
+                oid: None,
+            }
+        );
         assert_eq!(
             detached.head,
             HeadState::Detached {
