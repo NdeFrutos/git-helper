@@ -164,25 +164,44 @@ así que dos claves vivas (checks y release) caben holgadamente en el límite de
 sitio para muchas más variantes simultáneas: por eso las claves se mantienen acotadas y sin
 `github.ref`.
 
-Para repetir la medición en el perfil release sin publicar nada, lanzar `Release` con
-`workflow_dispatch`, `dry_run=true` y `failure_mode=none` sobre `main`: el job `package` debe
-indicar acierto exacto contra la caché que dejó `warm-release-cache` y reutilizar `cargo-wix` sin
-reinstalarlo cuando la versión coincide.
+### Perfil release, medido con dos dry-runs autorizadas
+
+Ambas se lanzaron con `workflow_dispatch`, `dry_run=true` y `failure_mode=none`, así que recorrieron
+el pipeline completo sin crear etiqueta ni release:
+
+Ejecución | `package` | `checks` | Pared del pipeline | Acierto exacto en `package` | `cargo-wix`
+--- | ---: | ---: | ---: | --- | ---
+Fría ([run 34597528583](https://github.com/NdeFrutos/git-helper/actions/runs/34597528583)) | 636 s | 93 s | 11 min 51 s | no | instalado y verificado
+Caliente ([run 34598631138](https://github.com/NdeFrutos/git-helper/actions/runs/34598631138)) | 218 s | 93 s | 4 min 09 s | sí | `Reutilizando cargo-wix 0.3.9 restaurado desde la caché`
+
+La caliente restauró la clave exacta que dejó la fría y reutilizó `cargo-wix` sin reinstalarlo; el
+MSI se sigue construyendo con `cargo wix --no-build`. En `main` la clave de release la escribe el job
+`warm-release-cache` de CI en cada push, de modo que una release real parte del mismo estado
+caliente: la clave no incluye `github.ref`, así que la etiqueta la restaura igual que esta dry-run
+restauró la de su propia rama.
+
+Cambiar `CARGO_WIX_VERSION` cambia el segmento `wix<versión>` de la clave, con lo que ninguna
+`restore-key` coincide y no puede reaparecer el binario anterior; además
+`ensure-cargo-wix.ps1` compara contra `cargo install --list` antes de decidir si instala, así que
+tampoco se reutiliza un binario de otra versión llegado por una restauración parcial.
 
 ## Medición del pipeline de release
 
 Cada job registra su duración y si obtuvo una coincidencia exacta de caché. El resumen final muestra
-el tiempo de pared y la suma de minutos de runner, que deben conservarse para una ejecución fría y
-otra caliente del mismo SHA mediante `dry_run`.
+el tiempo de pared y la suma de minutos de runner.
 
-Fase | Tiempo observado antes de CI-02 | Tiempo tras CI-02
---- | ---: | ---:
-Checks (Clippy + tests) | 6 min 16 s | Lo registra el resumen de Actions
-Build + WiX + MSI | 6 min 49 s | Lo registra el resumen de Actions
-Tiempo de pared total | aproximadamente 13 min | Objetivo inicial 7–8 min; validar con dos dry-runs
+Con las dos dry-runs de la sección anterior el objetivo de 7–8 minutos queda confirmado y superado
+cuando la caché está caliente:
 
-La cifra de 7–8 minutos es una hipótesis, no una garantía. No se crea ninguna etiqueta ni release
-para obtener estas mediciones.
+Fase | Antes de CI-02 | Dry-run fría | Dry-run caliente
+--- | ---: | ---: | ---:
+Checks (Clippy + tests) | 6 min 16 s | 6 min 48 s | 1 min 33 s
+Build + WiX + MSI | 6 min 49 s | 10 min 36 s | 3 min 38 s
+Tiempo de pared total | aproximadamente 13 min | 11 min 51 s | 4 min 09 s
+
+En frío el pipeline apenas mejora los 13 minutos previos, porque `checks` y `package` compilan en
+paralelo lo mismo que antes se compilaba en serie; la ganancia real la aporta la caché. No se crea
+ninguna etiqueta ni release para obtener estas mediciones.
 
 ## Validación posterior al empaquetado
 
