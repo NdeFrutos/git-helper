@@ -47,9 +47,29 @@ pub enum OperationKind {
     GenerateCommitMessage,
 }
 
-/// Estado efímero de la última operación.
+/// Estado efímero del refresco de lecturas de una sesión.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum OperationState {
+pub enum RefreshState {
+    #[default]
+    Idle,
+    Running {
+        generation: u64,
+    },
+    Succeeded {
+        message: String,
+    },
+    Failed {
+        message: String,
+        details: String,
+    },
+    Cancelled {
+        message: String,
+    },
+}
+
+/// Estado efímero de la última mutación de una sesión.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum MutationState {
     #[default]
     Idle,
     Running {
@@ -64,6 +84,10 @@ pub enum OperationState {
         kind: OperationKind,
         message: String,
         details: String,
+    },
+    Cancelled {
+        kind: OperationKind,
+        message: String,
     },
 }
 
@@ -134,7 +158,10 @@ pub struct RepositorySession {
     pub selected_view: RepositoryView,
     pub selected_change: Option<ChangeSelection>,
     pub selected_commit: Option<CommitId>,
-    pub operation_state: OperationState,
+    pub refresh_state: RefreshState,
+    pub mutation_state: MutationState,
+    pub status_message: String,
+    pub error: Option<String>,
     pub refresh_generation: u64,
     pub history_generation: u64,
     pub history_loaded: bool,
@@ -154,7 +181,10 @@ impl RepositorySession {
             selected_view: RepositoryView::default(),
             selected_change: None,
             selected_commit: None,
-            operation_state: OperationState::default(),
+            refresh_state: RefreshState::default(),
+            mutation_state: MutationState::default(),
+            status_message: "Preparando repositorio…".to_owned(),
+            error: None,
             refresh_generation: 0,
             history_generation: 0,
             history_loaded: false,
@@ -162,6 +192,71 @@ impl RepositorySession {
             refresh_coordinator: RefreshCoordinator::default(),
             history_invalidated_during_refresh: false,
         }
+    }
+
+    /// Indica si hay una lectura de estado en curso para esta pestaña.
+    #[must_use]
+    pub fn is_refreshing(&self) -> bool {
+        matches!(self.refresh_state, RefreshState::Running { .. })
+    }
+
+    /// Indica si hay una mutación Git o generación de mensaje en curso.
+    #[must_use]
+    pub fn is_mutating(&self) -> bool {
+        matches!(self.mutation_state, MutationState::Running { .. })
+    }
+
+    /// Las lecturas y mutaciones se serializan por repositorio para no operar
+    /// sobre un snapshot que está siendo reemplazado.
+    #[must_use]
+    pub fn can_mutate(&self) -> bool {
+        !self.is_mutating() && !self.is_refreshing()
+    }
+
+    /// Un refresh explícito no debe competir con otro refresh ni con una mutación.
+    #[must_use]
+    pub fn can_refresh(&self) -> bool {
+        !self.is_refreshing() && !self.is_mutating()
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_and_mutation_states_are_independent() {
+        let mut session = RepositorySession::new(PathBuf::from("repo"));
+        session.refresh_state = RefreshState::Running { generation: 1 };
+
+        assert!(session.is_refreshing());
+        assert!(!session.is_mutating());
+        assert!(!session.can_mutate());
+        assert!(!session.can_refresh());
+
+        session.mutation_state = MutationState::Running {
+            kind: OperationKind::Stage,
+            generation: 1,
+        };
+        assert!(session.is_refreshing());
+        assert!(session.is_mutating());
+        assert!(!session.can_mutate());
+        assert!(!session.can_refresh());
+    }
+
+    #[test]
+    fn cancelled_mutation_is_not_a_failure() {
+        let cancelled = MutationState::Cancelled {
+            kind: OperationKind::Commit,
+            message: "Operación cancelada".to_owned(),
+        };
+        let failed = MutationState::Failed {
+            kind: OperationKind::Commit,
+            message: "fallo".to_owned(),
+            details: "stderr".to_owned(),
+        };
+
+        assert_ne!(cancelled, failed);
     }
 }
 

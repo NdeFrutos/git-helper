@@ -49,3 +49,13 @@ las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
 y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
 continúa con estado vacío.
+
+## Estados de interacción por repositorio
+
+Cada `RepositorySession` mantiene por separado `refresh_state` y `mutation_state`. El refresh
+puede conservar el snapshot anterior mientras carga, y sus transiciones se notifican aunque Git
+devuelva exactamente los mismos datos. Las mutaciones se serializan por repositorio y no utilizan
+el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión conserva también el
+último `status_message` y el error accionable; los errores globales quedan reservados para fallos
+de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
+un estado distinto de un fallo para que la UI no la presente como error.

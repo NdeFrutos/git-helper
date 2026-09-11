@@ -364,7 +364,10 @@ struct RepositorySession {
 	selected_view: RepositoryView,
 	selected_change: Option<ChangeSelection>,
 	selected_commit: Option<CommitId>,
-	operation_state: OperationState,
+	refresh_state: RefreshState,
+	mutation_state: MutationState,
+	status_message: String,
+	error: Option<String>,
 }
 
 struct RepositorySnapshot {
