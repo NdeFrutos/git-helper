@@ -3665,9 +3665,35 @@ mod tests {
         };
 
         assert!(window.prepare_refresh(repository_id).is_none());
+        assert!(window.pending_refreshes.contains(&repository_id));
         window.state.repositories[0].mutation_state = MutationState::Cancelled {
             kind: OperationKind::Stage,
             message: "cancelada".to_owned(),
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_some());
+        assert!(matches!(
+            window.state.repositories[0].refresh_state,
+            RefreshState::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn invalidation_during_ai_generation_reconciles_after_finish() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].mutation_state = MutationState::Running {
+            kind: OperationKind::GenerateCommitMessage,
+            generation: 0,
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_none());
+        assert!(window.pending_refreshes.contains(&repository_id));
+
+        window.state.repositories[0].mutation_state = MutationState::Succeeded {
+            kind: OperationKind::GenerateCommitMessage,
+            message: "Mensaje generado".to_owned(),
         };
 
         assert!(window.prepare_refresh(repository_id).is_some());
