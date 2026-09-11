@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
-    parse_branch_refs, parse_log, parse_status, resolve_upstream,
+    classify_remote_failure, parse_branch_refs, parse_log, parse_status, resolve_upstream,
     validate_existing_path_inside_repository, validate_relative_path,
 };
 
@@ -849,6 +849,64 @@ impl GitClient {
             LOCAL_OPERATION_TIMEOUT,
             cancellation,
         )
+    }
+
+    /// Clona un repositorio remoto en la ruta destino indicada.
+    pub fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let output = self.run_process(
+            "git-clone",
+            vec![
+                OsString::from("clone"),
+                OsString::from(url),
+                destination.as_os_str().to_os_string(),
+            ],
+            None,
+            REMOTE_OPERATION_TIMEOUT,
+            cancellation,
+            false,
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(classify_remote_failure(
+                &String::from_utf8_lossy(&output.stderr),
+                output.status.code(),
+            ))
+        }
+    }
+
+    /// Lee la URL configurada para un remote concreto sin consultar la red.
+    pub fn remote_url(
+        &self,
+        repository_root: &Path,
+        remote_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitError> {
+        let output = self.run_git_read_only(
+            "git-remote-url",
+            repository_root,
+            ["remote", "get-url", remote_name],
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::RemoteNotConfigured {
+                remote: remote_name.to_owned(),
+            });
+        }
+        decode_trimmed_stdout(&output, "git remote get-url")
     }
 
     /// Ejecuta exclusivamente planes remotos creados por la capa tipada.

@@ -14,10 +14,10 @@ use tracing::warn;
 
 use crate::domain::{
     AppSettings, AppState, MutationState, RefreshCoordinator, RefreshState, RepositoryId,
-    RepositorySession, RepositorySnapshot, RepositoryView,
+    RepositorySession, RepositorySnapshot, RepositoryView, SshCloneMapping,
 };
 
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -48,6 +48,8 @@ pub struct PersistedAppState {
     #[serde(default)]
     pub recent_repositories: Vec<PathBuf>,
     #[serde(default)]
+    pub ssh_clone_mappings: Vec<SshCloneMapping>,
+    #[serde(default)]
     pub settings: AppSettings,
     pub window_placement: Option<WindowPlacement>,
 }
@@ -59,6 +61,7 @@ impl Default for PersistedAppState {
             repositories: Vec::new(),
             active_repository_id: None,
             recent_repositories: Vec::new(),
+            ssh_clone_mappings: Vec::new(),
             settings: AppSettings::default(),
             window_placement: None,
         }
@@ -82,6 +85,7 @@ impl PersistedAppState {
                 .collect(),
             active_repository_id: app_state.active_repository_id,
             recent_repositories: app_state.recent_repositories.clone(),
+            ssh_clone_mappings: app_state.ssh_clone_mappings.clone(),
             settings: app_state.settings.clone(),
             window_placement,
         }
@@ -116,6 +120,7 @@ impl PersistedAppState {
             repositories,
             active_repository_id: self.active_repository_id,
             recent_repositories: self.recent_repositories,
+            ssh_clone_mappings: self.ssh_clone_mappings,
             settings: self.settings,
         }
     }
@@ -284,7 +289,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::domain::{AppState, RepositorySession, RepositoryView};
+    use crate::domain::{AppState, RepositorySession, RepositoryView, SshCloneMapping};
 
     use super::{AppStateStore, PersistedAppState, WindowPlacement};
 
@@ -329,5 +334,40 @@ mod tests {
         assert!(loaded.state.repositories.is_empty());
         assert!(loaded.corruption_backup.is_some());
         assert!(!store.state_path().exists());
+    }
+
+    #[test]
+    fn migrates_legacy_state_without_ssh_mappings() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{"schema_version":1,"repositories":[],"recent_repositories":[],"settings":{}}"#,
+        )
+        .expect("debe escribir el fixture legacy");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe migrar");
+
+        assert_eq!(loaded.state.schema_version, 2);
+        assert!(loaded.state.ssh_clone_mappings.is_empty());
+    }
+
+    #[test]
+    fn persists_ssh_clone_mappings() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let mut app_state = AppState::default();
+        app_state.ssh_clone_mappings.push(SshCloneMapping {
+            ssh_url_normalized: "ssh://github.com/org/repo".to_owned(),
+            local_path: PathBuf::from(r"C:\GitHelper\repos\repo"),
+        });
+        let persisted = PersistedAppState::from_app_state(&app_state, None);
+        store.save(&persisted).expect("debe guardar");
+        let loaded = store.load().expect("debe cargar");
+        assert_eq!(
+            loaded.state.ssh_clone_mappings,
+            persisted.ssh_clone_mappings
+        );
     }
 }

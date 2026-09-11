@@ -6,7 +6,10 @@ use std::{
 
 use git_helper::{
     domain::ChangeKind,
-    git::{GitClient, plan_discard, plan_pull, plan_push},
+    git::{
+        GitClient, classify_remote_failure, parse_ssh_url, plan_clone_destination, plan_discard,
+        plan_pull, plan_push,
+    },
     process::CancellationToken,
 };
 use tempfile::tempdir;
@@ -496,4 +499,61 @@ fn pagination_stays_on_the_selected_oid_when_the_branch_moves() {
         .expect("debe resolver la rama movida");
     assert_ne!(moved.oid, first.oid);
     assert_eq!(moved.commits[0].summary.subject, "test: four");
+}
+
+#[test]
+fn clones_from_a_local_bare_remote() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let bare = temporary.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .expect("git init --bare debe funcionar");
+    let clone_destination = temporary.path().join("working-copy");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let remote_url = format!("file://{}", bare.display());
+
+    client
+        .clone_repository(&remote_url, &clone_destination, &cancellation)
+        .expect("git clone debe funcionar contra un bare local");
+    let origin = client
+        .remote_url(&clone_destination, "origin", &cancellation)
+        .expect("debe leer origin");
+
+    assert!(origin.contains("origin.git"));
+}
+
+#[test]
+fn reuses_destination_when_origin_matches_requested_ssh_url() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    require_git(
+        temporary.path(),
+        &["remote", "add", "origin", "git@github.com:org/demo.git"],
+    );
+    let parsed = parse_ssh_url("ssh://git@github.com/org/demo").expect("url ssh de prueba");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let plan = plan_clone_destination(&client, &parsed, temporary.path(), &cancellation)
+        .expect("debe reutilizar el clon existente");
+
+    assert!(matches!(
+        plan,
+        git_helper::git::CloneDestinationPlan::OpenExisting(_)
+    ));
+}
+
+#[test]
+fn classifies_common_ssh_failures() {
+    let auth = classify_remote_failure("Permission denied (publickey).", Some(128));
+    assert!(matches!(
+        auth,
+        git_helper::git::GitError::SshAuthenticationFailed { .. }
+    ));
+    let host = classify_remote_failure("Host key verification failed.", Some(128));
+    assert!(matches!(
+        host,
+        git_helper::git::GitError::SshHostKeyVerificationFailed { .. }
+    ));
 }

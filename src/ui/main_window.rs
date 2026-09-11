@@ -7,13 +7,14 @@ use std::{
 
 use gpui::{
     AnyElement, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel, Render,
-    Subscription, Window, div, prelude::*, px, uniform_list,
+    Subscription, Window, div, prelude::*, px, rgba, uniform_list,
 };
 
 use crate::{
     actions::{
-        CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+        CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
+        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
+        ShowHistory,
     },
     cursor::{
         CommitMessageRequest, CursorClient, GenerationApplyDecision, build_cursor_context,
@@ -22,9 +23,13 @@ use crate::{
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
         FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
-        RepositorySession, RepositorySnapshot, RepositoryView,
+        RepositorySession, RepositorySnapshot, RepositoryView, SshCloneMapping,
     },
-    git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
+    git::{
+        CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
+        default_clone_destination, default_clone_root, parse_ssh_url, plan_clone_destination,
+        plan_discard, plan_fetch, plan_pull, plan_push,
+    },
     persistence::{AppStateStore, PersistedAppState},
     process::CancellationToken,
     watcher::RepositoryWatcher,
@@ -141,6 +146,11 @@ pub struct MainWindow {
     git_version: Option<String>,
     global_status_message: String,
     global_error: Option<String>,
+    clone_panel_visible: bool,
+    clone_url_input: Option<Entity<CommitInput>>,
+    clone_in_progress: bool,
+    active_clone_cancellation: Option<CancellationToken>,
+    pending_existing_clone_open: Option<(String, PathBuf)>,
 }
 
 #[allow(
@@ -152,7 +162,7 @@ pub struct MainWindow {
 impl MainWindow {
     /// Restaura sesiones persistidas sin bloquear la creación de la ventana.
     #[must_use]
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let state_store = AppStateStore::default_location().ok();
         let state = AppState::default();
         Self {
@@ -177,6 +187,11 @@ impl MainWindow {
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
             global_error: None,
+            clone_panel_visible: false,
+            clone_url_input: Some(cx.new(CommitInput::new)),
+            clone_in_progress: false,
+            active_clone_cancellation: None,
+            pending_existing_clone_open: None,
         }
     }
 
@@ -236,6 +251,11 @@ impl MainWindow {
                             this.state.active_repository_id = loaded_state.active_repository_id;
                         }
                         this.state.recent_repositories = loaded_state.recent_repositories;
+                        this.state.ssh_clone_mappings = loaded_state
+                            .ssh_clone_mappings
+                            .into_iter()
+                            .filter(|mapping| mapping.local_path.is_dir())
+                            .collect();
                         this.state.settings = loaded_state.settings;
                         this.cursor_client = CursorClient::new(cursor_executable);
                         for repository_id in restored_ids {
@@ -365,7 +385,7 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(root_path) => this.finish_open_repository(root_path, cx),
+                    Ok(root_path) => this.finish_open_repository(root_path, None, cx),
                     Err(error) => {
                         this.global_error = Some(error.to_string());
                         this.global_status_message = "No se pudo abrir el repositorio".to_owned();
@@ -378,7 +398,12 @@ impl MainWindow {
         .detach();
     }
 
-    fn finish_open_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+    fn finish_open_repository(
+        &mut self,
+        root_path: PathBuf,
+        ssh_url_normalized: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let path_key = normalized_path_key(&root_path);
         if let Some(repository_id) = self
             .state
@@ -389,6 +414,9 @@ impl MainWindow {
         {
             self.state.active_repository_id = Some(repository_id);
             self.global_status_message = "El repositorio ya estaba abierto".to_owned();
+            if let Some(url) = ssh_url_normalized {
+                self.record_ssh_clone_mapping(url, root_path);
+            }
             self.save_state(cx);
             return;
         }
@@ -399,13 +427,315 @@ impl MainWindow {
         self.state
             .recent_repositories
             .retain(|recent| normalized_path_key(recent) != path_key);
-        self.state.recent_repositories.insert(0, root_path);
+        self.state.recent_repositories.insert(0, root_path.clone());
         self.state.recent_repositories.truncate(10);
+        if let Some(url) = ssh_url_normalized {
+            self.record_ssh_clone_mapping(url, root_path);
+        }
+        self.clone_panel_visible = false;
         self.create_commit_input(repository_id, cx);
         self.global_status_message = "Repositorio abierto".to_owned();
         self.global_error = None;
         self.save_state(cx);
         self.refresh_repository(repository_id, cx);
+    }
+
+    fn record_ssh_clone_mapping(&mut self, ssh_url_normalized: String, local_path: PathBuf) {
+        let local_key = normalized_path_key(&local_path);
+        self.state.ssh_clone_mappings.retain(|mapping| {
+            mapping.ssh_url_normalized != ssh_url_normalized
+                && normalized_path_key(&mapping.local_path) != local_key
+        });
+        self.state.ssh_clone_mappings.insert(
+            0,
+            SshCloneMapping {
+                ssh_url_normalized,
+                local_path,
+            },
+        );
+        self.state.ssh_clone_mappings.truncate(10);
+    }
+
+    fn clone_root_directory(&self) -> PathBuf {
+        self.state
+            .settings
+            .default_clone_directory
+            .clone()
+            .or_else(|| default_clone_root().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn clone_repository(&mut self, _: &CloneRepository, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_clone_panel(cx);
+    }
+
+    fn show_clone_panel(&mut self, cx: &mut Context<Self>) {
+        if self.clone_in_progress {
+            return;
+        }
+        self.clone_panel_visible = true;
+        self.global_error = None;
+        if let Some(input) = &self.clone_url_input {
+            input.update(cx, CommitInput::clear);
+        }
+        cx.notify();
+    }
+
+    fn cancel_clone(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.active_clone_cancellation.take() {
+            cancellation.cancel();
+            self.global_status_message = "Cancelando clonado…".to_owned();
+            cx.notify();
+        }
+    }
+
+    fn submit_clone_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clone_in_progress {
+            return;
+        }
+        let Some(input) = &self.clone_url_input else {
+            return;
+        };
+        let url = input.read(cx).content().trim().to_owned();
+        let parsed = match parse_ssh_url(&url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.global_error = Some(error.user_message());
+                cx.notify();
+                return;
+            }
+        };
+        let clone_root = self.clone_root_directory();
+        let default_destination =
+            match default_clone_destination(&clone_root, &parsed.repository_name) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    self.global_error = Some(error.user_message());
+                    cx.notify();
+                    return;
+                }
+            };
+        let details = format!(
+            "Destino sugerido:\n{}\n\nGit Helper usa el SSH de Git for Windows (GIT_SSH, ~/.ssh/config y ssh-agent). No almacena claves privadas ni contraseñas.",
+            default_destination.display()
+        );
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "¿Dónde clonar el repositorio?",
+            Some(&details),
+            &["Usar ubicación sugerida", "Elegir carpeta…", "Cancelar"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            match choice {
+                0 => {
+                    this.update(cx, |this, cx| {
+                        this.continue_clone_with_destination(parsed, default_destination, cx);
+                    })
+                    .ok();
+                }
+                1 => {
+                    let parsed_for_destination = parsed.clone();
+                    this.update_in(cx, |_this, _window, cx| {
+                        let path_receiver = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Selecciona la carpeta destino del clon".into()),
+                        });
+                        cx.spawn(async move |this, cx| {
+                            let Ok(Ok(Some(paths))) = path_receiver.await else {
+                                return;
+                            };
+                            let Some(destination) = paths.into_iter().next() else {
+                                return;
+                            };
+                            this.update(cx, |this, cx| {
+                                this.continue_clone_with_destination(
+                                    parsed_for_destination,
+                                    destination,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    })
+                    .ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    fn continue_clone_with_destination(
+        &mut self,
+        parsed: ParsedSshUrl,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let git_client = self.git_client.clone();
+        let cancellation = CancellationToken::default();
+        let parsed_for_execute = parsed.clone();
+        let normalized = parsed.normalized.clone();
+        self.global_status_message = "Comprobando destino…".to_owned();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let plan = cx
+                .background_spawn(async move {
+                    plan_clone_destination(&git_client, &parsed, &destination, &cancellation)
+                })
+                .await;
+            this.update(cx, |this, cx| match plan {
+                Ok(CloneDestinationPlan::CloneInto(path)) => {
+                    this.execute_clone(&parsed_for_execute, path, cx);
+                }
+                Ok(CloneDestinationPlan::OpenExisting(root_path)) => {
+                    this.pending_existing_clone_open = Some((normalized, root_path));
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.global_error = Some(error.user_message());
+                    this.global_status_message =
+                        "No se pudo preparar el clonado del repositorio".to_owned();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_open_existing_clone(
+        &mut self,
+        ssh_url_normalized: String,
+        root_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let details = format!(
+            "Ya existe un clon compatible en:\n{}\n\nSe abrirá sin sobrescribir datos.",
+            root_path.display()
+        );
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "Reutilizar clon existente",
+            Some(&details),
+            &["Abrir", "Cancelar"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(prompt.await, Ok(0)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.finish_open_repository(root_path, Some(ssh_url_normalized), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn process_pending_existing_clone_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((ssh_url_normalized, root_path)) = self.pending_existing_clone_open.take() {
+            self.confirm_open_existing_clone(ssh_url_normalized, root_path, window, cx);
+        }
+    }
+
+    fn execute_clone(
+        &mut self,
+        parsed: &ParsedSshUrl,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.clone_in_progress = true;
+        self.clone_panel_visible = false;
+        self.global_status_message = "Clonando repositorio…".to_owned();
+        self.global_error = None;
+        let cancellation = CancellationToken::default();
+        self.active_clone_cancellation = Some(cancellation.clone());
+        let url = parsed.original.clone();
+        let normalized = parsed.normalized.clone();
+        let git_client = self.git_client.clone();
+        let discover_destination = destination.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.clone_repository(&url, &destination, &cancellation)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.active_clone_cancellation = None;
+                this.clone_in_progress = false;
+                match result {
+                    Ok(()) => match this
+                        .git_client
+                        .discover_repository(&discover_destination, &CancellationToken::default())
+                    {
+                        Ok(root_path) => {
+                            this.finish_open_repository(root_path, Some(normalized), cx);
+                        }
+                        Err(error) => {
+                            this.global_error = Some(error.user_message());
+                            this.global_status_message =
+                                "El clon terminó pero no se pudo abrir el repositorio".to_owned();
+                        }
+                    },
+                    Err(error) => {
+                        let cancelled = is_cancelled_error(&error);
+                        this.global_error = if cancelled {
+                            None
+                        } else {
+                            Some(error.user_message())
+                        };
+                        this.global_status_message = if cancelled {
+                            "Clonado cancelado".to_owned()
+                        } else {
+                            "No se pudo clonar el repositorio".to_owned()
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_ssh_clone_mapping(&mut self, mapping: &SshCloneMapping, cx: &mut Context<Self>) {
+        if !mapping.local_path.is_dir() {
+            self.global_error = Some(format!(
+                "El clon ya no existe en {}",
+                mapping.local_path.display()
+            ));
+            self.state
+                .ssh_clone_mappings
+                .retain(|candidate| candidate.ssh_url_normalized != mapping.ssh_url_normalized);
+            self.save_state(cx);
+            cx.notify();
+            return;
+        }
+        match self
+            .git_client
+            .discover_repository(&mapping.local_path, &CancellationToken::default())
+        {
+            Ok(root_path) => {
+                self.finish_open_repository(
+                    root_path,
+                    Some(mapping.ssh_url_normalized.clone()),
+                    cx,
+                );
+            }
+            Err(error) => {
+                self.global_error = Some(error.user_message());
+                cx.notify();
+            }
+        }
     }
 
     fn close_active_repository(
@@ -2099,6 +2429,21 @@ impl MainWindow {
             }))
             .child(
                 div()
+                    .id("clone-repository-tab")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(38.0))
+                    .h_full()
+                    .text_sm()
+                    .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_clone_panel(cx);
+                    }))
+                    .child("⇩"),
+            )
+            .child(
+                div()
                     .id("open-repository-tab")
                     .flex()
                     .items_center()
@@ -3036,6 +3381,13 @@ impl MainWindow {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ssh_clones = self
+            .state
+            .ssh_clone_mappings
+            .iter()
+            .filter(|mapping| mapping.local_path.is_dir())
+            .cloned()
+            .collect::<Vec<_>>();
         div()
             .flex()
             .flex_1()
@@ -3048,25 +3400,148 @@ impl MainWindow {
                 div()
                     .text_sm()
                     .text_color(MUTED_TEXT_COLOR)
-                    .child("Abre una carpeta que contenga un repositorio Git."),
+                    .child("Abre una carpeta local o clona un repositorio accesible por SSH."),
             )
             .child(
-                action_button("open-empty", "Abrir repositorio", true).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.open_repository(&OpenRepository, window, cx);
-                    },
-                )),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        action_button("open-empty", "Abrir repositorio", !self.clone_in_progress)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_repository(&OpenRepository, window, cx);
+                            })),
+                    )
+                    .child(
+                        action_button("clone-empty", "Clonar repositorio", !self.clone_in_progress)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_clone_panel(cx);
+                            })),
+                    ),
+            )
+            .when(!ssh_clones.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(MUTED_TEXT_COLOR)
+                                .child("Clones SSH recientes"),
+                        )
+                        .children(ssh_clones.into_iter().map(|mapping| {
+                            let label = mapping.local_path.display().to_string();
+                            let mapping_for_click = mapping.clone();
+                            action_button(
+                                format!("ssh-clone-{}", mapping.ssh_url_normalized),
+                                label,
+                                !self.clone_in_progress,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.open_ssh_clone_mapping(&mapping_for_click, cx);
+                                },
+                            ))
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_clone_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_00A0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w(px(560.0))
+                    .p_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(BORDER_COLOR)
+                    .bg(ELEVATED_BACKGROUND_COLOR)
+                    .child(div().text_lg().child("Clonar repositorio por SSH"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(MUTED_TEXT_COLOR)
+                            .child(
+                                "Pega una URL SSH (git@host:org/repo.git o ssh://…). Git Helper usa tu configuración SSH del sistema.",
+                            ),
+                    )
+                    .when_some(self.clone_url_input.clone(), |panel, input| {
+                        panel.child(input)
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                action_button(
+                                    "clone-cancel",
+                                    if self.clone_in_progress {
+                                        "Cancelar clonado"
+                                    } else {
+                                        "Cerrar"
+                                    },
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.clone_in_progress {
+                                        this.cancel_clone(cx);
+                                    } else {
+                                        this.clone_panel_visible = false;
+                                        cx.notify();
+                                    }
+                                })),
+                            )
+                            .child(
+                                action_button(
+                                    "clone-submit",
+                                    "Continuar",
+                                    !self.clone_in_progress,
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_clone_url(window, cx);
+                                })),
+                            ),
+                    )
+                    .when(self.clone_in_progress, |panel| {
+                        panel.child(
+                            div()
+                                .text_sm()
+                                .text_color(ACCENT_COLOR)
+                                .child("Clonando… puedes cancelar en cualquier momento."),
+                        )
+                    }),
             )
             .into_any_element()
     }
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.process_pending_existing_clone_open(window, cx);
         let active_repository = self.active_repository().cloned();
         div()
             .key_context("GitHelper")
             .on_action(cx.listener(Self::open_repository))
+            .on_action(cx.listener(Self::clone_repository))
             .on_action(cx.listener(Self::close_active_repository))
             .on_action(cx.listener(Self::next_repository))
             .on_action(cx.listener(Self::previous_repository))
@@ -3091,6 +3566,9 @@ impl Render for MainWindow {
             })
             .when(active_repository.is_none(), |root| {
                 root.child(self.render_empty_state(cx))
+            })
+            .when(self.clone_panel_visible || self.clone_in_progress, |root| {
+                root.child(self.render_clone_panel(cx))
             })
             .when_some(
                 active_repository
@@ -3291,6 +3769,7 @@ fn operation_running_message(kind: OperationKind) -> &'static str {
         OperationKind::Unstage => "Quitando del staging area…",
         OperationKind::Discard => "Descartando cambios…",
         OperationKind::Commit => "Creando commit…",
+        OperationKind::Clone => "Clonando repositorio…",
         OperationKind::Fetch => "Ejecutando fetch…",
         OperationKind::Pull => "Ejecutando pull --ff-only…",
         OperationKind::Push => "Ejecutando push…",
@@ -3305,6 +3784,7 @@ fn operation_success_message(kind: OperationKind) -> &'static str {
         OperationKind::Unstage => "Cambios retirados del staging area",
         OperationKind::Discard => "Cambios descartados",
         OperationKind::Commit => "Commit creado",
+        OperationKind::Clone => "Repositorio clonado",
         OperationKind::Fetch => "Fetch completado",
         OperationKind::Pull => "Pull completado",
         OperationKind::Push => "Push completado",
@@ -3443,6 +3923,11 @@ mod tests {
             git_version: None,
             global_status_message: String::new(),
             global_error: None,
+            clone_panel_visible: false,
+            clone_url_input: None,
+            clone_in_progress: false,
+            active_clone_cancellation: None,
+            pending_existing_clone_open: None,
         }
     }
 

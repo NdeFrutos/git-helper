@@ -14,6 +14,7 @@ sincronizar con remotes y consultar el historial.
 ## Qué permite hacer
 
 - Abrir varios repositorios locales y cambiar entre ellos mediante pestañas.
+- Clonar repositorios remotos accesibles por SSH y abrirlos en una pestaña.
 - Ver cambios staged, sin preparar, sin seguimiento y en conflicto.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
 - Crear commits sin añadir archivos automáticamente.
@@ -48,10 +49,11 @@ También se publica `git-helper-<versión>-windows-x86_64-portable.zip`: basta c
 - Windows 10 u 11 de 64 bits.
 - [Git for Windows](https://gitforwindows.org/).
 - Opcional: [Cursor CLI](https://cursor.com/cli) y una sesión iniciada para generar mensajes.
+- Para clonar por SSH: clave en `ssh-agent` (`ssh-add`), entrada en `~/.ssh/known_hosts` y Git for Windows con su SSH habitual.
 
 ## Uso rápido
 
-1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` o `Ctrl+O`.
+1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` (`Ctrl+O`) o clónalo con `Clonar repositorio` (`Ctrl+Shift+O`).
 2. Prepara los archivos que quieras incluir desde la vista `Cambios`.
 3. Escribe el mensaje —o solicita una propuesta a Cursor— y pulsa `Commit`.
 4. Usa `Fetch`, `Pull` o `Push` desde la barra superior cuando necesites sincronizar.
@@ -61,6 +63,7 @@ Atajos disponibles:
 | Atajo | Acción |
 |---|---|
 | `Ctrl+O` | Abrir repositorio |
+| `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar la pestaña activa |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar de repositorio |
 | `F5` | Actualizar el estado |
@@ -142,6 +145,8 @@ la trazabilidad de código están en [docs/technical-decisions.md](docs/technica
 ## Limitaciones conocidas
 
 - El soporte oficial se limita a Windows 10/11 x64.
+- El clonado remoto admite URLs SSH; HTTPS y otros esquemas quedan pendientes.
+- Git Helper no gestiona claves SSH: usa `ssh-agent`, `~/.ssh/config` y el SSH incluido en Git for Windows.
 - No incluye diff, editor, git graph, checkout de ramas, stash, rebase ni resolución visual de
   conflictos.
 - La vista de ramas es informativa: consultar otra rama carga su historial por referencia sin
