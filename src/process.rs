@@ -204,12 +204,20 @@ fn read_capture(mut capture: impl Read + Seek) -> Result<Vec<u8>, std::io::Error
 }
 
 fn terminate_child(child: &mut std::process::Child) -> Result<(), ProcessError> {
+    // Un fallo al terminar el árbol no se propaga por sí solo: `taskkill.exe`
+    // también devuelve error cuando el hijo acaba de terminar por su cuenta, y
+    // convertir esa carrera en un error borraría la clasificación de
+    // cancelación o timeout que el llamador está a punto de devolver. El caso
+    // que sí importa —un proceso que sigue vivo— lo detecta la espera acotada.
     #[cfg(target_os = "windows")]
-    let tree_error = if child.try_wait().map_err(ProcessError::Wait)?.is_none() {
-        terminate_process_tree(child.id()).err()
-    } else {
-        None
-    };
+    if child.try_wait().map_err(ProcessError::Wait)?.is_none()
+        && let Err(tree_error) = terminate_process_tree(child.id())
+    {
+        warn!(
+            error = %tree_error,
+            "no se pudo terminar el árbol de procesos; se continúa con el hijo directo"
+        );
+    }
 
     if let Err(kill_error) = child.kill()
         && kill_error.kind() != std::io::ErrorKind::InvalidInput
@@ -221,11 +229,6 @@ fn terminate_child(child: &mut std::process::Child) -> Result<(), ProcessError> 
     #[cfg(not(target_os = "windows"))]
     let wait_result = child.wait().map(|_| ()).map_err(ProcessError::Wait);
     wait_result?;
-
-    #[cfg(target_os = "windows")]
-    if let Some(tree_error) = tree_error {
-        return Err(tree_error);
-    }
 
     Ok(())
 }
@@ -318,7 +321,11 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     #[cfg(windows)]
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::Path,
+        process::{Command, Stdio},
+    };
 
     use super::{CancellationToken, ProcessRequest, ProcessRunner, SystemProcessRunner};
 
@@ -345,6 +352,12 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
     }
 
+    /// Margen para que el descendiente arranque y publique su PID antes de que
+    /// el timeout termine el árbol; si muriera antes, la prueba no comprobaría
+    /// nada.
+    #[cfg(windows)]
+    const TIMEOUT_FIXTURE_LIMIT: Duration = Duration::from_secs(3);
+
     #[cfg(windows)]
     #[test]
     fn timeout_terminates_descendants_that_inherit_output_handles() {
@@ -352,17 +365,23 @@ mod tests {
         let request = write_fixture(
             temporary.path(),
             descendant_command(),
-            Duration::from_millis(250),
+            TIMEOUT_FIXTURE_LIMIT,
         );
         let started_at = std::time::Instant::now();
-        let result = SystemProcessRunner.run(request, &CancellationToken::default());
+        let worker = std::thread::spawn(move || {
+            SystemProcessRunner.run(request, &CancellationToken::default())
+        });
+
+        let descendant_pid =
+            read_descendant_pid(&temporary.path().join("child.pid"), Duration::from_secs(3))
+                .expect("el fixture debe publicar el PID del descendiente");
+        let result = worker
+            .join()
+            .expect("el runner no debe dejar un worker colgado");
 
         assert!(matches!(result, Err(ProcessError::TimedOut(_))));
-        assert!(started_at.elapsed() < Duration::from_secs(2));
-        assert!(
-            wait_for_absent_file(&temporary.path().join("marker.txt"), Duration::from_secs(3)),
-            "el descendiente no debe sobrevivir al timeout"
-        );
+        assert!(started_at.elapsed() < Duration::from_secs(8));
+        assert_process_stopped(descendant_pid);
     }
 
     #[cfg(windows)]
@@ -380,22 +399,17 @@ mod tests {
         let worker =
             std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
 
-        let pid_path = temporary.path().join("child.pid");
-        assert!(
-            wait_for_file(&pid_path, Duration::from_secs(3)),
-            "el fixture debe iniciar el descendiente antes de cancelar"
-        );
+        let descendant_pid =
+            read_descendant_pid(&temporary.path().join("child.pid"), Duration::from_secs(3))
+                .expect("el fixture debe publicar el PID del descendiente antes de cancelar");
         cancellation.cancel();
         let result = worker
             .join()
             .expect("el runner no debe dejar un worker colgado");
 
         assert!(matches!(result, Err(ProcessError::Cancelled)));
-        assert!(started_at.elapsed() < Duration::from_secs(3));
-        assert!(
-            wait_for_absent_file(&temporary.path().join("marker.txt"), Duration::from_secs(3)),
-            "el descendiente no debe sobrevivir a la cancelación"
-        );
+        assert!(started_at.elapsed() < Duration::from_secs(5));
+        assert_process_stopped(descendant_pid);
     }
 
     #[cfg(windows)]
@@ -420,6 +434,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn terminating_a_child_that_already_exited_is_not_an_infrastructure_error() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("debe iniciar el proceso de prueba");
+        while child
+            .try_wait()
+            .expect("debe poder consultar el estado del proceso")
+            .is_none()
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Terminar un proceso que ya acabó es la carrera habitual al cancelar:
+        // no debe degradarse a un error que oculte Cancelled o TimedOut.
+        assert!(super::terminate_child(&mut child).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn repeated_cancellation_does_not_leave_descendant_processes() {
         for iteration in 0..8 {
             let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
@@ -434,15 +471,8 @@ mod tests {
             let worker =
                 std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
 
-            assert!(
-                wait_for_file(&pid_path, Duration::from_secs(3)),
-                "el fixture {iteration} no inició el descendiente"
-            );
-            let child_pid = fs::read_to_string(&pid_path)
-                .expect("el fixture debe escribir el PID del descendiente")
-                .trim()
-                .parse::<u32>()
-                .expect("el PID del descendiente debe ser numérico");
+            let child_pid = read_descendant_pid(&pid_path, Duration::from_secs(3))
+                .unwrap_or_else(|| panic!("el fixture {iteration} no publicó el PID"));
             cancellation.cancel();
             assert!(matches!(
                 worker
@@ -451,7 +481,6 @@ mod tests {
                 Err(ProcessError::Cancelled)
             ));
             assert_process_stopped(child_pid);
-            assert!(!temporary.path().join("marker.txt").exists());
         }
     }
 
@@ -494,16 +523,24 @@ mod tests {
         false
     }
 
+    /// Lee el PID publicado por el fixture reintentando hasta el plazo dado.
+    ///
+    /// La existencia del archivo no basta: `Set-Content` puede mantenerlo
+    /// abierto y vacío mientras el test intenta leerlo.
     #[cfg(windows)]
-    fn wait_for_absent_file(path: &Path, timeout: Duration) -> bool {
+    fn read_descendant_pid(path: &Path, timeout: Duration) -> Option<u32> {
         let started_at = std::time::Instant::now();
-        while started_at.elapsed() < timeout {
-            if !path.exists() {
-                return true;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && let Ok(process_id) = contents.trim().parse::<u32>()
+            {
+                return Some(process_id);
             }
-            std::thread::sleep(Duration::from_millis(25));
+            if started_at.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        !path.exists()
     }
 
     #[cfg(windows)]

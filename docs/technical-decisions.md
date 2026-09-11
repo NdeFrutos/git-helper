@@ -43,15 +43,19 @@ los ejemplos de Zed. No se copió código GPL de Zed.
 mantiene la captura independiente de ambos streams sin crear lectores bloqueables cuando un
 descendiente hereda los handles. En Windows, la cancelación y el timeout finalizan el árbol activo
 con `taskkill.exe /PID <pid> /T /F`; el comando auxiliar también se crea con `CREATE_NO_WINDOW`, no
-usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` no puede completar la
-operación, el runner devuelve un error de infraestructura después de intentar finalizar el hijo
-directo, en lugar de ocultar un proceso potencialmente vivo. La salida normal del padre no espera a
+usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` falla —lo hace también cuando el hijo
+acaba de terminar por su cuenta— se registra el aviso y se continúa con el hijo directo; el runner
+solo devuelve un error de infraestructura si el proceso sigue vivo tras la espera acotada, de modo
+que la clasificación de cancelación o timeout nunca se pierde por esa carrera. La salida normal del padre no espera a
 descendientes que se hayan desacoplado voluntariamente; los datos capturados se leen sin esperar al
 cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
 `CURSOR_API_TOKEN`.
 
 Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
-los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. La
+los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
+fixture publica el PID del descendiente y las pruebas comprueban su desaparición con `tasklist.exe`;
+no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta antes incluso de
+que el descendiente pudiera escribirlo. La
 comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
 puede no tener Cargo o Windows disponible.
 
