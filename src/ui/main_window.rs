@@ -402,30 +402,58 @@ impl MainWindow {
     }
 
     fn retry_repository_access(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
-        let Some(repository) = self
+        let Some(root_path) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+        else {
+            return;
+        };
+        if let Some(repository) = self
             .state
             .repositories
             .iter_mut()
             .find(|repository| repository.id == repository_id)
-        else {
-            return;
-        };
-        repository.path_accessible = repository.root_path.is_dir();
-        if repository.path_accessible {
+        {
             repository.error = None;
-            repository.status_message = "Preparando repositorio…".to_owned();
-            self.pending_refreshes.insert(repository_id);
-            self.refresh_repository(repository_id, cx);
-        } else {
-            repository.error = Some(
-                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
-                    .to_owned(),
-            );
-            repository.status_message =
-                "Repositorio no disponible; comprueba la ruta o el disco".to_owned();
+            repository.status_message = "Comprobando la ruta del repositorio…".to_owned();
         }
-        self.save_state(cx);
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let path_accessible = cx
+                .background_spawn(async move { root_path.is_dir() })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(repository) = this
+                    .state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                else {
+                    return;
+                };
+                repository.path_accessible = path_accessible;
+                if path_accessible {
+                    repository.error = None;
+                    repository.status_message = "Preparando repositorio…".to_owned();
+                    this.pending_refreshes.insert(repository_id);
+                    this.refresh_repository(repository_id, cx);
+                } else {
+                    repository.error = Some(
+                        "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
+                            .to_owned(),
+                    );
+                    repository.status_message =
+                        "Repositorio no disponible; comprueba la ruta o el disco".to_owned();
+                }
+                this.save_state(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_recent_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
@@ -667,9 +695,9 @@ impl MainWindow {
         // La transición a carga debe ser visible aunque el snapshot aún no cambie.
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, path_accessible) = cx
                 .background_spawn(async move {
-                    if include_history {
+                    let result = if include_history {
                         git_client.snapshot_with_history(
                             &root_path,
                             INITIAL_HISTORY_LIMIT,
@@ -677,12 +705,18 @@ impl MainWindow {
                         )
                     } else {
                         git_client.snapshot(&root_path, &cancellation)
-                    }
+                    };
+                    (result, root_path.is_dir())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let outcome =
-                    this.finish_refresh(repository_id, generation, include_history, result);
+                let outcome = this.finish_refresh(
+                    repository_id,
+                    generation,
+                    include_history,
+                    path_accessible,
+                    result,
+                );
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
@@ -889,6 +923,7 @@ impl MainWindow {
         repository_id: RepositoryId,
         generation: u64,
         history_included: bool,
+        path_accessible: bool,
         result: Result<RepositorySnapshot, GitError>,
     ) -> RefreshOutcome {
         if self.global_refresh_in_flight == Some(repository_id) {
@@ -913,6 +948,26 @@ impl MainWindow {
         };
         let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
         repository.history_invalidated_during_refresh = false;
+        if !path_accessible {
+            if history_included {
+                repository.history_loading = false;
+            }
+            repository.path_accessible = false;
+            repository.refresh_state = RefreshState::Failed {
+                message: "Repositorio no disponible".to_owned(),
+                details: "La ruta del repositorio no responde".to_owned(),
+            };
+            repository.status_message = "Repositorio no disponible".to_owned();
+            repository.error = Some(
+                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
+                    .to_owned(),
+            );
+            return RefreshOutcome {
+                should_notify: true,
+                continuation,
+                ..RefreshOutcome::default()
+            };
+        }
         match result {
             Ok(mut snapshot) => {
                 let history_changed = repository.snapshot.head != snapshot.head
@@ -3683,6 +3738,7 @@ mod tests {
             repository_id,
             first_generation,
             first_include_history,
+            true,
             first_result,
         );
         assert_eq!(first_outcome.continuation, RefreshContinuation::Repeat);
@@ -3695,6 +3751,7 @@ mod tests {
             repository_id,
             follow_up.generation,
             follow_up.include_history,
+            true,
             follow_up_result,
         );
 
@@ -3735,6 +3792,7 @@ mod tests {
             old_id,
             pending.generation,
             pending.include_history,
+            true,
             Ok(RepositorySnapshot {
                 head: HeadState::Branch {
                     name: "stale".to_owned(),
@@ -3789,6 +3847,7 @@ mod tests {
             second_id,
             pending.generation,
             pending.include_history,
+            true,
             Err(GitError::InvalidStatus {
                 message: "respuesta rota".to_owned(),
             }),
@@ -3811,6 +3870,35 @@ mod tests {
         assert!(matches!(first.refresh_state, RefreshState::Idle));
         assert!(second.error.is_some());
         assert!(matches!(second.refresh_state, RefreshState::Failed { .. }));
+    }
+
+    #[test]
+    fn refresh_failure_marks_a_lost_repository_unavailable() {
+        let repository = RepositorySession::new(PathBuf::from("disconnected"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            false,
+            Err(GitError::Io {
+                path: PathBuf::from("disconnected"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            }),
+        );
+
+        let repository = &window.state.repositories[0];
+        assert!(!repository.path_accessible);
+        assert_eq!(repository.status_message, "Repositorio no disponible");
+        assert!(
+            repository
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reintentar"))
+        );
     }
 
     #[test]
@@ -3879,6 +3967,7 @@ mod tests {
             first_id,
             first_refresh.generation,
             first_refresh.include_history,
+            true,
             Ok(RepositorySnapshot::default()),
         );
         let second_refresh = window.prepare_refresh(second_id).unwrap();
