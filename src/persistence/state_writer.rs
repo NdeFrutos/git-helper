@@ -48,14 +48,15 @@ impl Drop for Worker {
             pending.shutdown = true;
         }
         self.shared.signal.notify_all();
-        if let Some(handle) = self
-            .handle
-            .lock()
-            .expect("el mutex del hilo trabajador no debe envenenarse")
-            .take()
-        {
-            let _ = handle.join();
-        }
+        // Soltar el `JoinHandle` desacopla el worker. Esperarlo aquí invalidaría el
+        // plazo de cierre si el almacenamiento está bloqueado; `shutdown` hará que
+        // termine en cuanto vuelva del I/O en curso.
+        drop(
+            self.handle
+                .lock()
+                .expect("el mutex del hilo trabajador no debe envenenarse")
+                .take(),
+        );
     }
 }
 
@@ -325,6 +326,35 @@ mod tests {
         drop(writer);
         // El hilo sigue vivo mientras exista un clon; soltarlo debe terminar sin bloquear.
         drop(clone);
+    }
+
+    #[test]
+    fn dropping_writer_never_waits_for_a_blocked_disk_write() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let writer = StateWriter::new(store);
+        let shared = Arc::clone(&writer.worker.shared);
+        let write_guard = shared
+            .write_lock
+            .lock()
+            .expect("el mutex de escritura no debe envenenarse");
+
+        writer.schedule(PersistedAppState::default(), Duration::ZERO);
+        thread::sleep(Duration::from_millis(20));
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = thread::spawn(move || {
+            drop(writer);
+            let _ = sender.send(());
+        });
+        let result = receiver.recv_timeout(Duration::from_millis(100));
+
+        drop(write_guard);
+        drop_thread.join().expect("el hilo de drop debe terminar");
+        assert!(
+            result.is_ok(),
+            "soltar el escritor no debe esperar al worker bloqueado en disco"
+        );
     }
 
     #[test]
