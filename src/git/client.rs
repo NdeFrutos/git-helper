@@ -7,8 +7,6 @@ use std::{
     time::Duration,
 };
 
-use tracing::warn;
-
 use crate::{
     domain::{
         BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage, Remote,
@@ -868,7 +866,23 @@ impl GitClient {
                 source,
             })?;
         }
-        let destination_existed = destination.exists();
+        let staging_directory = if destination.exists() {
+            None
+        } else {
+            let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+            Some(
+                tempfile::Builder::new()
+                    .prefix(".git-helper-clone-")
+                    .tempdir_in(parent)
+                    .map_err(|source| GitError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?,
+            )
+        };
+        let clone_destination = staging_directory
+            .as_ref()
+            .map_or(destination, tempfile::TempDir::path);
         let result = self.run_process(
             "git-clone",
             vec![
@@ -876,7 +890,7 @@ impl GitClient {
                 // `--` evita que una URL o un destino con guion inicial se lean como opción de git.
                 OsString::from("--"),
                 OsString::from(url),
-                destination.as_os_str().to_os_string(),
+                clone_destination.as_os_str().to_os_string(),
             ],
             None,
             REMOTE_OPERATION_TIMEOUT,
@@ -891,10 +905,17 @@ impl GitClient {
             )),
             Err(error) => Err(GitError::from(error)),
         };
-        if outcome.is_err() && !destination_existed {
-            // Un clonado cancelado o interrumpido deja un árbol a medias que bloquearía
-            // el siguiente intento; solo se borra lo que ha creado esta operación.
-            remove_partial_clone(destination);
+        if outcome.is_ok()
+            && let Some(staging_directory) = staging_directory.as_ref()
+        {
+            // Publica el clon terminado solo si el destino sigue libre. El temporal es
+            // propiedad exclusiva de esta operación y se limpia al fallar o cancelarse.
+            std::fs::rename(staging_directory.path(), destination).map_err(|source| {
+                GitError::Io {
+                    path: destination.to_path_buf(),
+                    source,
+                }
+            })?;
         }
         outcome
     }
@@ -1225,19 +1246,6 @@ fn validate_history_ref(reference: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Borra el destino a medio clonar sin propagar errores de limpieza.
-fn remove_partial_clone(destination: &Path) {
-    if let Err(error) = std::fs::remove_dir_all(destination)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            path = %destination.display(),
-            %error,
-            "no se pudo limpiar el destino de un clonado fallido"
-        );
-    }
-}
-
 /// Rechaza URLs y destinos que git podría interpretar como opciones aunque exista `--`.
 fn validate_clone_argument(value: &str) -> Result<(), GitError> {
     if value.is_empty() || value.starts_with('-') || value.contains('\0') {
@@ -1277,6 +1285,25 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    struct ConcurrentDestinationRunner {
+        destination: PathBuf,
+    }
+
+    impl ProcessRunner for ConcurrentDestinationRunner {
+        fn run(
+            &self,
+            _request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            std::fs::create_dir_all(&self.destination).expect("debe crear el destino concurrente");
+            std::fs::write(self.destination.join("datos-ajenos.txt"), b"conservar")
+                .expect("debe escribir los datos concurrentes");
+            Err(ProcessError::Spawn(std::io::Error::other(
+                "fallo de clone simulado",
+            )))
+        }
     }
 
     impl RecordingRunner {
@@ -1320,6 +1347,30 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+    }
+
+    #[test]
+    fn failed_clone_does_not_delete_a_destination_created_concurrently() {
+        let temporary = tempfile::tempdir().expect("debe crear el temporal");
+        let destination = temporary.path().join("working-copy");
+        let runner = Arc::new(ConcurrentDestinationRunner {
+            destination: destination.clone(),
+        });
+        let client = GitClient::with_runner(PathBuf::from("git"), runner);
+
+        client
+            .clone_repository(
+                "git@example.com:org/repo.git",
+                &destination,
+                &CancellationToken::default(),
+            )
+            .expect_err("el clone simulado debe fallar");
+
+        assert_eq!(
+            std::fs::read(destination.join("datos-ajenos.txt"))
+                .expect("los datos concurrentes deben sobrevivir"),
+            b"conservar"
+        );
     }
 
     #[test]
