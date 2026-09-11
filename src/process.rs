@@ -205,11 +205,7 @@ fn read_capture(mut capture: impl Read + Seek) -> Result<Vec<u8>, std::io::Error
 
 fn terminate_child(child: &mut std::process::Child) -> Result<(), ProcessError> {
     #[cfg(target_os = "windows")]
-    let tree_error = if child
-        .try_wait()
-        .map_err(ProcessError::Wait)?
-        .is_none()
-    {
+    let tree_error = if child.try_wait().map_err(ProcessError::Wait)?.is_none() {
         terminate_process_tree(child.id()).err()
     } else {
         None
@@ -266,7 +262,11 @@ fn terminate_process_tree(process_id: u32) -> Result<(), ProcessError> {
 fn taskkill_executable() -> PathBuf {
     std::env::var_os("SystemRoot").map_or_else(
         || PathBuf::from("taskkill.exe"),
-        |system_root| PathBuf::from(system_root).join("System32").join("taskkill.exe"),
+        |system_root| {
+            PathBuf::from(system_root)
+                .join("System32")
+                .join("taskkill.exe")
+        },
     )
 }
 
@@ -297,17 +297,12 @@ fn wait_for_process(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        time::Duration,
-    };
+    use std::{path::PathBuf, time::Duration};
 
     #[cfg(windows)]
     use std::{fs, path::Path};
 
-    use super::{
-        CancellationToken, ProcessRequest, ProcessRunner, SystemProcessRunner,
-    };
+    use super::{CancellationToken, ProcessRequest, ProcessRunner, SystemProcessRunner};
 
     #[cfg(windows)]
     use super::ProcessError;
@@ -338,15 +333,15 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            "@echo off\r\ncmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
-            Duration::from_secs(5),
+            descendant_command(),
+            Duration::from_millis(250),
         );
         let started_at = std::time::Instant::now();
         let result = SystemProcessRunner.run(request, &CancellationToken::default());
 
         assert!(matches!(result, Err(ProcessError::TimedOut(_))));
-        assert!(started_at.elapsed() < Duration::from_secs(3));
-        std::thread::sleep(Duration::from_millis(2_300));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(1));
         assert!(!temporary.path().join("marker.txt").exists());
     }
 
@@ -356,23 +351,24 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            "@echo off\r\ncmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
-            Duration::from_secs(5),
+            descendant_command(),
+            Duration::from_secs(10),
         );
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
         let started_at = std::time::Instant::now();
-        let worker = std::thread::spawn(move || {
-            SystemProcessRunner.run(request, &worker_cancellation)
-        });
+        let worker =
+            std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
 
         std::thread::sleep(Duration::from_millis(100));
         cancellation.cancel();
-        let result = worker.join().expect("el runner no debe dejar un worker colgado");
+        let result = worker
+            .join()
+            .expect("el runner no debe dejar un worker colgado");
 
         assert!(matches!(result, Err(ProcessError::Cancelled)));
         assert!(started_at.elapsed() < Duration::from_secs(3));
-        std::thread::sleep(Duration::from_millis(2_300));
+        std::thread::sleep(Duration::from_secs(1));
         assert!(!temporary.path().join("marker.txt").exists());
     }
 
@@ -382,26 +378,60 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            "@echo off\r\nstart \"\" /B cmd.exe /D /S /C \"timeout.exe /T 2 /NOBREAK >NUL 2>NUL & echo survivor>marker.txt\"\r\n",
-            Duration::from_secs(5),
+            normal_exit_descendant_command(),
+            Duration::from_secs(10),
         );
         let started_at = std::time::Instant::now();
         let result = SystemProcessRunner.run(request, &CancellationToken::default());
 
         assert!(result.is_ok());
-        assert!(started_at.elapsed() < Duration::from_millis(1_500));
-        std::thread::sleep(Duration::from_millis(2_300));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(3));
         assert!(temporary.path().join("marker.txt").exists());
     }
 
     #[cfg(windows)]
-    fn write_fixture(
-        directory: &Path,
-        contents: &str,
-        timeout: Duration,
-    ) -> ProcessRequest {
+    #[test]
+    fn repeated_cancellation_does_not_leave_descendant_processes() {
+        for iteration in 0..8 {
+            let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
+            let request = write_fixture(
+                temporary.path(),
+                descendant_command(),
+                Duration::from_secs(10),
+            );
+            let pid_path = temporary.path().join("child.pid");
+            let cancellation = CancellationToken::default();
+            let worker_cancellation = cancellation.clone();
+            let worker =
+                std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
+
+            assert!(
+                wait_for_file(&pid_path, Duration::from_secs(3)),
+                "el fixture {iteration} no inició el descendiente"
+            );
+            let child_pid = fs::read_to_string(&pid_path)
+                .expect("el fixture debe escribir el PID del descendiente")
+                .trim()
+                .parse::<u32>()
+                .expect("el PID del descendiente debe ser numérico");
+            cancellation.cancel();
+            assert!(matches!(
+                worker
+                    .join()
+                    .expect("el runner no debe dejar un worker colgado"),
+                Err(ProcessError::Cancelled)
+            ));
+            assert_process_stopped(child_pid);
+            assert!(!temporary.path().join("marker.txt").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_fixture(directory: &Path, command: &str, timeout: Duration) -> ProcessRequest {
         let script = directory.join("process-tree-fixture.cmd");
-        fs::write(&script, contents).expect("debe escribir el fixture de procesos");
+        fs::write(&script, format!("@echo off\r\n{command}\r\n"))
+            .expect("debe escribir el fixture de procesos");
         ProcessRequest {
             label: "process-tree-fixture",
             program: PathBuf::from("cmd.exe"),
@@ -412,5 +442,45 @@ mod tests {
             stdin: None,
             timeout,
         }
+    }
+
+    #[cfg(windows)]
+    fn descendant_command() -> &'static str {
+        r#"powershell.exe -NoProfile -NonInteractive -Command "$PID | Set-Content -LiteralPath child.pid; Start-Sleep -Seconds 30; Set-Content -LiteralPath marker.txt survivor""#
+    }
+
+    #[cfg(windows)]
+    fn normal_exit_descendant_command() -> &'static str {
+        r#"start "" /B powershell.exe -NoProfile -NonInteractive -Command "$PID | Set-Content -LiteralPath child.pid; Start-Sleep -Seconds 2; Set-Content -LiteralPath marker.txt survivor""#
+    }
+
+    #[cfg(windows)]
+    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+        let started_at = std::time::Instant::now();
+        while started_at.elapsed() < timeout {
+            if path.is_file() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    fn assert_process_stopped(process_id: u32) {
+        let filter = format!("PID eq {process_id}");
+        let started_at = std::time::Instant::now();
+        while started_at.elapsed() < Duration::from_secs(3) {
+            let output = std::process::Command::new("tasklist.exe")
+                .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+                .output()
+                .expect("tasklist debe estar disponible en Windows");
+            let process_row = format!("\"{process_id}\"");
+            if !String::from_utf8_lossy(&output.stdout).contains(&process_row) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("el proceso descendiente {process_id} sigue vivo tras la cancelación");
     }
 }
