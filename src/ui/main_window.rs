@@ -133,6 +133,8 @@ pub struct MainWindow {
     generation_requests: HashMap<RepositoryId, CommitMessageRequest>,
     next_generation_request_id: u64,
     repository_watchers: HashMap<RepositoryId, RepositoryWatcher>,
+    pending_refreshes: HashSet<RepositoryId>,
+    global_refresh_in_flight: Option<RepositoryId>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
     change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
     save_generation: u64,
@@ -167,6 +169,8 @@ impl MainWindow {
             generation_requests: HashMap::new(),
             next_generation_request_id: 0,
             repository_watchers: HashMap::new(),
+            pending_refreshes: HashSet::new(),
+            global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
             save_generation: 0,
@@ -185,15 +189,7 @@ impl MainWindow {
             let Some(repository_id) = this.state.active_repository_id else {
                 return;
             };
-            let can_refresh = this
-                .state
-                .repositories
-                .iter()
-                .find(|repository| repository.id == repository_id)
-                .is_some_and(RepositorySession::can_refresh);
-            if can_refresh {
-                this.refresh_repository(repository_id, cx);
-            }
+            this.force_refresh_repository(repository_id, cx);
         });
         self.window_subscriptions.push(activation_subscription);
 
@@ -244,7 +240,11 @@ impl MainWindow {
                         this.cursor_client = CursorClient::new(cursor_executable);
                         for repository_id in restored_ids {
                             this.create_commit_input(repository_id, cx);
-                            this.refresh_repository(repository_id, cx);
+                            if this.state.active_repository_id == Some(repository_id) {
+                                this.refresh_repository(repository_id, cx);
+                            } else {
+                                this.pending_refreshes.insert(repository_id);
+                            }
                         }
                         this.save_state(cx);
                         this.global_status_message = "Sesión restaurada".to_owned();
@@ -442,6 +442,10 @@ impl MainWindow {
         self.generation_requests.remove(&repository_id);
         self.selected_commit_details.remove(&repository_id);
         self.repository_watchers.remove(&repository_id);
+        self.pending_refreshes.remove(&repository_id);
+        if self.global_refresh_in_flight == Some(repository_id) {
+            self.global_refresh_in_flight = None;
+        }
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
         self.change_rows.remove(&repository_id);
         if was_active {
@@ -455,6 +459,10 @@ impl MainWindow {
                         .and_then(|index| self.state.repositories.get(index))
                 })
                 .map(|repository| repository.id);
+            if let Some(active_id) = self.state.active_repository_id {
+                self.pending_refreshes.insert(active_id);
+                self.refresh_repository(active_id, cx);
+            }
         }
         self.global_status_message = "Pestaña cerrada".to_owned();
         self.save_state(cx);
@@ -492,7 +500,11 @@ impl MainWindow {
         let next = (current.cast_signed() + direction)
             .rem_euclid(count)
             .cast_unsigned();
-        self.state.active_repository_id = Some(self.state.repositories[next].id);
+        let repository_id = self.state.repositories[next].id;
+        self.state.active_repository_id = Some(repository_id);
+        if self.pending_refreshes.contains(&repository_id) {
+            self.force_refresh_repository(repository_id, cx);
+        }
         self.save_state(cx);
         cx.notify();
     }
@@ -564,9 +576,17 @@ impl MainWindow {
                     this.ensure_watcher(repository_id, cx);
                 }
                 if outcome.continuation == RefreshContinuation::Repeat {
-                    this.refresh_repository(repository_id, cx);
+                    this.pending_refreshes.insert(repository_id);
                 }
-                if outcome.reload_history && outcome.continuation == RefreshContinuation::Complete {
+                let next_refresh = this
+                    .state
+                    .active_repository_id
+                    .filter(|active_id| this.pending_refreshes.contains(active_id));
+                if let Some(next_refresh) = next_refresh {
+                    this.refresh_repository(next_refresh, cx);
+                } else if outcome.reload_history
+                    && outcome.continuation == RefreshContinuation::Complete
+                {
                     this.ensure_history_loaded(repository_id, cx);
                 }
                 if outcome.should_notify {
@@ -579,6 +599,13 @@ impl MainWindow {
     }
 
     fn prepare_refresh(&mut self, repository_id: RepositoryId) -> Option<PreparedRefresh> {
+        if self
+            .global_refresh_in_flight
+            .is_some_and(|in_flight| in_flight != repository_id)
+        {
+            self.pending_refreshes.insert(repository_id);
+            return None;
+        }
         let repository = self
             .state
             .repositories
@@ -586,11 +613,15 @@ impl MainWindow {
             .find(|repository| repository.id == repository_id)?;
         if repository.is_refreshing() || repository.is_mutating() {
             repository.refresh_coordinator.mark_dirty();
+            self.pending_refreshes.insert(repository_id);
             return None;
         }
         if !repository.refresh_coordinator.request() {
+            self.pending_refreshes.insert(repository_id);
             return None;
         }
+        self.pending_refreshes.remove(&repository_id);
+        self.global_refresh_in_flight = Some(repository_id);
         repository.refresh_generation = repository.refresh_generation.saturating_add(1);
         let generation = repository.refresh_generation;
         repository.refresh_state = RefreshState::Running { generation };
@@ -628,6 +659,7 @@ impl MainWindow {
             return;
         };
         let directory_client = self.git_client.clone();
+        let common_directory_client = self.git_client.clone();
         let ignored_paths_client = self.git_client.clone();
         cx.spawn(async move |this, cx| {
             let git_directory_task =
@@ -637,6 +669,13 @@ impl MainWindow {
                         directory_client.git_directory(&root_path, &CancellationToken::default())
                     }
                 });
+            let common_git_directory_task = cx.background_spawn({
+                let root_path = root_path.clone();
+                async move {
+                    common_directory_client
+                        .git_common_directory(&root_path, &CancellationToken::default())
+                }
+            });
             let ignored_paths_task = cx.background_spawn({
                 let root_path = root_path.clone();
                 async move {
@@ -644,6 +683,7 @@ impl MainWindow {
                 }
             });
             let git_directory_result = git_directory_task.await;
+            let common_git_directory = common_git_directory_task.await.ok();
             let ignored_paths = ignored_paths_task.await.unwrap_or_default();
             let Ok(git_directory) = git_directory_result else {
                 return;
@@ -652,6 +692,7 @@ impl MainWindow {
             let watcher_result = RepositoryWatcher::start(
                 &root_path,
                 &git_directory,
+                common_git_directory.as_deref(),
                 ignored_paths,
                 Arc::new(move |change| {
                     let _ = sender.try_send(change);
@@ -685,9 +726,30 @@ impl MainWindow {
                             this.git_client.invalidate_branches(&root_path);
                             this.invalidate_history(repository_id);
                         }
-                        if change.ignore_rules_changed {
+                        if change.refresh_ignored_paths() || change.watcher_error {
                             this.repository_watchers.remove(&repository_id);
+                        }
+                        if change.watcher_error {
+                            this.pending_refreshes.insert(repository_id);
+                            if let Some(repository) = this
+                                .state
+                                .repositories
+                                .iter_mut()
+                                .find(|repository| repository.id == repository_id)
+                            {
+                                repository.status_message =
+                                    "Watcher detenido; pulsa F5 para reconciliar".to_owned();
+                                repository.error = Some(
+                                    "La vigilancia falló; el estado visible se conserva y se intentará recuperar tras el próximo refresh."
+                                        .to_owned(),
+                                );
+                            }
+                        } else if change.refresh_ignored_paths() {
                             this.ensure_watcher(repository_id, cx);
+                        }
+                        if this.state.active_repository_id != Some(repository_id) {
+                            this.pending_refreshes.insert(repository_id);
+                            return true;
                         }
                         this.refresh_repository(repository_id, cx);
                         true
@@ -715,6 +777,9 @@ impl MainWindow {
         history_included: bool,
         result: Result<RepositorySnapshot, GitError>,
     ) -> RefreshOutcome {
+        if self.global_refresh_in_flight == Some(repository_id) {
+            self.global_refresh_in_flight = None;
+        }
         let Some(repository) = self
             .state
             .repositories
@@ -1961,6 +2026,9 @@ impl MainWindow {
 
     fn select_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
         self.state.active_repository_id = Some(repository_id);
+        if self.pending_refreshes.contains(&repository_id) {
+            self.force_refresh_repository(repository_id, cx);
+        }
         self.save_state(cx);
         cx.notify();
     }
@@ -3367,6 +3435,8 @@ mod tests {
             generation_requests: HashMap::new(),
             next_generation_request_id: 0,
             repository_watchers: HashMap::new(),
+            pending_refreshes: HashSet::new(),
+            global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
             save_generation: 0,
@@ -3583,6 +3653,32 @@ mod tests {
             Some(("deadbeef".to_owned(), "deadbeef".to_owned()))
         );
         assert_eq!(history_target_for_head(&HeadState::Unborn), None);
+    }
+
+    #[test]
+    fn active_repository_waits_for_the_single_global_refresh_slot() {
+        let first = RepositorySession::new(PathBuf::from("first"));
+        let second = RepositorySession::new(PathBuf::from("second"));
+        let first_id = first.id;
+        let second_id = second.id;
+        let mut window = test_window(GitClient::default(), vec![first, second]);
+
+        let first_refresh = window.prepare_refresh(first_id).unwrap();
+        window.state.active_repository_id = Some(second_id);
+        assert!(window.prepare_refresh(second_id).is_none());
+        assert!(window.pending_refreshes.contains(&second_id));
+
+        window.finish_refresh(
+            first_id,
+            first_refresh.generation,
+            first_refresh.include_history,
+            Ok(RepositorySnapshot::default()),
+        );
+        let second_refresh = window.prepare_refresh(second_id).unwrap();
+
+        assert_eq!(window.global_refresh_in_flight, Some(second_id));
+        assert!(!window.pending_refreshes.contains(&second_id));
+        assert!(second_refresh.generation > 0);
     }
 
     #[test]

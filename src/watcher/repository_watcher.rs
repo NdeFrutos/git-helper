@@ -9,25 +9,43 @@ use std::{
     time::{Duration, Instant},
 };
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tracing::warn;
 
-const DEBOUNCE_DURATION: Duration = Duration::from_millis(250);
+pub(crate) const DEBOUNCE_DURATION: Duration = Duration::from_millis(250);
+pub(crate) const MAX_DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
+const EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Efectos de una ráfaga de cambios que la UI debe invalidar.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepositoryChange {
     pub git_config_changed: bool,
     pub history_changed: bool,
-    pub ignore_rules_changed: bool,
+    ignore_paths_change: IgnorePathsChange,
+    pub watcher_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+enum IgnorePathsChange {
+    #[default]
+    None,
+    DirectoryCreated,
+    RulesChanged,
 }
 
 impl RepositoryChange {
     fn merge(&mut self, other: Self) {
         self.git_config_changed |= other.git_config_changed;
         self.history_changed |= other.history_changed;
-        self.ignore_rules_changed |= other.ignore_rules_changed;
+        self.ignore_paths_change = self.ignore_paths_change.max(other.ignore_paths_change);
+        self.watcher_error |= other.watcher_error;
+    }
+
+    /// Indica que el filtro de ignorados debe reconstruirse al terminar el lote.
+    #[must_use]
+    pub const fn refresh_ignored_paths(self) -> bool {
+        !matches!(self.ignore_paths_change, IgnorePathsChange::None)
     }
 }
 
@@ -72,29 +90,36 @@ enum WorkerMessage {
 /// Mantiene vivos el watcher y su worker de debounce.
 pub struct RepositoryWatcher {
     _watcher: RecommendedWatcher,
-    worker_sender: mpsc::Sender<WorkerMessage>,
+    worker_sender: mpsc::SyncSender<WorkerMessage>,
     stopping: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl RepositoryWatcher {
     /// Vigila el working tree y el git-dir real; agrupa ráfagas antes de notificar.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "la configuración y el worker forman una única operación de inicio del watcher"
+    )]
     pub fn start(
         repository_root: &Path,
         git_directory: &Path,
+        common_git_directory: Option<&Path>,
         ignored_paths: Vec<PathBuf>,
         on_refresh_requested: Arc<dyn Fn(RepositoryChange) + Send + Sync>,
     ) -> Result<Self, WatcherError> {
-        let (worker_sender, worker_receiver) = mpsc::channel();
+        let (worker_sender, worker_receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let event_sender = worker_sender.clone();
         let stopping = Arc::new(AtomicBool::new(false));
+        let overflowed = Arc::new(AtomicBool::new(false));
         let callback_stopping = Arc::clone(&stopping);
+        let callback_overflowed = Arc::clone(&overflowed);
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
             if callback_stopping.load(Ordering::Acquire) {
                 return;
             }
-            if let Err(send_error) = event_sender.send(WorkerMessage::Event(result)) {
-                warn!(error = %send_error, "No se pudo reenviar un evento del watcher");
+            if event_sender.try_send(WorkerMessage::Event(result)).is_err() {
+                callback_overflowed.store(true, Ordering::Release);
             }
         })
         .map_err(WatcherError::Create)?;
@@ -113,34 +138,66 @@ impl RepositoryWatcher {
                     source,
                 })?;
         }
+        if let Some(common_git_directory) = common_git_directory
+            && common_git_directory != git_directory
+            && !common_git_directory.starts_with(repository_root)
+        {
+            watcher
+                .watch(common_git_directory, RecursiveMode::Recursive)
+                .map_err(|source| WatcherError::Watch {
+                    path: common_git_directory.to_path_buf(),
+                    source,
+                })?;
+        }
 
         let repository_root = repository_root.to_path_buf();
         let git_directory = git_directory.to_path_buf();
+        let common_git_directory = common_git_directory.map(Path::to_path_buf);
         let worker_stopping = Arc::clone(&stopping);
         let worker = thread::spawn(move || {
-            let mut pending: Option<(Instant, RepositoryChange)> = None;
+            let mut pending: Option<(Instant, Instant, RepositoryChange)> = None;
             loop {
-                let timeout = pending.map_or(Duration::from_mins(1), |(started, _)| {
-                    DEBOUNCE_DURATION.saturating_sub(started.elapsed())
-                });
+                if overflowed.swap(false, Ordering::AcqRel) {
+                    let now = Instant::now();
+                    pending = Some((now, now, RepositoryChange::default()));
+                }
+                let timeout =
+                    pending.map_or(Duration::from_mins(1), |(first_seen, last_seen, _)| {
+                        DEBOUNCE_DURATION
+                            .saturating_sub(last_seen.elapsed())
+                            .min(MAX_DEBOUNCE_DURATION.saturating_sub(first_seen.elapsed()))
+                    });
                 match worker_receiver.recv_timeout(timeout) {
                     Ok(WorkerMessage::Event(_)) if worker_stopping.load(Ordering::Acquire) => break,
                     Ok(WorkerMessage::Event(Ok(event))) => {
-                        if let Some(change) =
-                            classify_event(&event, &repository_root, &git_directory, &ignored_paths)
-                        {
-                            let accumulated = pending.map_or(change, |(_, mut accumulated)| {
-                                accumulated.merge(change);
-                                accumulated
-                            });
-                            pending = Some((Instant::now(), accumulated));
+                        if let Some(change) = classify_event(
+                            &event,
+                            &repository_root,
+                            &git_directory,
+                            common_git_directory.as_deref(),
+                            &ignored_paths,
+                        ) {
+                            let now = Instant::now();
+                            let (first_seen, mut accumulated) = pending.map_or(
+                                (now, RepositoryChange::default()),
+                                |(first_seen, _, accumulated)| (first_seen, accumulated),
+                            );
+                            accumulated.merge(change);
+                            pending = Some((first_seen, now, accumulated));
                         }
                     }
                     Ok(WorkerMessage::Event(Err(watcher_error))) => {
                         warn!(error = %watcher_error, "El watcher notificó un error");
+                        let now = Instant::now();
+                        let (first_seen, mut accumulated) = pending.map_or(
+                            (now, RepositoryChange::default()),
+                            |(first_seen, _, accumulated)| (first_seen, accumulated),
+                        );
+                        accumulated.watcher_error = true;
+                        pending = Some((first_seen, now, accumulated));
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Some((_, change)) = pending.take() {
+                        if let Some((_, _, change)) = pending.take() {
                             on_refresh_requested(change);
                         }
                     }
@@ -174,15 +231,34 @@ fn classify_event(
     event: &Event,
     repository_root: &Path,
     git_directory: &Path,
+    common_git_directory: Option<&Path>,
     ignored_paths: &[PathBuf],
 ) -> Option<RepositoryChange> {
     let mut result: Option<RepositoryChange> = None;
     for path in &event.paths {
-        if let Some(change) = classify_path(path, repository_root, git_directory, ignored_paths) {
+        if let Some(change) = classify_path(
+            path,
+            repository_root,
+            git_directory,
+            common_git_directory,
+            ignored_paths,
+        ) {
             result
                 .get_or_insert_with(RepositoryChange::default)
                 .merge(change);
         }
+    }
+    if matches!(event.kind, EventKind::Create(_))
+        && event.paths.iter().any(|path| {
+            path.starts_with(repository_root)
+                && !path.starts_with(git_directory)
+                && common_git_directory.is_none_or(|directory| !path.starts_with(directory))
+                && path.is_dir()
+        })
+    {
+        result
+            .get_or_insert_with(RepositoryChange::default)
+            .ignore_paths_change = IgnorePathsChange::DirectoryCreated;
     }
     result
 }
@@ -191,9 +267,14 @@ fn classify_path(
     path: &Path,
     repository_root: &Path,
     git_directory: &Path,
+    common_git_directory: Option<&Path>,
     ignored_paths: &[PathBuf],
 ) -> Option<RepositoryChange> {
-    if let Ok(relative) = path.strip_prefix(git_directory) {
+    let git_relative = path
+        .strip_prefix(git_directory)
+        .ok()
+        .or_else(|| common_git_directory.and_then(|directory| path.strip_prefix(directory).ok()));
+    if let Some(relative) = git_relative {
         let is_exact = |candidate: &str| relative == Path::new(candidate);
         if is_exact("config") {
             return Some(RepositoryChange {
@@ -203,7 +284,7 @@ fn classify_path(
         }
         if is_exact("info/exclude") {
             return Some(RepositoryChange {
-                ignore_rules_changed: true,
+                ignore_paths_change: IgnorePathsChange::RulesChanged,
                 ..RepositoryChange::default()
             });
         }
@@ -234,16 +315,23 @@ fn classify_path(
         .file_name()
         .is_some_and(|file_name| file_name == ".gitignore");
     Some(RepositoryChange {
-        ignore_rules_changed,
+        ignore_paths_change: if ignore_rules_changed {
+            IgnorePathsChange::RulesChanged
+        } else {
+            IgnorePathsChange::None
+        },
         ..RepositoryChange::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
-    use super::{GenerationGate, classify_path};
+    use notify::{Event, EventKind, event::CreateKind};
+    use tempfile::tempdir;
+
+    use super::{GenerationGate, classify_event, classify_path};
 
     #[test]
     fn rejects_stale_generations() {
@@ -261,10 +349,21 @@ mod tests {
         let git = root.join(".git");
         let ignored = vec![root.join("target")];
 
-        assert!(classify_path(&git.join("objects/aa/object"), root, &git, &ignored).is_none());
-        assert!(classify_path(&root.join("target/debug/app.exe"), root, &git, &ignored).is_none());
-        assert!(classify_path(&git.join("index"), root, &git, &ignored).is_some());
-        assert!(classify_path(&root.join("src/lib.rs"), root, &git, &ignored).is_some());
+        assert!(
+            classify_path(&git.join("objects/aa/object"), root, &git, None, &ignored).is_none()
+        );
+        assert!(
+            classify_path(
+                &root.join("target/debug/app.exe"),
+                root,
+                &git,
+                None,
+                &ignored
+            )
+            .is_none()
+        );
+        assert!(classify_path(&git.join("index"), root, &git, None, &ignored).is_some());
+        assert!(classify_path(&root.join("src/lib.rs"), root, &git, None, &ignored).is_some());
     }
 
     #[test]
@@ -272,12 +371,27 @@ mod tests {
         let root = Path::new(r"C:\repo");
         let git = root.join(".git");
 
-        let config = classify_path(&git.join("config"), root, &git, &[]).unwrap();
-        let history = classify_path(&git.join("refs/heads/main"), root, &git, &[]).unwrap();
-        let ignores = classify_path(&root.join(".gitignore"), root, &git, &[]).unwrap();
+        let config = classify_path(&git.join("config"), root, &git, None, &[]).unwrap();
+        let history = classify_path(&git.join("refs/heads/main"), root, &git, None, &[]).unwrap();
+        let ignores = classify_path(&root.join(".gitignore"), root, &git, None, &[]).unwrap();
 
         assert!(config.git_config_changed);
         assert!(history.history_changed);
-        assert!(ignores.ignore_rules_changed);
+        assert!(ignores.refresh_ignored_paths());
+    }
+
+    #[test]
+    fn newly_created_directory_requests_ignored_path_reconciliation() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        let git = root.join(".git");
+        let generated = root.join("build");
+        fs::create_dir_all(&git).unwrap();
+        fs::create_dir_all(&generated).unwrap();
+        let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(generated);
+
+        let change = classify_event(&event, root, &git, None, &[]).unwrap();
+
+        assert!(change.refresh_ignored_paths());
     }
 }

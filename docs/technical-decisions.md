@@ -66,6 +66,26 @@ aunque no cambien sus nombres ni el número de archivos; los cambios exclusivame
 invalidan. Las respuestas obsoletas, canceladas o de pestañas cerradas se descartan sin tocar el
 texto actual. La generación solo propone texto: nunca hace stage ni commit.
 
+## Watcher y prioridad de refresco
+
+El watcher mantiene una cola acotada de 256 eventos. Una ráfaga se agrupa con un debounce trailing
+de 250 ms y una espera máxima de 2 s desde el primer evento; si la cola se desborda, se solicita
+una reconciliación completa en lugar de intentar conservar cada evento individual. Esto evita que
+un árbol generado por una compilación haga crecer la memoria o posponga indefinidamente la
+actualización.
+
+Solo el repositorio visible se refresca automáticamente. Las pestañas inactivas conservan una
+marca de actualización pendiente y se reconcilian al seleccionarlas, evitando que diez
+repositorios compitan por procesos Git mientras el usuario trabaja en uno. Al recuperar el foco se
+fuerza la misma reconciliación del repositorio activo.
+
+Se observan el working tree, el git-dir de la sesión y el git-common-dir cuando el repositorio es un
+worktree vinculado. Las reglas ignoradas se vuelven a consultar al cambiar `.gitignore` o
+`.git/info/exclude` y al aparecer un directorio nuevo: como máximo el primer lote atraviesa el
+filtro y el watcher se reconstruye con las rutas ignoradas actuales, sin ejecutar Git por evento.
+Si notify comunica un error, la UI conserva el estado visible, retira el watcher fallido y deja F5
+como recuperación explícita; un refresh correcto vuelve a instalar la vigilancia.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
