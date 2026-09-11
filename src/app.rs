@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::OnceLock};
 
+use async_channel::unbounded;
 use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -11,16 +12,31 @@ use crate::{
         NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
         ShowHistory,
     },
+    cli::InstanceServer,
     ui::{CommitInput, MainWindow},
 };
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
+/// Configuración de arranque de la aplicación gráfica.
+#[derive(Clone, Debug, Default)]
+pub struct AppStartup {
+    /// Repositorio que debe abrirse al iniciar, si se invocó desde la CLI.
+    pub open_repository: Option<PathBuf>,
+}
+
 /// Inicia la aplicación y crea su ventana principal.
-pub fn run() {
+pub fn run(startup: AppStartup) {
     initialize_logging();
 
-    gpui_platform::application().run(|cx: &mut App| {
+    let (instance_sender, instance_receiver) = unbounded();
+    let _instance_server = InstanceServer::start(instance_sender)
+        .inspect_err(
+            |error| error!(error = %error, "No se pudo iniciar el servidor de instancia única"),
+        )
+        .ok();
+
+    gpui_platform::application().run(move |cx: &mut App| {
         CommitInput::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenRepository, Some("GitHelper")),
@@ -40,7 +56,7 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(MainWindow::new),
+            |_, cx| cx.new(|cx| MainWindow::new(startup.clone(), instance_receiver.clone(), cx)),
         );
 
         match window_result {

@@ -13,8 +13,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, MutationState, RefreshCoordinator, RefreshState, RepositoryId,
-    RepositorySession, RepositorySnapshot, RepositoryView, SshCloneMapping,
+    AppSettings, AppState, ChangeCounters, HistorySnapshot, MutationState, RefreshCoordinator,
+    RefreshState, RepositoryId, RepositorySession, RepositoryView, SshCloneMapping,
+    WorkingTreeSnapshot,
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -100,7 +101,9 @@ impl PersistedAppState {
             .map(|repository| RepositorySession {
                 id: repository.id,
                 root_path: repository.root_path,
-                snapshot: Arc::new(RepositorySnapshot::default()),
+                working_tree: Arc::new(WorkingTreeSnapshot::default()),
+                history: Arc::new(HistorySnapshot::empty()),
+                change_counters: ChangeCounters::default(),
                 selected_view: repository.selected_view,
                 selected_change: None,
                 selected_commit: None,

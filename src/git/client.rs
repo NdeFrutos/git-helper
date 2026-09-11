@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     domain::{
-        BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage, Remote,
-        RemoteOperationPlan, RepositorySnapshot,
+        BranchKind, BranchReference, BranchUpstream, CommitDetails, HeadState, HistoryPage,
+        HistorySnapshot, Remote, RemoteOperationPlan, WorkingTreeSnapshot,
     },
     process::{
         CancellationToken, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
@@ -148,7 +148,7 @@ impl GitClient {
         &self,
         repository_root: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<RepositorySnapshot, GitError> {
+    ) -> Result<WorkingTreeSnapshot, GitError> {
         let (status, remotes, branches) = thread::scope(|scope| {
             let remotes_worker = scope.spawn(|| self.remotes(repository_root, cancellation));
             let branches_worker = scope.spawn(|| self.branch_refs(repository_root, cancellation));
@@ -168,41 +168,56 @@ impl GitClient {
         let upstream = resolve_upstream(&status, &remotes);
         let branches = mark_active_branch(branches, &status.head);
 
-        Ok(RepositorySnapshot {
+        Ok(WorkingTreeSnapshot {
             head: status.head,
             upstream,
             remotes,
             branches,
             changes: status.changes,
-            commits: Vec::new(),
-            has_more_commits: false,
-            history_reference: None,
-            history_oid: None,
         })
     }
 
-    /// Lee el snapshot y una primera página de historial de forma concurrente.
+    /// Lee el working tree y una primera página de historial de forma concurrente.
     pub fn snapshot_with_history(
         &self,
         repository_root: &Path,
         history_limit: usize,
         cancellation: &CancellationToken,
-    ) -> Result<RepositorySnapshot, GitError> {
-        let mut snapshot = self.snapshot(repository_root, cancellation)?;
-        let page = match history_target(&snapshot.head) {
+    ) -> Result<(WorkingTreeSnapshot, HistorySnapshot), GitError> {
+        let working_tree = self.snapshot(repository_root, cancellation)?;
+        let history = self.history_page_as_snapshot(
+            repository_root,
+            &working_tree.head,
+            history_limit,
+            0,
+            cancellation,
+        )?;
+        Ok((working_tree, history))
+    }
+
+    /// Convierte una página de historial en el snapshot de historial de la sesión.
+    pub fn history_page_as_snapshot(
+        &self,
+        repository_root: &Path,
+        head: &HeadState,
+        history_limit: usize,
+        skip: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<HistorySnapshot, GitError> {
+        let page = match history_target(head) {
             Some((reference, oid)) if reference.starts_with("refs/") => self.history_for_oid(
                 repository_root,
                 &reference,
                 &oid,
                 history_limit + 1,
-                0,
+                skip,
                 cancellation,
             )?,
             Some((_, oid)) => self.history_for_revision(
                 repository_root,
                 &oid,
                 history_limit + 1,
-                0,
+                skip,
                 cancellation,
             )?,
             None => HistoryPage {
@@ -212,19 +227,19 @@ impl GitClient {
             },
         };
         let has_more_commits = page.commits.len() > history_limit;
-        let commits = page
-            .commits
-            .into_iter()
-            .take(history_limit)
-            .map(|commit| commit.summary)
-            .collect();
-        snapshot.history_reference = (!page.reference.is_empty()).then_some(page.reference);
-        snapshot.history_oid = (!page.oid.is_empty()).then_some(page.oid);
+        let commits = Arc::new(
+            page.commits
+                .into_iter()
+                .take(history_limit)
+                .map(|commit| commit.summary)
+                .collect(),
+        );
 
-        Ok(RepositorySnapshot {
+        Ok(HistorySnapshot {
             commits,
             has_more_commits,
-            ..snapshot
+            history_reference: (!page.reference.is_empty()).then_some(page.reference),
+            history_oid: (!page.oid.is_empty()).then_some(page.oid),
         })
     }
 
@@ -1379,16 +1394,14 @@ mod tests {
         let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
         let cancellation = CancellationToken::default();
 
-        let first = client
+        client
             .snapshot(Path::new("repo"), &cancellation)
             .expect("debe crear el primer snapshot");
-        let second = client
+        client
             .snapshot(Path::new("repo"), &cancellation)
             .expect("debe reutilizar la caché");
         let requests = runner.requests();
 
-        assert!(first.commits.is_empty());
-        assert!(second.commits.is_empty());
         assert_eq!(
             requests
                 .iter()

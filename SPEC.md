@@ -568,7 +568,7 @@ git rev-parse --abbrev-ref --symbolic-full-name @{upstream}
 
 Los datos que se puedan obtener desde `status --porcelain=v2 --branch` no se consultarán de nuevo innecesariamente. Los nombres de remote y branch se pasan como argumentos separados y nunca se aceptan como opciones: deben validarse y situarse después de `--` cuando el subcomando Git lo soporte.
 
-La cancelación termina el proceso hijo y sus pipes sin cerrar la aplicación. Se establecerá un timeout configurable y razonable para detectar procesos bloqueados, pero una operación remota activa no se considerará fallida solo por tardar varios segundos.
+La cancelación termina el proceso hijo y sus descendientes sin cerrar la aplicación. stdout, stderr y stdin se capturan mediante temporales anónimos para que un descendiente que herede handles no pueda bloquear la finalización del runner. En Windows se usa `taskkill.exe /PID <pid> /T /F`, sin shell y con `CREATE_NO_WINDOW`, con un límite de dos segundos para su propio cleanup. Si `taskkill.exe` no puede completar la operación se registra el fallo y se continúa con el hijo directo: solo se informa error de infraestructura cuando el proceso sigue vivo después de la espera acotada, para no convertir una cancelación normal en un fallo. Se establecerá un timeout configurable y razonable para detectar procesos bloqueados, pero una operación remota activa no se considerará fallida solo por tardar varios segundos.
 
 ### 6.5 Cliente de Cursor CLI
 

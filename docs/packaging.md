@@ -31,7 +31,7 @@ winget install --id WiXToolset.WiXToolset --exact
 
 El MSI resultante se crea en `target\wix`. Incluye:
 
-- `target\release\git-helper.exe`.
+- `target\release\git-helper.exe` y `target\release\ghelper.exe`.
 - `LICENSE`.
 - `THIRD_PARTY_NOTICES.md`.
 - Icono propio multirresolución `assets/icon.ico`, compartido por el ejecutable y el instalador.
