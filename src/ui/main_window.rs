@@ -604,8 +604,11 @@ impl MainWindow {
             this.update(cx, |this, cx| {
                 let outcome =
                     this.finish_refresh(repository_id, generation, include_history, result);
+                let needs_history_reload =
+                    outcome.reload_history && outcome.continuation == RefreshContinuation::Complete;
                 let selected_commit_to_reload = (outcome.succeeded
-                    && outcome.continuation == RefreshContinuation::Complete)
+                    && outcome.continuation == RefreshContinuation::Complete
+                    && !needs_history_reload)
                     .then(|| this.reconcile_selected_commit(repository_id))
                     .flatten();
                 if outcome.succeeded {
@@ -620,9 +623,7 @@ impl MainWindow {
                     .filter(|active_id| this.pending_refreshes.contains(active_id));
                 if let Some(next_refresh) = next_refresh {
                     this.refresh_repository(next_refresh, cx);
-                } else if outcome.reload_history
-                    && outcome.continuation == RefreshContinuation::Complete
-                {
+                } else if needs_history_reload {
                     this.ensure_history_loaded(repository_id, cx);
                 }
                 if let Some(commit_id) = selected_commit_to_reload {
@@ -827,106 +828,116 @@ impl MainWindow {
         if self.global_refresh_in_flight == Some(repository_id) {
             self.global_refresh_in_flight = None;
         }
-        let Some(repository) = self
-            .state
-            .repositories
-            .iter_mut()
-            .find(|repository| repository.id == repository_id)
-        else {
-            return RefreshOutcome::default();
-        };
-        if repository.refresh_generation != generation {
-            return RefreshOutcome::default();
-        }
         self.active_refresh_cancellations.remove(&repository_id);
-        let continuation = if repository.refresh_coordinator.finish() {
-            RefreshContinuation::Repeat
-        } else {
-            RefreshContinuation::Complete
+        let (outcome, invalidate_details) = {
+            let Some(repository) = self
+                .state
+                .repositories
+                .iter_mut()
+                .find(|repository| repository.id == repository_id)
+            else {
+                return RefreshOutcome::default();
+            };
+            if repository.refresh_generation != generation {
+                return RefreshOutcome::default();
+            }
+            let continuation = if repository.refresh_coordinator.finish() {
+                RefreshContinuation::Repeat
+            } else {
+                RefreshContinuation::Complete
+            };
+            let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
+            repository.history_invalidated_during_refresh = false;
+            match result {
+                Ok(mut snapshot) => {
+                    let history_changed = repository.snapshot.head != snapshot.head
+                        || repository.snapshot.upstream != snapshot.upstream;
+                    if history_included {
+                        repository.history_loaded = !history_invalidated_during_refresh;
+                        repository.history_loading = false;
+                    } else if history_changed || history_invalidated_during_refresh {
+                        repository.history_generation =
+                            repository.history_generation.saturating_add(1);
+                        repository.history_loaded = false;
+                        repository.history_loading = false;
+                        snapshot.commits.clone_from(&repository.snapshot.commits);
+                        snapshot.has_more_commits = repository.snapshot.has_more_commits;
+                        snapshot
+                            .history_reference
+                            .clone_from(&repository.snapshot.history_reference);
+                        snapshot
+                            .history_oid
+                            .clone_from(&repository.snapshot.history_oid);
+                    } else {
+                        snapshot.commits.clone_from(&repository.snapshot.commits);
+                        snapshot.has_more_commits = repository.snapshot.has_more_commits;
+                        snapshot
+                            .history_reference
+                            .clone_from(&repository.snapshot.history_reference);
+                        snapshot
+                            .history_oid
+                            .clone_from(&repository.snapshot.history_oid);
+                    }
+                    let snapshot_changed = *repository.snapshot != snapshot;
+                    if snapshot_changed {
+                        repository.snapshot = Arc::new(snapshot);
+                        self.change_rows.remove(&repository_id);
+                    }
+                    repository.refresh_state = RefreshState::Succeeded {
+                        message: "Estado actualizado".to_owned(),
+                    };
+                    repository.status_message = "Estado actualizado".to_owned();
+                    repository.error = None;
+                    (
+                        RefreshOutcome {
+                            succeeded: true,
+                            // El fin de la operación también es una transición visible si
+                            // Git devolvió exactamente el mismo snapshot.
+                            should_notify: true,
+                            reload_history: !repository.history_loaded
+                                && repository.selected_view == RepositoryView::History,
+                            continuation,
+                        },
+                        history_changed || history_invalidated_during_refresh,
+                    )
+                }
+                Err(error) => {
+                    let details = error.technical_details();
+                    if history_included {
+                        repository.history_loading = false;
+                    }
+                    let is_cancelled = is_cancelled_error(&error);
+                    repository.refresh_state = if is_cancelled {
+                        RefreshState::Cancelled {
+                            message: "Actualización cancelada".to_owned(),
+                        }
+                    } else {
+                        RefreshState::Failed {
+                            message: error.to_string(),
+                            details: details.clone(),
+                        }
+                    };
+                    repository.status_message = if is_cancelled {
+                        "Actualización cancelada".to_owned()
+                    } else {
+                        "Error al actualizar".to_owned()
+                    };
+                    repository.error = (!is_cancelled).then_some(details);
+                    (
+                        RefreshOutcome {
+                            should_notify: true,
+                            continuation,
+                            ..RefreshOutcome::default()
+                        },
+                        false,
+                    )
+                }
+            }
         };
-        let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
-        repository.history_invalidated_during_refresh = false;
-        match result {
-            Ok(mut snapshot) => {
-                let history_changed = repository.snapshot.head != snapshot.head
-                    || repository.snapshot.upstream != snapshot.upstream;
-                if history_included {
-                    repository.history_loaded = !history_invalidated_during_refresh;
-                    repository.history_loading = false;
-                } else if history_changed || history_invalidated_during_refresh {
-                    repository.history_generation = repository.history_generation.saturating_add(1);
-                    repository.history_loaded = false;
-                    repository.history_loading = false;
-                    snapshot.commits.clone_from(&repository.snapshot.commits);
-                    snapshot.has_more_commits = repository.snapshot.has_more_commits;
-                    snapshot
-                        .history_reference
-                        .clone_from(&repository.snapshot.history_reference);
-                    snapshot
-                        .history_oid
-                        .clone_from(&repository.snapshot.history_oid);
-                } else {
-                    snapshot.commits.clone_from(&repository.snapshot.commits);
-                    snapshot.has_more_commits = repository.snapshot.has_more_commits;
-                    snapshot
-                        .history_reference
-                        .clone_from(&repository.snapshot.history_reference);
-                    snapshot
-                        .history_oid
-                        .clone_from(&repository.snapshot.history_oid);
-                }
-                let snapshot_changed = *repository.snapshot != snapshot;
-                if snapshot_changed {
-                    repository.snapshot = Arc::new(snapshot);
-                    self.change_rows.remove(&repository_id);
-                }
-                repository.refresh_state = RefreshState::Succeeded {
-                    message: "Estado actualizado".to_owned(),
-                };
-                repository.status_message = "Estado actualizado".to_owned();
-                repository.error = None;
-                if history_changed {
-                    self.selected_commit_details.remove(&repository_id);
-                }
-                RefreshOutcome {
-                    succeeded: true,
-                    // El fin de la operación también es una transición visible si
-                    // Git devolvió exactamente el mismo snapshot.
-                    should_notify: true,
-                    reload_history: !repository.history_loaded
-                        && repository.selected_view == RepositoryView::History,
-                    continuation,
-                }
-            }
-            Err(error) => {
-                let details = error.technical_details();
-                if history_included {
-                    repository.history_loading = false;
-                }
-                let is_cancelled = is_cancelled_error(&error);
-                repository.refresh_state = if is_cancelled {
-                    RefreshState::Cancelled {
-                        message: "Actualización cancelada".to_owned(),
-                    }
-                } else {
-                    RefreshState::Failed {
-                        message: error.to_string(),
-                        details: details.clone(),
-                    }
-                };
-                repository.status_message = if is_cancelled {
-                    "Actualización cancelada".to_owned()
-                } else {
-                    "Error al actualizar".to_owned()
-                };
-                repository.error = (!is_cancelled).then_some(details);
-                RefreshOutcome {
-                    should_notify: true,
-                    continuation,
-                    ..RefreshOutcome::default()
-                }
-            }
+        if invalidate_details {
+            self.invalidate_history_details(repository_id);
         }
+        outcome
     }
 
     fn reconcile_selected_commit(&mut self, repository_id: RepositoryId) -> Option<String> {
@@ -948,7 +959,15 @@ impl MainWindow {
             // dejar la selección vacía; nunca se muestra un detalle ajeno al historial.
             repository.selected_commit = None;
             self.selected_commit_details.remove(&repository_id);
-            self.history_detail_errors.remove(&repository_id);
+            if repository.snapshot.has_more_commits {
+                self.history_detail_errors.insert(
+                    repository_id,
+                    "La selección quedó fuera de la primera página tras actualizar el historial; elige de nuevo el commit."
+                        .to_owned(),
+                );
+            } else {
+                self.history_detail_errors.remove(&repository_id);
+            }
             return None;
         }
         selected_commit.filter(|_| {
@@ -1063,6 +1082,9 @@ impl MainWindow {
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
                         repository.error = None;
+                        if let Some(commit_id) = this.reconcile_selected_commit(repository_id) {
+                            this.select_commit(repository_id, commit_id, cx);
+                        }
                     }
                     Ok(_) => {
                         repository.history_loaded = false;
@@ -2871,7 +2893,10 @@ impl MainWindow {
                             "No se pudieron cargar los detalles".to_owned();
                         this.clear_history_details_cancellation(repository_id, request.request_id);
                     }
-                    DetailsCompletion::Stale => return,
+                    DetailsCompletion::Stale => {
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
+                        return;
+                    }
                 }
                 cx.notify();
             })
@@ -3943,6 +3968,86 @@ mod tests {
 
         assert_eq!(window.reconcile_selected_commit(repository_id), None);
         assert!(window.state.repositories[0].selected_commit.is_none());
+    }
+
+    #[test]
+    fn refresh_clears_paginated_selection_with_explicit_fallback() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("deep".to_owned());
+        let snapshot = Arc::make_mut(&mut repository.snapshot);
+        snapshot.commits = vec![summary("recent")];
+        snapshot.has_more_commits = true;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(window.reconcile_selected_commit(repository_id), None);
+        assert!(window.state.repositories[0].selected_commit.is_none());
+        assert!(window.history_detail_errors.contains_key(&repository_id));
+    }
+
+    #[test]
+    fn head_change_during_details_load_cancels_active_request() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.history_loaded = true;
+        repository.refresh_generation = 1;
+        repository.selected_commit = Some("commit-a".to_owned());
+        Arc::make_mut(&mut repository.snapshot).head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: Some("old-oid".to_owned()),
+        };
+        Arc::make_mut(&mut repository.snapshot).commits = vec![summary("commit-a")];
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        let history_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "old-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        let request = match window
+            .history_details
+            .begin(repository_id, 1, history_key.clone())
+        {
+            BeginDetailsSelection::Loading(request) => request,
+            BeginDetailsSelection::Cached(_) => panic!("la prueba necesita una carga en curso"),
+        };
+        assert!(window.history_details.is_loading(repository_id));
+
+        let mut new_snapshot = (*window.state.repositories[0].snapshot).clone();
+        new_snapshot.head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: Some("new-oid".to_owned()),
+        };
+        new_snapshot.commits = vec![summary("commit-b")];
+        window.finish_refresh(repository_id, 1, false, Ok(new_snapshot));
+
+        assert!(!window.history_details.is_loading(repository_id));
+        let current_generation = window.state.repositories[0].history_generation;
+        let current_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "new-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        assert!(matches!(
+            window.history_details.complete(
+                &request,
+                Ok(CommitDetails {
+                    summary: summary("commit-a"),
+                    body: String::new(),
+                    committer_name: String::new(),
+                    committer_email: String::new(),
+                    committed_at: 0,
+                    parent_ids: Vec::new(),
+                }),
+                current_generation,
+                Some(&current_key),
+                Some("commit-a"),
+            ),
+            DetailsCompletion::Stale
+        ));
+        assert!(!window.history_details.is_loading(repository_id));
     }
 
     #[test]

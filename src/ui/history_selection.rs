@@ -132,6 +132,9 @@ impl HistoryDetailsController {
             && current_key == Some(&request.key)
             && selected_commit == Some(request.key.commit_id.as_str());
         if !is_current {
+            if self.active.get(&request.repository_id) == Some(request) {
+                self.active.remove(&request.repository_id);
+            }
             return DetailsCompletion::Stale;
         }
         self.active.remove(&request.repository_id);
@@ -247,7 +250,7 @@ mod tests {
             controller.complete(&request, Ok(details("a")), 5, Some(&current_key), Some("a")),
             DetailsCompletion::Stale
         ));
-        assert!(controller.is_loading(repository_id));
+        assert!(!controller.is_loading(repository_id));
     }
 
     #[test]
