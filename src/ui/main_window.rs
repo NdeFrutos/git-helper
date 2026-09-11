@@ -83,6 +83,21 @@ struct RefreshOutcome {
     succeeded: bool,
     should_notify: bool,
     reload_history: bool,
+    continuation: RefreshContinuation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RefreshContinuation {
+    #[default]
+    Complete,
+    Repeat,
+}
+
+struct PreparedRefresh {
+    generation: u64,
+    include_history: bool,
+    root_path: PathBuf,
+    cancellation: CancellationToken,
 }
 
 /// Modelo y presentación de la ventana principal.
@@ -490,32 +505,16 @@ impl MainWindow {
     }
 
     fn refresh_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
-        let Some(repository) = self
-            .state
-            .repositories
-            .iter_mut()
-            .find(|repository| repository.id == repository_id)
-        else {
+        let Some(refresh) = self.prepare_refresh(repository_id) else {
             return;
         };
-        repository.refresh_generation = repository.refresh_generation.saturating_add(1);
-        let generation = repository.refresh_generation;
-        repository.operation_state = OperationState::Running {
-            kind: OperationKind::Refresh,
+        let PreparedRefresh {
             generation,
-        };
-        let include_history =
-            repository.selected_view == RepositoryView::History && !repository.history_loaded;
-        if include_history {
-            repository.history_generation = repository.history_generation.saturating_add(1);
-            repository.history_loading = true;
-        }
-        let root_path = repository.root_path.clone();
+            include_history,
+            root_path,
+            cancellation,
+        } = refresh;
         let git_client = self.git_client.clone();
-        let cancellation = CancellationToken::default();
-        self.active_cancellations
-            .insert(repository_id, cancellation.clone());
-        self.status_message = "Actualizando estado…".to_owned();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -536,7 +535,10 @@ impl MainWindow {
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
-                if outcome.reload_history {
+                if outcome.continuation == RefreshContinuation::Repeat {
+                    this.refresh_repository(repository_id, cx);
+                }
+                if outcome.reload_history && outcome.continuation == RefreshContinuation::Complete {
                     this.ensure_history_loaded(repository_id, cx);
                 }
                 if outcome.should_notify {
@@ -546,6 +548,44 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    fn prepare_refresh(&mut self, repository_id: RepositoryId) -> Option<PreparedRefresh> {
+        let repository = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)?;
+        if matches!(repository.operation_state, OperationState::Running { .. }) {
+            repository.refresh_coordinator.mark_dirty();
+            return None;
+        }
+        if !repository.refresh_coordinator.request() {
+            return None;
+        }
+        repository.refresh_generation = repository.refresh_generation.saturating_add(1);
+        let generation = repository.refresh_generation;
+        repository.operation_state = OperationState::Running {
+            kind: OperationKind::Refresh,
+            generation,
+        };
+        let include_history =
+            repository.selected_view == RepositoryView::History && !repository.history_loaded;
+        if include_history {
+            repository.history_generation = repository.history_generation.saturating_add(1);
+            repository.history_loading = true;
+        }
+        let root_path = repository.root_path.clone();
+        let cancellation = CancellationToken::default();
+        self.active_cancellations
+            .insert(repository_id, cancellation.clone());
+        self.status_message = "Actualizando estado…".to_owned();
+        Some(PreparedRefresh {
+            generation,
+            include_history,
+            root_path,
+            cancellation,
+        })
     }
 
     fn ensure_watcher(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -594,17 +634,24 @@ impl MainWindow {
             let Ok(watcher) = watcher_result else {
                 return;
             };
-            if this
+            let installed = this
                 .update(cx, |this, _| {
+                    if !this.repository_session_is_open(repository_id) {
+                        return false;
+                    }
                     this.repository_watchers.insert(repository_id, watcher);
+                    true
                 })
-                .is_err()
-            {
+                .unwrap_or(false);
+            if !installed {
                 return;
             }
             while let Ok(change) = receiver.recv().await {
-                if this
+                let should_continue = this
                     .update(cx, |this, cx| {
+                        if !this.repository_session_is_open(repository_id) {
+                            return false;
+                        }
                         if change.git_config_changed {
                             this.git_client.invalidate_remotes(&root_path);
                         }
@@ -615,28 +662,23 @@ impl MainWindow {
                             this.repository_watchers.remove(&repository_id);
                             this.ensure_watcher(repository_id, cx);
                         }
-                        let can_refresh = this
-                            .state
-                            .repositories
-                            .iter()
-                            .find(|repository| repository.id == repository_id)
-                            .is_some_and(|repository| {
-                                !matches!(
-                                    repository.operation_state,
-                                    OperationState::Running { .. }
-                                )
-                            });
-                        if can_refresh {
-                            this.refresh_repository(repository_id, cx);
-                        }
+                        this.refresh_repository(repository_id, cx);
+                        true
                     })
-                    .is_err()
-                {
+                    .unwrap_or(false);
+                if !should_continue {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    fn repository_session_is_open(&self, repository_id: RepositoryId) -> bool {
+        self.state
+            .repositories
+            .iter()
+            .any(|repository| repository.id == repository_id)
     }
 
     fn finish_refresh(
@@ -658,14 +700,21 @@ impl MainWindow {
             return RefreshOutcome::default();
         }
         self.active_cancellations.remove(&repository_id);
+        let continuation = if repository.refresh_coordinator.finish() {
+            RefreshContinuation::Repeat
+        } else {
+            RefreshContinuation::Complete
+        };
+        let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
+        repository.history_invalidated_during_refresh = false;
         match result {
             Ok(mut snapshot) => {
                 let history_changed = repository.snapshot.head != snapshot.head
                     || repository.snapshot.upstream != snapshot.upstream;
                 if history_included {
-                    repository.history_loaded = true;
+                    repository.history_loaded = !history_invalidated_during_refresh;
                     repository.history_loading = false;
-                } else if history_changed {
+                } else if history_changed || history_invalidated_during_refresh {
                     repository.history_generation = repository.history_generation.saturating_add(1);
                     repository.history_loaded = false;
                     repository.history_loading = false;
@@ -692,6 +741,7 @@ impl MainWindow {
                     should_notify: snapshot_changed,
                     reload_history: !repository.history_loaded
                         && repository.selected_view == RepositoryView::History,
+                    continuation,
                 }
             }
             Err(error) => {
@@ -708,6 +758,7 @@ impl MainWindow {
                 self.global_error = Some(details);
                 RefreshOutcome {
                     should_notify: true,
+                    continuation,
                     ..RefreshOutcome::default()
                 }
             }
@@ -739,6 +790,9 @@ impl MainWindow {
         repository.history_generation = repository.history_generation.saturating_add(1);
         repository.history_loaded = false;
         repository.history_loading = false;
+        if repository.refresh_coordinator.in_flight() {
+            repository.history_invalidated_during_refresh = true;
+        }
         let snapshot = Arc::make_mut(&mut repository.snapshot);
         snapshot.commits.clear();
         snapshot.has_more_commits = false;
@@ -1192,6 +1246,7 @@ impl MainWindow {
         {
             repository.operation_state = OperationState::Idle;
         }
+        self.refresh_repository(repository_id, cx);
         cx.notify();
     }
 
@@ -1457,7 +1512,6 @@ impl MainWindow {
                         ) {
                             this.invalidate_history(repository_id);
                         }
-                        this.refresh_repository(repository_id, cx);
                     }
                     Err(error) => {
                         if let Some(repository) = this
@@ -1476,6 +1530,9 @@ impl MainWindow {
                         this.global_error = Some(error.technical_details());
                     }
                 }
+                // Reconciliar siempre: el estado real puede haber cambiado
+                // antes, durante o después de una operación fallida/cancelada.
+                this.refresh_repository(repository_id, cx);
                 cx.notify();
             })
             .ok();
@@ -2522,9 +2579,206 @@ fn tab_button(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        process::ExitStatus,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{Receiver, Sender, channel},
+        },
+        thread,
+    };
+
+    use crate::process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
 
     use super::*;
+
+    struct ControlledSnapshotRunner {
+        status_calls: AtomicUsize,
+        first_status_started: Sender<()>,
+        release_first_status: Mutex<Receiver<()>>,
+    }
+
+    impl ProcessRunner for ControlledSnapshotRunner {
+        fn run(
+            &self,
+            request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            let stdout = match request.label {
+                "git-status" => {
+                    let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        self.first_status_started.send(()).unwrap();
+                        self.release_first_status.lock().unwrap().recv().unwrap();
+                        b"# branch.oid old\0# branch.head main\0".to_vec()
+                    } else {
+                        b"# branch.oid new\0# branch.head main\0? changed.txt\0".to_vec()
+                    }
+                }
+                "git-remotes" => Vec::new(),
+                label => panic!("petición Git inesperada: {label}"),
+            };
+            Ok(ProcessOutput {
+                status: success_status(),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn test_window(git_client: GitClient, repositories: Vec<RepositorySession>) -> MainWindow {
+        MainWindow {
+            state: AppState {
+                active_repository_id: repositories.first().map(|repository| repository.id),
+                repositories,
+                ..AppState::default()
+            },
+            git_client,
+            cursor_client: CursorClient::new(PathBuf::from("agent")),
+            state_store: None,
+            commit_inputs: HashMap::new(),
+            selected_commit_details: HashMap::new(),
+            commit_input_subscriptions: HashMap::new(),
+            window_subscriptions: Vec::new(),
+            active_cancellations: HashMap::new(),
+            repository_watchers: HashMap::new(),
+            collapsed_groups: HashSet::new(),
+            change_rows: HashMap::new(),
+            save_generation: 0,
+            git_version: None,
+            status_message: String::new(),
+            global_error: None,
+        }
+    }
+
+    #[test]
+    fn refresh_invalidated_during_status_runs_one_follow_up_and_converges() {
+        let (started_sender, started_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        let runner = Arc::new(ControlledSnapshotRunner {
+            status_calls: AtomicUsize::new(0),
+            first_status_started: started_sender,
+            release_first_status: Mutex::new(release_receiver),
+        });
+        let git_client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(git_client.clone(), vec![repository]);
+
+        let first = window.prepare_refresh(repository_id).unwrap();
+        let first_generation = first.generation;
+        let first_include_history = first.include_history;
+        let first_snapshot =
+            thread::spawn(move || git_client.snapshot(&first.root_path, &first.cancellation));
+        started_receiver.recv().unwrap();
+
+        assert!(window.prepare_refresh(repository_id).is_none());
+        assert!(window.prepare_refresh(repository_id).is_none());
+        release_sender.send(()).unwrap();
+
+        let first_result = first_snapshot.join().unwrap();
+        let first_outcome = window.finish_refresh(
+            repository_id,
+            first_generation,
+            first_include_history,
+            first_result,
+        );
+        assert_eq!(first_outcome.continuation, RefreshContinuation::Repeat);
+
+        let follow_up = window.prepare_refresh(repository_id).unwrap();
+        let follow_up_result = window
+            .git_client
+            .snapshot(&follow_up.root_path, &follow_up.cancellation);
+        let follow_up_outcome = window.finish_refresh(
+            repository_id,
+            follow_up.generation,
+            follow_up.include_history,
+            follow_up_result,
+        );
+
+        assert_eq!(
+            follow_up_outcome.continuation,
+            RefreshContinuation::Complete
+        );
+        assert_eq!(runner.status_calls.load(Ordering::SeqCst), 2);
+        let repository = window
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        assert_eq!(
+            repository.snapshot.head,
+            HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("new".to_owned()),
+            }
+        );
+        assert_eq!(repository.snapshot.changes.len(), 1);
+    }
+
+    #[test]
+    fn closed_session_rejects_late_refresh_and_watcher_installation() {
+        let old_repository = RepositorySession::new(PathBuf::from("repo"));
+        let old_id = old_repository.id;
+        let mut window = test_window(GitClient::default(), vec![old_repository]);
+        let pending = window.prepare_refresh(old_id).unwrap();
+
+        window.state.repositories.clear();
+        let reopened_repository = RepositorySession::new(PathBuf::from("repo"));
+        let reopened_id = reopened_repository.id;
+        window.state.repositories.push(reopened_repository);
+
+        let outcome = window.finish_refresh(
+            old_id,
+            pending.generation,
+            pending.include_history,
+            Ok(RepositorySnapshot {
+                head: HeadState::Branch {
+                    name: "stale".to_owned(),
+                    oid: Some("old".to_owned()),
+                },
+                ..RepositorySnapshot::default()
+            }),
+        );
+
+        assert!(!outcome.succeeded);
+        assert!(!window.repository_session_is_open(old_id));
+        assert!(window.repository_session_is_open(reopened_id));
+        assert_eq!(
+            window.state.repositories[0].snapshot.head,
+            HeadState::Unborn
+        );
+    }
+
+    #[test]
+    fn invalidation_during_mutation_starts_reconciliation_after_failure() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].operation_state = OperationState::Running {
+            kind: OperationKind::Stage,
+            generation: 0,
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_none());
+        window.state.repositories[0].operation_state = OperationState::Failed {
+            kind: OperationKind::Stage,
+            message: "cancelada".to_owned(),
+            details: "cancelada".to_owned(),
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_some());
+        assert!(matches!(
+            window.state.repositories[0].operation_state,
+            OperationState::Running {
+                kind: OperationKind::Refresh,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn virtualized_change_rows_have_uniform_height() {
@@ -2560,5 +2814,19 @@ mod tests {
                 "las filas staged y worktree no pueden compartir el id de {action}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
     }
 }

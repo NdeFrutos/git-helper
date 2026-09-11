@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, OperationState, RepositoryId, RepositorySession, RepositorySnapshot,
-    RepositoryView,
+    AppSettings, AppState, OperationState, RefreshCoordinator, RepositoryId, RepositorySession,
+    RepositorySnapshot, RepositoryView,
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -105,6 +105,8 @@ impl PersistedAppState {
                 history_generation: 0,
                 history_loaded: false,
                 history_loading: false,
+                refresh_coordinator: RefreshCoordinator::default(),
+                history_invalidated_during_refresh: false,
             })
             .collect();
         AppState {

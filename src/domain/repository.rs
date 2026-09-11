@@ -67,6 +67,53 @@ pub enum OperationState {
     },
 }
 
+/// Coordina los refreshes solicitados para una sesión de repositorio.
+///
+/// Mientras hay un refresh en curso, las invalidaciones se agrupan en una
+/// única ejecución posterior. Esto evita lanzar una tarea por evento y hace
+/// que un cambio que llega durante una lectura no se pierda.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RefreshCoordinator {
+    in_flight: bool,
+    dirty: bool,
+}
+
+impl RefreshCoordinator {
+    /// Solicita un refresh. Devuelve `true` solo cuando debe iniciarse uno.
+    pub fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.dirty = true;
+            return false;
+        }
+        self.in_flight = true;
+        self.dirty = false;
+        true
+    }
+
+    /// Marca que habrá que reconciliar el repositorio cuando termine la
+    /// operación Git actual.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Finaliza el refresh actual e indica si hay que lanzar otro.
+    pub fn finish(&mut self) -> bool {
+        if !self.in_flight {
+            return false;
+        }
+        self.in_flight = false;
+        let should_refresh_again = self.dirty;
+        self.dirty = false;
+        should_refresh_again
+    }
+
+    /// Indica si hay una lectura de estado en curso.
+    #[must_use]
+    pub const fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+}
+
 /// Snapshot inmutable que la UI puede conservar durante un refresh.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepositorySnapshot {
@@ -92,6 +139,8 @@ pub struct RepositorySession {
     pub history_generation: u64,
     pub history_loaded: bool,
     pub history_loading: bool,
+    pub refresh_coordinator: RefreshCoordinator,
+    pub history_invalidated_during_refresh: bool,
 }
 
 impl RepositorySession {
@@ -110,7 +159,39 @@ impl RepositorySession {
             history_generation: 0,
             history_loaded: false,
             history_loading: false,
+            refresh_coordinator: RefreshCoordinator::default(),
+            history_invalidated_during_refresh: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshCoordinator;
+
+    #[test]
+    fn coalesces_invalidations_until_the_current_refresh_finishes() {
+        let mut coordinator = RefreshCoordinator::default();
+
+        assert!(coordinator.request());
+        assert!(coordinator.in_flight());
+
+        coordinator.mark_dirty();
+        coordinator.mark_dirty();
+
+        assert!(coordinator.finish());
+        assert!(!coordinator.in_flight());
+        assert!(!coordinator.finish());
+    }
+
+    #[test]
+    fn does_not_start_more_than_one_refresh_for_repeated_requests() {
+        let mut coordinator = RefreshCoordinator::default();
+
+        assert!(coordinator.request());
+        assert!(!coordinator.request());
+        assert!(coordinator.finish());
+        assert!(!coordinator.finish());
     }
 }
 
