@@ -2,10 +2,10 @@ use std::ops::Range;
 
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, Rgba,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Size, Style, TextRun, UTF16Selection, Window, WrappedLine, actions,
-    div, fill, point, prelude::*, px, relative, rgba, size,
+    PaintQuad, Pixels, Point, Rgba, Size, Style, TextRun, UTF16Selection, Window, WrappedLine,
+    actions, div, fill, point, prelude::*, px, relative, rgba, size,
 };
 
 /// Mínimo de líneas visibles cuando el campo está vacío o con poco texto.
@@ -696,28 +696,28 @@ impl Element for TextElement {
         let input = self.input.clone();
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        let layout_id = window.request_measured_layout(style, move |known_dimensions, available_space, window, cx| {
-            let input_state = input.read(cx);
-            let (display_text, text_color, _content_is_empty) =
-                display_text_for_input(input_state);
-            let wrap_width = known_dimensions.width.or(match available_space.width {
-                AvailableSpace::Definite(width) => Some(width),
-                _ => None,
-            }).unwrap_or(px(200.0));
-            let lines = shape_display_lines(
-                &display_text,
-                text_color,
-                wrap_width,
-                window,
-                cx,
-            );
-            let line_height = window.line_height();
-            let content_height = content_height_for_lines(&lines, line_height);
-            Size {
-                width: known_dimensions.width.unwrap_or(wrap_width),
-                height: content_height,
-            }
-        });
+        let layout_id = window.request_measured_layout(
+            style,
+            move |known_dimensions, available_space, window, cx| {
+                let input_state = input.read(cx);
+                let (display_text, text_color, _content_is_empty) =
+                    display_text_for_input(input_state);
+                let wrap_width = known_dimensions
+                    .width
+                    .or(match available_space.width {
+                        AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    })
+                    .unwrap_or(px(200.0));
+                let lines = shape_display_lines(&display_text, text_color, wrap_width, window, cx);
+                let line_height = window.line_height();
+                let content_height = content_height_for_lines(&lines, line_height);
+                Size {
+                    width: known_dimensions.width.unwrap_or(wrap_width),
+                    height: content_height,
+                }
+            },
+        );
         (layout_id, ())
     }
 
@@ -734,13 +734,7 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor_offset = input.cursor_offset();
         let (display_text, text_color, content_is_empty) = display_text_for_input(input);
-        let lines = shape_display_lines(
-            &display_text,
-            text_color,
-            bounds.size.width,
-            window,
-            cx,
-        );
+        let lines = shape_display_lines(&display_text, text_color, bounds.size.width, window, cx);
         let line_height = window.line_height();
         let cursor_position = position_for_index(&lines, cursor_offset, line_height);
         let cursor = cursor_position.map(|position| {
