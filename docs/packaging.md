@@ -53,6 +53,30 @@ El workflow `.github/workflows/release.yml` ejecuta formato, Clippy, pruebas, bu
 SHA-256 en GitHub Releases. Se activa al subir una etiqueta `vMAJOR.MINOR.PATCH` o manualmente desde
 GitHub Actions, y exige que la versión coincida con `Cargo.toml`.
 
+El pipeline valida primero la versión y que la release no exista. Después ejecuta en paralelo
+un job de checks y otro de empaquetado; el job de publicación depende de ambos, descarga el
+artefacto ya construido y comprueba su SHA, nombres versionados y checksums antes de publicar. Solo
+ese último job dispone de `contents: write`.
+
+La ejecución manual admite `dry_run`, que recorre el pipeline completo sin crear una release, y
+`failure_mode=checks|package`, que provoca un fallo controlado. En ambos casos puede comprobarse en
+el grafo de Actions que `publish` queda bloqueado si falla cualquiera de sus dos dependencias.
+
+## Medición del pipeline de release
+
+Cada job registra su duración y si obtuvo una coincidencia exacta de caché. El resumen final muestra
+el tiempo de pared y la suma de minutos de runner, que deben conservarse para una ejecución fría y
+otra caliente del mismo SHA mediante `dry_run`.
+
+Fase | Tiempo observado antes de CI-02 | Tiempo tras CI-02
+--- | ---: | ---:
+Checks (Clippy + tests) | 6 min 16 s | Lo registra el resumen de Actions
+Build + WiX + MSI | 6 min 49 s | Lo registra el resumen de Actions
+Tiempo de pared total | aproximadamente 13 min | Objetivo inicial 7–8 min; validar con dos dry-runs
+
+La cifra de 7–8 minutos es una hipótesis, no una garantía. No se crea ninguna etiqueta ni release
+para obtener estas mediciones.
+
 ## Validación posterior al empaquetado
 
 Seguir el checklist de [`docs/visual-validation.md`](visual-validation.md) en el binario release y,
