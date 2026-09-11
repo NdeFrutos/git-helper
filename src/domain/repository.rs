@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    ChangeSelection, CommitId, CommitSummary, HeadState, Remote, UpstreamState, status::FileChange,
+    BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote, UpstreamState,
+    status::FileChange,
 };
 
 /// Identificador estable de una sesión de repositorio.
@@ -144,9 +145,12 @@ pub struct RepositorySnapshot {
     pub head: HeadState,
     pub upstream: Option<UpstreamState>,
     pub remotes: Vec<Remote>,
+    pub branches: Vec<BranchReference>,
     pub changes: Vec<FileChange>,
     pub commits: Vec<CommitSummary>,
     pub has_more_commits: bool,
+    pub history_reference: Option<String>,
+    pub history_oid: Option<String>,
 }
 
 /// Sesión independiente asociada a una pestaña superior.

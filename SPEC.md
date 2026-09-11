@@ -80,6 +80,7 @@ La reutilización se organizará así:
 9. Mostrar una lista navegable del historial de commits.
 10. Actualizar la interfaz cuando cambie el repositorio, sin bloquear la ventana.
 11. Mostrar errores accionables y conservar intacto el repositorio ante fallos.
+12. Consultar ramas locales y referencias remote-tracking sin cambiar el checkout.
 
 ### 3.2 Fuera del MVP
 
@@ -121,7 +122,7 @@ La ventana tendrá estas áreas:
 3. **Contenido**
 	- Dos pestañas internas: `Cambios (n)` e `Historial`.
 	- `Cambios` muestra una lista compacta de archivos y el formulario de commit en una única columna.
-	- `Historial` muestra una lista compacta de commits en la misma área, sin abrir otra ventana ni cambiar de proyecto.
+	- `Historial` muestra un inventario de ramas locales y referencias remote-tracking y una lista compacta de commits en la misma área, sin abrir otra ventana ni cambiar de proyecto.
 
 4. **Barra de estado**
 	- Ruta del repositorio.
@@ -326,6 +327,13 @@ git -C <repo> log --all --date-order --decorate=full <formato-estructurado>
 El formato debe usar separadores NUL o un formato inequívoco. El MVP presenta una lista cronológica compacta como la vista History de Zed; no calcula ni dibuja lanes de un git graph.
 
 Al seleccionar una fila se podrá mostrar en la parte inferior el hash completo, cuerpo, autor, committer, fechas, padres y referencias. No se mostrará el diff ni el contenido de los archivos del commit.
+
+La vista de historial permite seleccionar una rama local o referencia remote-tracking. La consulta
+se ejecuta con `git log` sobre el OID de la referencia, sin hacer checkout ni modificar `HEAD`, el
+índice o el working tree. Las ramas locales indican su upstream configurado, los contadores
+`ahead/behind`, la ausencia de upstream o un upstream que ya no existe. `origin/HEAD` y otras
+referencias simbólicas se excluyen del inventario. Las referencias remotas representan el último
+`fetch` disponible localmente.
 
 ### 4.10 Atajos
 

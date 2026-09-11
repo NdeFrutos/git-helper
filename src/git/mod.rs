@@ -1,3 +1,4 @@
+mod branch_parser;
 mod client;
 mod context;
 mod discard;
@@ -7,6 +8,7 @@ mod path;
 mod remote_plan;
 mod status_parser;
 
+pub use branch_parser::{BRANCH_FORMAT, parse_branch_refs};
 pub use client::GitClient;
 pub use context::StagedContextData;
 pub use discard::{DiscardMode, DiscardPlan, plan_discard};

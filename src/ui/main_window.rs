@@ -17,8 +17,9 @@ use crate::{
     },
     cursor::{CursorClient, build_cursor_context, resolve_cursor_executable},
     domain::{
-        AppState, ChangeKind, CommitDetails, FileChange, HeadState, MutationState, OperationKind,
-        RefreshState, RepositoryId, RepositorySession, RepositorySnapshot, RepositoryView,
+        AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
+        FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
+        RepositorySession, RepositorySnapshot, RepositoryView,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
     persistence::{AppStateStore, PersistedAppState},
@@ -659,6 +660,7 @@ impl MainWindow {
                             this.git_client.invalidate_remotes(&root_path);
                         }
                         if change.history_changed {
+                            this.git_client.invalidate_branches(&root_path);
                             this.invalidate_history(repository_id);
                         }
                         if change.ignore_rules_changed {
@@ -724,6 +726,12 @@ impl MainWindow {
                 } else {
                     snapshot.commits.clone_from(&repository.snapshot.commits);
                     snapshot.has_more_commits = repository.snapshot.has_more_commits;
+                    snapshot
+                        .history_reference
+                        .clone_from(&repository.snapshot.history_reference);
+                    snapshot
+                        .history_oid
+                        .clone_from(&repository.snapshot.history_oid);
                 }
                 let snapshot_changed = *repository.snapshot != snapshot;
                 if snapshot_changed {
@@ -810,6 +818,8 @@ impl MainWindow {
         let snapshot = Arc::make_mut(&mut repository.snapshot);
         snapshot.commits.clear();
         snapshot.has_more_commits = false;
+        snapshot.history_reference = None;
+        snapshot.history_oid = None;
         self.selected_commit_details.remove(&repository_id);
     }
 
@@ -828,23 +838,29 @@ impl MainWindow {
         {
             return;
         }
-        if matches!(repository.snapshot.head, HeadState::Unborn) {
+        let Some((reference, expected_oid)) = history_target_for_head(&repository.snapshot.head)
+        else {
             repository.history_loaded = true;
             return;
-        }
+        };
         repository.history_generation = repository.history_generation.saturating_add(1);
         let generation = repository.history_generation;
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
         repository.error = None;
+        let snapshot = Arc::make_mut(&mut repository.snapshot);
+        snapshot.history_reference = Some(reference.clone());
+        snapshot.history_oid = Some(expected_oid.clone());
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.history(
+                    git_client.history_for_oid(
                         &root_path,
+                        &reference,
+                        &expected_oid,
                         INITIAL_HISTORY_LIMIT + 1,
                         0,
                         &CancellationToken::default(),
@@ -865,17 +881,26 @@ impl MainWindow {
                 }
                 repository.history_loading = false;
                 match result {
-                    Ok(commits) => {
+                    Ok(page)
+                        if history_target_is_current(repository, &page.reference, &page.oid) =>
+                    {
                         let snapshot = Arc::make_mut(&mut repository.snapshot);
-                        snapshot.has_more_commits = commits.len() > INITIAL_HISTORY_LIMIT;
-                        snapshot.commits = commits
+                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
+                        snapshot.commits = page
+                            .commits
                             .into_iter()
                             .take(INITIAL_HISTORY_LIMIT)
                             .map(|commit| commit.summary)
                             .collect();
+                        snapshot.history_reference = Some(page.reference);
+                        snapshot.history_oid = Some(page.oid);
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
                         repository.error = None;
+                    }
+                    Ok(_) => {
+                        repository.history_loaded = false;
+                        repository.status_message = "La selección de historial cambió".to_owned();
                     }
                     Err(error) => {
                         repository.status_message = "No se pudo cargar el historial".to_owned();
@@ -2238,6 +2263,129 @@ impl MainWindow {
         }
     }
 
+    fn select_branch(
+        &mut self,
+        repository_id: RepositoryId,
+        branch: BranchReference,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        let Some(current_branch) = repository
+            .snapshot
+            .branches
+            .iter()
+            .find(|current| current.full_name == branch.full_name)
+        else {
+            repository.error = Some("La rama ya no existe; actualiza el repositorio.".to_owned());
+            cx.notify();
+            return;
+        };
+        if current_branch.oid != branch.oid {
+            repository.error = Some("La rama cambió; actualiza el repositorio.".to_owned());
+            cx.notify();
+            return;
+        }
+        repository.selected_view = RepositoryView::History;
+        repository.history_generation = repository.history_generation.saturating_add(1);
+        let generation = repository.history_generation;
+        repository.history_loaded = branch.oid.is_none();
+        repository.history_loading = branch.oid.is_some();
+        repository.selected_commit = None;
+        let snapshot = Arc::make_mut(&mut repository.snapshot);
+        snapshot.commits.clear();
+        snapshot.has_more_commits = false;
+        snapshot.history_reference = Some(branch.full_name.clone());
+        snapshot.history_oid.clone_from(&branch.oid);
+        self.selected_commit_details.remove(&repository_id);
+        let Some(expected_oid) = branch.oid else {
+            repository.status_message = "La rama no tiene commits".to_owned();
+            repository.error = None;
+            cx.notify();
+            return;
+        };
+        let root_path = repository.root_path.clone();
+        let reference = branch.full_name;
+        let branch_name = branch.name;
+        let git_client = self.git_client.clone();
+        repository.status_message = format!("Cargando historial de {branch_name}…");
+        repository.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.history_for_ref(
+                        &root_path,
+                        &reference,
+                        INITIAL_HISTORY_LIMIT + 1,
+                        0,
+                        &CancellationToken::default(),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(repository) = this
+                    .state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                else {
+                    return;
+                };
+                if repository.history_generation != generation {
+                    return;
+                }
+                repository.history_loading = false;
+                match result {
+                    Ok(page)
+                        if page.oid == expected_oid
+                            && history_target_is_current(
+                                repository,
+                                &page.reference,
+                                &page.oid,
+                            ) =>
+                    {
+                        let snapshot = Arc::make_mut(&mut repository.snapshot);
+                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
+                        snapshot.commits = page
+                            .commits
+                            .into_iter()
+                            .take(INITIAL_HISTORY_LIMIT)
+                            .map(|commit| commit.summary)
+                            .collect();
+                        snapshot.history_reference = Some(page.reference);
+                        snapshot.history_oid = Some(page.oid);
+                        repository.history_loaded = true;
+                        repository.status_message = "Historial actualizado".to_owned();
+                        repository.error = None;
+                    }
+                    Ok(_) => {
+                        repository.history_loaded = false;
+                        repository.status_message = "La rama cambió durante la carga".to_owned();
+                        repository.error = Some(
+                            "Se descartó el resultado obsoleto; vuelve a seleccionar la rama."
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        repository.history_loaded = false;
+                        repository.status_message = "No se pudo cargar la rama".to_owned();
+                        repository.error = Some(error.technical_details());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn select_commit(
         &mut self,
         repository_id: RepositoryId,
@@ -2304,6 +2452,14 @@ impl MainWindow {
         if repository.history_loading {
             return;
         }
+        let (Some(reference), Some(oid)) = (
+            repository.snapshot.history_reference.clone(),
+            repository.snapshot.history_oid.clone(),
+        ) else {
+            repository.error = Some("No hay una referencia de historial seleccionada".to_owned());
+            cx.notify();
+            return;
+        };
         repository.history_loading = true;
         let generation = repository.history_generation;
         let root_path = repository.root_path.clone();
@@ -2315,8 +2471,10 @@ impl MainWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.history(
+                    git_client.history_for_oid(
                         &root_path,
+                        &reference,
+                        &oid,
                         INITIAL_HISTORY_LIMIT + 1,
                         offset,
                         &CancellationToken::default(),
@@ -2325,19 +2483,25 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(commits) => {
-                        let has_more = commits.len() > INITIAL_HISTORY_LIMIT;
+                    Ok(page) => {
+                        let has_more = page.commits.len() > INITIAL_HISTORY_LIMIT;
                         if let Some(repository) = this
                             .state
                             .repositories
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
-                            if repository.history_generation != generation {
+                            if repository.history_generation != generation
+                                || !history_target_is_current(
+                                    repository,
+                                    &page.reference,
+                                    &page.oid,
+                                )
+                            {
                                 return;
                             }
                             Arc::make_mut(&mut repository.snapshot).commits.extend(
-                                commits
+                                page.commits
                                     .into_iter()
                                     .take(INITIAL_HISTORY_LIMIT)
                                     .map(|commit| commit.summary),
@@ -2376,12 +2540,67 @@ impl MainWindow {
         let repository_id = repository.id;
         let selected_commit = repository.selected_commit.clone();
         let has_more = repository.snapshot.has_more_commits;
+        let selected_reference = repository.snapshot.history_reference.clone();
+        let branches = repository.snapshot.branches.clone();
         let details = self.selected_commit_details.get(&repository_id).cloned();
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .child(
+                div()
+                    .id("branch-inventory")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_h(px(150.0))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(BORDER_COLOR)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(MUTED_TEXT_COLOR)
+                            .child("Ramas locales y referencias remotas"),
+                    )
+                    .children(branches.into_iter().map(|branch| {
+                        let is_selected = selected_reference.as_ref() == Some(&branch.full_name);
+                        let branch_for_click = branch.clone();
+                        div()
+                            .id(format!("branch-{}", branch.full_name))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .when(is_selected, |row| row.bg(SELECTED_BACKGROUND_COLOR))
+                            .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_branch(repository_id, branch_for_click.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if branch.is_active {
+                                        SUCCESS_COLOR
+                                    } else {
+                                        MUTED_TEXT_COLOR
+                                    })
+                                    .child(branch_kind_label(branch.kind)),
+                            )
+                            .child(div().text_sm().child(branch.name.clone()))
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .text_xs()
+                                    .text_color(MUTED_TEXT_COLOR)
+                                    .child(branch_upstream_label(&branch.upstream)),
+                            )
+                    })),
+            )
             .child(
                 uniform_list(
                     "history-list",
@@ -2604,6 +2823,49 @@ impl Render for MainWindow {
                 )
             })
             .child(self.render_status_bar(active_repository.as_ref()))
+    }
+}
+
+fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
+    match head {
+        HeadState::Branch {
+            name,
+            oid: Some(oid),
+        } => Some((format!("refs/heads/{name}"), oid.clone())),
+        HeadState::Detached { oid } if !oid.is_empty() => Some((oid.clone(), oid.clone())),
+        HeadState::Branch { oid: None, .. } | HeadState::Detached { .. } | HeadState::Unborn => {
+            None
+        }
+    }
+}
+
+fn history_target_is_current(repository: &RepositorySession, reference: &str, oid: &str) -> bool {
+    repository.snapshot.history_reference.as_deref() == Some(reference)
+        && repository.snapshot.history_oid.as_deref() == Some(oid)
+}
+
+const fn branch_kind_label(kind: BranchKind) -> &'static str {
+    match kind {
+        BranchKind::Local => "Local",
+        BranchKind::RemoteTracking => "Remota",
+    }
+}
+
+fn branch_upstream_label(upstream: &BranchUpstream) -> String {
+    match upstream {
+        BranchUpstream::Configured {
+            full_name,
+            ahead,
+            behind,
+        } => format!(
+            "{} · ↑{ahead} ↓{behind}",
+            full_name.strip_prefix("refs/remotes/").unwrap_or(full_name)
+        ),
+        BranchUpstream::NoUpstream => "Sin upstream".to_owned(),
+        BranchUpstream::Gone { full_name } => format!(
+            "Upstream ausente: {}",
+            full_name.strip_prefix("refs/remotes/").unwrap_or(full_name)
+        ),
     }
 }
 
@@ -2842,7 +3104,7 @@ mod tests {
                         b"# branch.oid new\0# branch.head main\0? changed.txt\0".to_vec()
                     }
                 }
-                "git-remotes" => Vec::new(),
+                "git-remotes" | "git-branches" => Vec::new(),
                 label => panic!("petición Git inesperada: {label}"),
             };
             Ok(ProcessOutput {
@@ -3037,6 +3299,55 @@ mod tests {
         assert!(matches!(first.refresh_state, RefreshState::Idle));
         assert!(second.error.is_some());
         assert!(matches!(second.refresh_state, RefreshState::Failed { .. }));
+    }
+
+    #[test]
+    fn rapid_branch_selection_rejects_the_previous_response() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        {
+            let snapshot = Arc::make_mut(&mut repository.snapshot);
+            snapshot.history_reference = Some("refs/heads/first".to_owned());
+            snapshot.history_oid = Some("1111".to_owned());
+        }
+        assert!(history_target_is_current(
+            &repository,
+            "refs/heads/first",
+            "1111"
+        ));
+
+        {
+            let snapshot = Arc::make_mut(&mut repository.snapshot);
+            snapshot.history_reference = Some("refs/heads/second".to_owned());
+            snapshot.history_oid = Some("2222".to_owned());
+        }
+        assert!(!history_target_is_current(
+            &repository,
+            "refs/heads/first",
+            "1111"
+        ));
+        assert!(history_target_is_current(
+            &repository,
+            "refs/heads/second",
+            "2222"
+        ));
+    }
+
+    #[test]
+    fn current_branch_history_is_tied_to_its_oid() {
+        assert_eq!(
+            history_target_for_head(&HeadState::Branch {
+                name: "feature/test".to_owned(),
+                oid: Some("abcd".to_owned()),
+            }),
+            Some(("refs/heads/feature/test".to_owned(), "abcd".to_owned()))
+        );
+        assert_eq!(
+            history_target_for_head(&HeadState::Detached {
+                oid: "deadbeef".to_owned(),
+            }),
+            Some(("deadbeef".to_owned(), "deadbeef".to_owned()))
+        );
+        assert_eq!(history_target_for_head(&HeadState::Unborn), None);
     }
 
     #[test]

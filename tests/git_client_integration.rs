@@ -280,3 +280,179 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
     assert!(pull_error.to_string().contains("Git rechazó"));
     assert_eq!(head_before, head_after);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn enumerates_branches_and_reads_selected_history_without_checkout() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let repository = temporary.path().join("repositorio principal");
+    fs::create_dir_all(&repository).expect("debe crear el repositorio");
+    initialize_repository(&repository);
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    commit_file(&client, &repository, "base.txt", "base\n", "test: base");
+    require_git(&repository, &["branch", "feature/ñ/rama"]);
+    require_git(&repository, &["branch", "sin-upstream"]);
+    require_git(&repository, &["branch", "upstream-eliminado"]);
+
+    let origin = temporary.path().join("origin.git");
+    fs::create_dir_all(&origin).expect("debe crear origin");
+    require_git(&origin, &["init", "--bare"]);
+    require_git(
+        &repository,
+        &["remote", "add", "origin", &origin.display().to_string()],
+    );
+    require_git(&repository, &["config", "branch.main.remote", "origin"]);
+    require_git(
+        &repository,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    require_git(
+        &repository,
+        &["config", "branch.upstream-eliminado.remote", "origin"],
+    );
+    require_git(
+        &repository,
+        &[
+            "config",
+            "branch.upstream-eliminado.merge",
+            "refs/heads/eliminada",
+        ],
+    );
+    let head_oid = String::from_utf8(run_git(&repository, &["rev-parse", "HEAD"]).stdout)
+        .expect("OID UTF-8")
+        .trim()
+        .to_owned();
+    require_git(
+        &repository,
+        &["update-ref", "refs/remotes/origin/main", &head_oid],
+    );
+    require_git(
+        &repository,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let tree_before = run_git(&repository, &["write-tree"]).stdout;
+    let head_before = run_git(&repository, &["rev-parse", "HEAD"]).stdout;
+    let snapshot = client
+        .snapshot(&repository, &cancellation)
+        .expect("debe enumerar ramas");
+
+    let main = snapshot
+        .branches
+        .iter()
+        .find(|branch| branch.name == "main")
+        .expect("debe aparecer la rama actual");
+    assert!(main.is_active);
+    assert!(matches!(
+        main.upstream,
+        git_helper::domain::BranchUpstream::Configured {
+            ahead: 0,
+            behind: 0,
+            ..
+        }
+    ));
+    assert!(
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "feature/ñ/rama")
+    );
+    assert!(matches!(
+        snapshot
+            .branches
+            .iter()
+            .find(|branch| branch.name == "upstream-eliminado")
+            .expect("debe conservar el upstream configurado")
+            .upstream,
+        git_helper::domain::BranchUpstream::Gone { .. }
+    ));
+    assert!(
+        !snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "origin/HEAD")
+    );
+
+    let history = client
+        .history_for_ref(
+            &repository,
+            "refs/heads/feature/ñ/rama",
+            20,
+            0,
+            &cancellation,
+        )
+        .expect("debe leer historial de la rama sin checkout");
+    assert_eq!(history.oid, head_oid);
+    assert_eq!(history.commits[0].summary.subject, "test: base");
+    assert_eq!(run_git(&repository, &["write-tree"]).stdout, tree_before);
+    assert_eq!(
+        run_git(&repository, &["rev-parse", "HEAD"]).stdout,
+        head_before
+    );
+
+    require_git(&repository, &["branch", "externa"]);
+    client.invalidate_branches(&repository);
+    let refreshed = client
+        .branches(&repository, &cancellation)
+        .expect("debe invalidar la caché de referencias");
+    assert!(refreshed.iter().any(|branch| branch.name == "externa"));
+}
+
+#[test]
+fn pagination_stays_on_the_selected_oid_when_the_branch_moves() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    commit_file(&client, temporary.path(), "one.txt", "1\n", "test: one");
+    commit_file(&client, temporary.path(), "two.txt", "2\n", "test: two");
+    commit_file(&client, temporary.path(), "three.txt", "3\n", "test: three");
+    require_git(temporary.path(), &["branch", "selected"]);
+
+    let first = client
+        .history_for_ref(temporary.path(), "refs/heads/selected", 2, 0, &cancellation)
+        .expect("debe cargar la primera página");
+    assert_eq!(first.commits.len(), 2);
+
+    commit_file(&client, temporary.path(), "four.txt", "4\n", "test: four");
+    require_git(temporary.path(), &["branch", "-f", "selected", "HEAD"]);
+    let second = client
+        .history_for_oid(
+            temporary.path(),
+            "refs/heads/selected",
+            &first.oid,
+            2,
+            2,
+            &cancellation,
+        )
+        .expect("debe paginar desde el OID original");
+    assert_eq!(second.oid, first.oid);
+    assert_eq!(second.commits.len(), 1);
+    assert_eq!(second.commits[0].summary.subject, "test: one");
+
+    let detached = client
+        .history_for_oid(
+            temporary.path(),
+            &first.oid,
+            &first.oid,
+            1,
+            0,
+            &cancellation,
+        )
+        .expect("debe aceptar un OID fijado como referencia para HEAD separado");
+    assert_eq!(detached.reference, first.oid);
+    assert_eq!(detached.commits.len(), 1);
+
+    let moved = client
+        .history_for_ref(temporary.path(), "refs/heads/selected", 1, 0, &cancellation)
+        .expect("debe resolver la rama movida");
+    assert_ne!(moved.oid, first.oid);
+    assert_eq!(moved.commits[0].summary.subject, "test: four");
+}
