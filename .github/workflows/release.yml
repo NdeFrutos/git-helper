@@ -188,11 +188,13 @@ jobs:
           $msiPath = "target\wix\git-helper-$env:RELEASE_VERSION-x86_64.msi"
           if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) { throw "Falta el MSI: $msiPath" }
           if (-not (Test-Path -LiteralPath "target\release\git-helper.exe" -PathType Leaf)) { throw "Falta git-helper.exe" }
+          if (-not (Test-Path -LiteralPath "target\release\ghelper.exe" -PathType Leaf)) { throw "Falta ghelper.exe" }
           $msiName = "git-helper-$env:RELEASE_VERSION-windows-x86_64.msi"
           Copy-Item -LiteralPath $msiPath -Destination "dist\$msiName"
           $portable = "dist\portable"
           New-Item -ItemType Directory -Path $portable -Force | Out-Null
           Copy-Item -LiteralPath "target\release\git-helper.exe" -Destination $portable
+          Copy-Item -LiteralPath "target\release\ghelper.exe" -Destination $portable
           Copy-Item -LiteralPath "LICENSE" -Destination $portable
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $portable
           $zipName = "git-helper-$env:RELEASE_VERSION-windows-x86_64-portable.zip"
