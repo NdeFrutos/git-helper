@@ -77,12 +77,17 @@ jobs:
             throw "La etiqueta $tag no coincide con Cargo.toml ($cargoVersion)."
           }
           if ($env:DRY_RUN -ne "true") {
-            $ErrorActionPreference = "Continue"
-            & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 1>$null 2>$null
-            $releaseExists = ($LASTEXITCODE -eq 0)
-            $ErrorActionPreference = "Stop"
-            if ($releaseExists) {
+            $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+            try {
+              Invoke-RestMethod -Uri $releaseUri -Headers @{
+                Authorization = "Bearer $env:GH_TOKEN"
+                "User-Agent" = "git-helper-release"
+              } | Out-Null
               throw "La release $tag ya existe."
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+                throw
+              }
             }
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
@@ -272,11 +277,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          $ErrorActionPreference = "Continue"
-          & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 1>$null 2>$null
-          $releaseExists = ($LASTEXITCODE -eq 0)
-          $ErrorActionPreference = "Stop"
-          if ($releaseExists) { throw "La release ya existe" }
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG"
+          try {
+            Invoke-RestMethod -Uri $releaseUri -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              "User-Agent" = "git-helper-release"
+            } | Out-Null
+            throw "La release ya existe"
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+              throw
+            }
+          }
           $assets = Get-ChildItem -LiteralPath "dist" -File | ForEach-Object { $_.FullName }
           gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --generate-notes
           if ($LASTEXITCODE -ne 0) { throw "GitHub no pudo crear la release" }
