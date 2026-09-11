@@ -81,14 +81,14 @@ pub enum MutationState {
         kind: OperationKind,
         message: String,
     },
+    Cancelled {
+        kind: OperationKind,
+        message: String,
+    },
     Failed {
         kind: OperationKind,
         message: String,
         details: String,
-    },
-    Cancelled {
-        kind: OperationKind,
-        message: String,
     },
 }
 
@@ -139,18 +139,64 @@ impl RefreshCoordinator {
     }
 }
 
-/// Snapshot inmutable que la UI puede conservar durante un refresh.
+/// Contadores derivados del working tree, recalculados solo cuando cambian los cambios.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChangeCounters {
+    pub change_count: usize,
+    pub staged_count: usize,
+}
+
+/// Estado Git del working tree, índice y referencias consultables sin tocar el historial.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RepositorySnapshot {
+pub struct WorkingTreeSnapshot {
     pub head: HeadState,
     pub upstream: Option<UpstreamState>,
     pub remotes: Vec<Remote>,
     pub branches: Vec<BranchReference>,
     pub changes: Vec<FileChange>,
-    pub commits: Vec<CommitSummary>,
+}
+
+impl WorkingTreeSnapshot {
+    /// Deriva contadores de la lista de cambios para evitar recorrerla en cada render.
+    #[must_use]
+    pub fn change_counters(&self) -> ChangeCounters {
+        ChangeCounters {
+            change_count: self.changes.len(),
+            staged_count: self
+                .changes
+                .iter()
+                .filter(|change| change.has_staged_change())
+                .count(),
+        }
+    }
+}
+
+/// Página de historial paginada anclada a una referencia y OID estables.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistorySnapshot {
+    pub commits: Arc<Vec<CommitSummary>>,
     pub has_more_commits: bool,
     pub history_reference: Option<String>,
     pub history_oid: Option<String>,
+}
+
+impl Default for HistorySnapshot {
+    fn default() -> Self {
+        Self {
+            commits: Arc::new(Vec::new()),
+            has_more_commits: false,
+            history_reference: None,
+            history_oid: None,
+        }
+    }
+}
+
+impl HistorySnapshot {
+    /// Historial vacío tras invalidación o antes de la primera carga.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 /// Sesión independiente asociada a una pestaña superior.
@@ -158,7 +204,9 @@ pub struct RepositorySnapshot {
 pub struct RepositorySession {
     pub id: RepositoryId,
     pub root_path: PathBuf,
-    pub snapshot: Arc<RepositorySnapshot>,
+    pub working_tree: Arc<WorkingTreeSnapshot>,
+    pub history: Arc<HistorySnapshot>,
+    pub change_counters: ChangeCounters,
     pub selected_view: RepositoryView,
     pub selected_change: Option<ChangeSelection>,
     pub selected_commit: Option<CommitId>,
@@ -181,7 +229,9 @@ impl RepositorySession {
         Self {
             id: RepositoryId::new(),
             root_path,
-            snapshot: Arc::new(RepositorySnapshot::default()),
+            working_tree: Arc::new(WorkingTreeSnapshot::default()),
+            history: Arc::new(HistorySnapshot::empty()),
+            change_counters: ChangeCounters::default(),
             selected_view: RepositoryView::default(),
             selected_change: None,
             selected_commit: None,
@@ -221,6 +271,45 @@ impl RepositorySession {
     #[must_use]
     pub fn can_refresh(&self) -> bool {
         !self.is_refreshing() && !self.is_mutating()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::path::PathBuf;
+
+    use super::{ChangeCounters, WorkingTreeSnapshot};
+    use crate::domain::{ChangeKind, FileChange};
+
+    #[test]
+    fn change_counters_track_staged_files_without_rescanning_in_render() {
+        let snapshot = WorkingTreeSnapshot {
+            changes: vec![
+                FileChange {
+                    path: PathBuf::from("a.rs"),
+                    original_path: None,
+                    index_status: ChangeKind::Modified,
+                    worktree_status: ChangeKind::Unmodified,
+                    is_conflicted: false,
+                },
+                FileChange {
+                    path: PathBuf::from("b.rs"),
+                    original_path: None,
+                    index_status: ChangeKind::Unmodified,
+                    worktree_status: ChangeKind::Modified,
+                    is_conflicted: false,
+                },
+            ],
+            ..WorkingTreeSnapshot::default()
+        };
+
+        assert_eq!(
+            snapshot.change_counters(),
+            ChangeCounters {
+                change_count: 2,
+                staged_count: 1,
+            }
+        );
     }
 }
 

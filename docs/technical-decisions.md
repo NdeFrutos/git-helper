@@ -39,10 +39,26 @@ los ejemplos de Zed. No se copió código GPL de Zed.
 ## Límites de procesos
 
 `src/process.rs` es la única abstracción de procesos. No usa una shell, conserva argumentos como
-`OsString`, lee stdout y stderr en paralelo, permite cancelación cooperativa y aplica timeouts. Git
-recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
-`CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
-las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
+`OsString` y aplica timeouts. stdout, stderr y stdin se redirigen a temporales anónimos: así se
+mantiene la captura independiente de ambos streams sin crear lectores bloqueables cuando un
+descendiente hereda los handles. En Windows, la cancelación y el timeout finalizan el árbol activo
+con `taskkill.exe /PID <pid> /T /F`; el comando auxiliar también se crea con `CREATE_NO_WINDOW`, no
+usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` falla —lo hace también cuando el hijo
+acaba de terminar por su cuenta— se registra el aviso y se continúa con el hijo directo; el runner
+solo devuelve un error de infraestructura si el proceso sigue vivo tras la espera acotada, de modo
+que la clasificación de cancelación o timeout nunca se pierde por esa carrera. La salida normal del padre no espera a
+descendientes que se hayan desacoplado voluntariamente; los datos capturados se leen sin esperar al
+cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
+`CURSOR_API_TOKEN`.
+
+Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
+los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
+descendiente es el propio binario de pruebas —no un intérprete externo, cuyo arranque decidía en CI
+si la prueba llegaba a comprobar algo—, publica su PID y las pruebas verifican su desaparición con
+`tasklist.exe`; no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta
+antes incluso de que el descendiente pudiera escribirlo. La
+comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
+puede no tener Cargo o Windows disponible.
 
 ## Inventario de ramas e historial
 
@@ -86,11 +102,51 @@ filtro y el watcher se reconstruye con las rutas ignoradas actuales, sin ejecuta
 Si notify comunica un error, la UI conserva el estado visible, retira el watcher fallido y deja F5
 como recuperación explícita; un refresh correcto vuelve a instalar la vigilancia.
 
+## Coordinación de refrescos (UX-01)
+
+Cada `RepositorySession` incluye un `RefreshCoordinator` con dos banderas: `in_flight` indica si hay
+una lectura de estado en curso y `dirty` acumula invalidaciones recibidas mientras tanto. Una
+solicitud de refresh solo arranca un proceso Git cuando `request()` devuelve `true`; las peticiones
+concurrentes marcan `dirty` y se encolan sin crear una tarea por evento.
+
+Al terminar un refresh —con éxito, error o cancelación— `finish()` libera `in_flight` y devuelve si
+hace falta como máximo un refresh adicional que consuma lo pendiente. Si llegan eventos durante ese
+segundo refresh, vuelven a marcar `dirty` y el ciclo se repite una vez más. Las lecturas de status
+siguen usando `GIT_OPTIONAL_LOCKS=0` para no reactivar el watcher por cambios en `.git/index`.
+
+Las mutaciones Git (stage, unstage, descarte, commit, fetch, pull, push) y la generación de mensaje
+con Cursor se serializan por repositorio: mientras `mutation_state` está en `Running`, los refreshes
+solicitados marcan `dirty` y se guardan en `pending_refreshes`. Al finalizar la mutación —incluso si
+falla o se cancela— se llama a `refresh_repository` para reconciliar el snapshot con el working tree
+real.
+
+Al cerrar una pestaña se cancelan los tokens activos, se eliminan watchers y se descartan respuestas
+cuya generación ya no coincide con la sesión. Un watcher que termine de instalarse después del cierre
+no se registra ni procesa eventos.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
 y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
 continúa con estado vacío.
+
+## Working tree e historial desacoplados (PERF-03)
+
+Cada `RepositorySession` separa `working_tree` (`Arc<WorkingTreeSnapshot>`) e `history`
+(`Arc<HistorySnapshot>`). Un refresh de lectura solo compara y sustituye el working tree; el
+historial paginado permanece intacto salvo invalidación explícita (cambio de `HEAD`/upstream,
+selección de otra rama o carga diferida). Los commits se almacenan en `Arc<Vec<CommitSummary>>`
+para que `render_history` y la paginación no clonen miles de filas en cada frame.
+
+Los contadores de la pestaña Cambios (`change_count`, `staged_count`) se derivan una vez al
+actualizar el working tree. Los detalles de commit se cachean por repositorio con un límite fijo
+(32 entradas, LRU) para evitar clonados profundos al alternar selección.
+
+La medición manual ignorada en la prueba unitaria
+(`finish_refresh_comparison_cost_is_bounded_with_large_history`) conserva el umbral de referencia:
+con 10 000 commits cargados, `finish_refresh` tras un cambio del working tree completa en menos de
+50 ms porque ya no recorre ni compara la lista de commits. La garantía de regresión que se ejecuta
+en CI es determinista y comprueba que los `Arc` del historial permanecen intactos.
 
 ## Estados de interacción por repositorio
 

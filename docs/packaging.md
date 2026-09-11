@@ -53,14 +53,41 @@ El workflow `.github/workflows/release.yml` ejecuta formato, Clippy, pruebas, bu
 SHA-256 en GitHub Releases. Se activa al subir una etiqueta `vMAJOR.MINOR.PATCH` o manualmente desde
 GitHub Actions, y exige que la versión coincida con `Cargo.toml`.
 
-El pipeline valida primero la versión y que la release no exista. Después ejecuta en paralelo
-un job de checks y otro de empaquetado; el job de publicación depende de ambos, descarga el
-artefacto ya construido y comprueba su SHA, nombres versionados y checksums antes de publicar. Solo
-ese último job dispone de `contents: write`.
+El pipeline valida primero la versión y que la release no exista en el job `preflight`. Solo
+después se ejecutan en paralelo los jobs `checks` y `package`; `publish` depende de ambos, descarga
+el artefacto ya construido y comprueba su SHA, nombres versionados y checksums antes de publicar. No
+recompila en ese job. Solo `publish` dispone de `contents: write`.
+
+```mermaid
+flowchart TD
+  preflight["preflight<br/>Validate release request"]
+  checks["checks<br/>Format, lint and test"]
+  package["package<br/>Build Windows packages"]
+  publish["publish<br/>Publish validated artifacts"]
+
+  preflight --> checks
+  preflight --> package
+  checks --> publish
+  package --> publish
+```
 
 La ejecución manual admite `dry_run`, que recorre el pipeline completo sin crear una release, y
 `failure_mode=checks|package`, que provoca un fallo controlado. En ambos casos puede comprobarse en
 el grafo de Actions que `publish` queda bloqueado si falla cualquiera de sus dos dependencias.
+
+Para comprobar las puertas sin publicar:
+
+```text
+gh workflow run release.yml \
+  --repo NdeFrutos/git-helper \
+  --ref main \
+  -f version=0.1.1 \
+  -f dry_run=true \
+  -f failure_mode=checks
+```
+
+Repita con `failure_mode=package` y, para medir tiempos, con `failure_mode=none` en una ejecución
+fría y otra caliente del mismo SHA.
 
 ## Medición del pipeline de release
 
