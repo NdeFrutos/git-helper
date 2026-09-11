@@ -7,44 +7,59 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Versión de Cargo.toml que se publicará (por ejemplo, 0.2.0)"
+        description: "Versión de Cargo.toml que se validará (por ejemplo, 0.2.0)"
         required: true
         type: string
+      dry_run:
+        description: "Construir y validar sin crear una release"
+        required: true
+        default: false
+        type: boolean
+      failure_mode:
+        description: "Fallo controlado para comprobar las puertas de publicación"
+        required: true
+        default: none
+        type: choice
+        options: [none, checks, package]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish Windows release
+  preflight:
+    name: Validate release request
     runs-on: windows-latest
-
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      started_at: ${{ steps.clock.outputs.started_at }}
+      duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
     steps:
-      - name: Checkout
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+      - name: Checkout exact SHA
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Validate release version
+      - name: Validate version and release absence
         id: release
         shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if ($env:GITHUB_EVENT_NAME -eq "push") {
-            $tag = $env:GITHUB_REF_NAME
-          } else {
-            $tag = "v$env:INPUT_VERSION"
-          }
-
+          if ($env:GITHUB_EVENT_NAME -eq "push") { $tag = $env:GITHUB_REF_NAME }
+          else { $tag = "v$env:INPUT_VERSION" }
           if ($tag -notmatch '^v(?<major>0|[1-9]\d*)\.(?<minor>0|[1-9]\d*)\.(?<patch>0|[1-9]\d*)$') {
             throw "La release debe usar una versión semántica estable, por ejemplo v0.2.0."
           }
-
           $version = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
           $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw
           if ($manifest -notmatch '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$') {
@@ -53,11 +68,38 @@ jobs:
           if ($Matches.cargoVersion -ne $version) {
             throw "La etiqueta $tag no coincide con Cargo.toml ($($Matches.cargoVersion))."
           }
-
+          if ($env:DRY_RUN -ne "true" -and (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
+            throw "La release $tag ya existe."
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Record preflight timing
+        id: metrics
+        if: always()
+        shell: pwsh
+        env:
+          STARTED_AT: ${{ steps.clock.outputs.started_at }}
+        run: |
+          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
+          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
+          "Preflight: $duration s" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Cache Cargo
+  checks:
+    name: Format, lint and test
+    needs: preflight
+    runs-on: windows-latest
+    outputs:
+      duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
+      cache_hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+      - name: Checkout exact SHA
+        uses: actions/checkout@v7
+      - name: Cache Cargo checks
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
@@ -67,25 +109,67 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          # Keep the key independent from the tag/ref so releases can restore
-          # the cache populated by the default branch.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
+      - name: Controlled checks failure
+        if: inputs.failure_mode == 'checks'
+        shell: pwsh
+        run: throw "Fallo controlado de checks; publish debe quedar bloqueado."
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Record checks timing
+        id: metrics
+        if: always()
+        shell: pwsh
+        env:
+          STARTED_AT: ${{ steps.clock.outputs.started_at }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
+          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
+          "Checks: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+
+  package:
+    name: Build Windows packages
+    needs: preflight
+    runs-on: windows-latest
+    outputs:
+      duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
+      cache_hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+      - name: Checkout exact SHA
+        uses: actions/checkout@v7
+      - name: Cache Cargo release
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
             ${{ runner.os }}-${{ runner.arch }}-cargo-release-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Test
-        run: cargo test --all-targets --locked
-
+      - name: Controlled package failure
+        if: inputs.failure_mode == 'package'
+        shell: pwsh
+        run: throw "Fallo controlado de package; publish debe quedar bloqueado."
       - name: Build release executable
         run: cargo build --release --locked
-
       - name: Install cargo-wix
         shell: pwsh
         run: |
@@ -93,69 +177,120 @@ jobs:
           if (-not (Test-Path -LiteralPath $cargoWix -PathType Leaf)) {
             cargo install cargo-wix --version 0.3.9 --locked
           }
-
-      - name: Build MSI
-        run: cargo wix --nocapture
-
-      - name: Prepare release assets
+      - name: Build MSI without rebuilding Rust
+        run: cargo wix --no-build --nocapture
+      - name: Prepare and verify release assets
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           New-Item -ItemType Directory -Path "dist" -Force | Out-Null
           $msiPath = "target\wix\git-helper-$env:RELEASE_VERSION-x86_64.msi"
-          if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) {
-            throw "cargo-wix no generó el MSI esperado: $msiPath"
-          }
-
+          if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) { throw "Falta el MSI: $msiPath" }
+          if (-not (Test-Path -LiteralPath "target\release\git-helper.exe" -PathType Leaf)) { throw "Falta git-helper.exe" }
           $msiName = "git-helper-$env:RELEASE_VERSION-windows-x86_64.msi"
           Copy-Item -LiteralPath $msiPath -Destination "dist\$msiName"
-
           $portable = "dist\portable"
           New-Item -ItemType Directory -Path $portable -Force | Out-Null
           Copy-Item -LiteralPath "target\release\git-helper.exe" -Destination $portable
           Copy-Item -LiteralPath "LICENSE" -Destination $portable
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $portable
-
           $zipName = "git-helper-$env:RELEASE_VERSION-windows-x86_64-portable.zip"
           Compress-Archive -Path "$portable\*" -DestinationPath "dist\$zipName"
           Remove-Item -LiteralPath $portable -Recurse
-
-          $checksumFiles = @($msiName, $zipName)
-          $checksums = foreach ($file in $checksumFiles) {
+          $checksums = foreach ($file in @($msiName, $zipName)) {
             $hash = (Get-FileHash -LiteralPath "dist\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $file"
           }
           Set-Content -LiteralPath "dist\SHA256SUMS.txt" -Value $checksums -Encoding utf8NoBOM
-
-      - name: Upload workflow artifacts
+          Set-Content -LiteralPath "dist\BUILD_SHA.txt" -Value $env:GITHUB_SHA -Encoding utf8NoBOM
+      - name: Upload packages for publication
         uses: actions/upload-artifact@v7
         with:
-          name: git-helper-${{ steps.release.outputs.version }}-windows-x86_64
-          path: |
-            dist/*.msi
-            dist/*.zip
-            dist/SHA256SUMS.txt
+          name: git-helper-${{ needs.preflight.outputs.version }}-windows-x86_64
+          path: dist
           if-no-files-found: error
+          retention-days: 7
+      - name: Record package timing
+        id: metrics
+        if: always()
+        shell: pwsh
+        env:
+          STARTED_AT: ${{ steps.clock.outputs.started_at }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
+          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
+          "Package: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
 
+  publish:
+    name: Publish validated artifacts
+    needs: [preflight, checks, package]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Start timing
+        id: clock
+        shell: pwsh
+        run: '"started_at=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_OUTPUT'
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: git-helper-${{ needs.preflight.outputs.version }}-windows-x86_64
+          path: dist
+      - name: Verify SHA, version and checksums
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $msi = "git-helper-$env:RELEASE_VERSION-windows-x86_64.msi"
+          $zip = "git-helper-$env:RELEASE_VERSION-windows-x86_64-portable.zip"
+          foreach ($file in @($msi, $zip, "SHA256SUMS.txt", "BUILD_SHA.txt")) {
+            if (-not (Test-Path -LiteralPath "dist\$file" -PathType Leaf)) { throw "Falta el artefacto: $file" }
+          }
+          $buildSha = (Get-Content -LiteralPath "dist\BUILD_SHA.txt" -Raw).Trim()
+          if ($buildSha -ne $env:GITHUB_SHA) { throw "Artefactos de $buildSha; SHA validado: $env:GITHUB_SHA" }
+          foreach ($line in Get-Content -LiteralPath "dist\SHA256SUMS.txt") {
+            if ($line -notmatch '^(?<hash>[a-f0-9]{64})  (?<file>.+)$') { throw "Checksum inválido: $line" }
+            $actual = (Get-FileHash -LiteralPath "dist\$($Matches.file)" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $Matches.hash) { throw "Checksum incorrecto para $($Matches.file)" }
+          }
+          Remove-Item -LiteralPath "dist\BUILD_SHA.txt"
       - name: Publish GitHub release
+        if: inputs.dry_run != true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
-            throw "La release $env:RELEASE_TAG ya existe."
-          }
-
-          $assets = Get-ChildItem -LiteralPath "dist" -File |
-            Where-Object { $_.Extension -in ".msi", ".zip", ".txt" } |
-            ForEach-Object { $_.FullName }
-          gh release create $env:RELEASE_TAG @assets `
-            --repo $env:GITHUB_REPOSITORY `
-            --target $env:GITHUB_SHA `
-            --title "Git Helper $env:RELEASE_TAG" `
-            --generate-notes
-          if ($LASTEXITCODE -ne 0) {
-            throw "GitHub no pudo crear la release $env:RELEASE_TAG."
-          }
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) { throw "La release ya existe" }
+          $assets = Get-ChildItem -LiteralPath "dist" -File | ForEach-Object { $_.FullName }
+          gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "GitHub no pudo crear la release" }
+      - name: Record release pipeline timing
+        if: always()
+        shell: pwsh
+        env:
+          PIPELINE_STARTED_AT: ${{ needs.preflight.outputs.started_at }}
+          PUBLISH_STARTED_AT: ${{ steps.clock.outputs.started_at }}
+          PREFLIGHT_SECONDS: ${{ needs.preflight.outputs.duration_seconds }}
+          CHECKS_SECONDS: ${{ needs.checks.outputs.duration_seconds }}
+          PACKAGE_SECONDS: ${{ needs.package.outputs.duration_seconds }}
+          CHECKS_CACHE_HIT: ${{ needs.checks.outputs.cache_hit }}
+          PACKAGE_CACHE_HIT: ${{ needs.package.outputs.cache_hit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $publishSeconds = $now - [long]$env:PUBLISH_STARTED_AT
+          $wallSeconds = $now - [long]$env:PIPELINE_STARTED_AT
+          $runnerSeconds = [long]$env:PREFLIGHT_SECONDS + [long]$env:CHECKS_SECONDS + [long]$env:PACKAGE_SECONDS + $publishSeconds
+          @"
+          ## Métricas de release
+          - Tiempo de pared: $wallSeconds s
+          - Tiempo total de runners: $runnerSeconds s
+          - Checks: $env:CHECKS_SECONDS s (cache exacta: $env:CHECKS_CACHE_HIT)
+          - Package: $env:PACKAGE_SECONDS s (cache exacta: $env:PACKAGE_CACHE_HIT)
+          - Publish: $publishSeconds s
+          - Dry run: $env:DRY_RUN
+          "@ >> $env:GITHUB_STEP_SUMMARY
