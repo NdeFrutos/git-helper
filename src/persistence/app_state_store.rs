@@ -21,7 +21,7 @@ use crate::domain::{
 
 /// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
 /// su brazo en `migrate`; nunca reutilices un número ya publicado por otra rama.
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -141,6 +141,7 @@ impl PersistedAppState {
                     refresh_coordinator: RefreshCoordinator::default(),
                     history_invalidated_during_refresh: false,
                     path_accessible: true,
+                    remote_freshness: crate::domain::RemoteFreshnessTracker::default(),
                 }
             })
             .collect();
@@ -325,6 +326,11 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
                 normalize_commit_drafts(&mut state);
                 state.schema_version = 3;
             }
+            3 => {
+                state.settings.periodic_fetch_enabled = false;
+                state = normalize_periodic_fetch_settings(state);
+                state.schema_version = 4;
+            }
             unknown => {
                 warn!(
                     version = unknown,
@@ -334,10 +340,17 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
             }
         }
     }
-    // Ambas normalizaciones son idempotentes y reparan estados escritos por
-    // builds intermedias que compartieron temporalmente el mismo número.
     normalize_ssh_clone_mappings(&mut state);
     normalize_commit_drafts(&mut state);
+    state = normalize_periodic_fetch_settings(state);
+    state
+}
+
+fn normalize_periodic_fetch_settings(mut state: PersistedAppState) -> PersistedAppState {
+    if state.settings.periodic_fetch_interval_secs == 0 {
+        state.settings.periodic_fetch_interval_secs =
+            crate::domain::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS;
+    }
     state
 }
 
@@ -507,6 +520,54 @@ mod tests {
             error,
             super::PersistenceError::UnsupportedSchema { .. }
         ));
+    }
+
+    #[test]
+    fn migrates_schema_v1_settings_without_periodic_fetch() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{
+                "schema_version": 1,
+                "settings": {
+                    "theme": "System",
+                    "cursor_context_consent": false
+                }
+            }"#,
+        )
+        .expect("debe escribir el fixture");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe migrar");
+
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert!(loaded.corruption_backup.is_none());
+        assert!(!loaded.state.settings.periodic_fetch_enabled);
+        assert_eq!(
+            loaded.state.settings.periodic_fetch_interval_secs,
+            crate::domain::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent_for_state_already_marked_as_v3() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{"schema_version":3,"repositories":[],"recent_repositories":[],"settings":{}}"#,
+        )
+        .expect("debe escribir el fixture v3 de otro cambio");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe cargar sin perder datos");
+
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.state.settings.periodic_fetch_interval_secs,
+            crate::domain::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS
+        );
     }
 
     #[test]

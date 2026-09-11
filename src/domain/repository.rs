@@ -1,10 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote, UpstreamState,
+    BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote,
+    RemoteFreshnessTracker, UpstreamState, remote_freshness::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
     status::FileChange,
 };
 
@@ -230,6 +231,7 @@ pub struct RepositorySession {
     pub history_invalidated_during_refresh: bool,
     /// Se evalúa al restaurar o reintentar; no elimina la sesión si la ruta no responde.
     pub path_accessible: bool,
+    pub remote_freshness: RemoteFreshnessTracker,
 }
 
 impl RepositorySession {
@@ -257,6 +259,7 @@ impl RepositorySession {
             refresh_coordinator: RefreshCoordinator::default(),
             history_invalidated_during_refresh: false,
             path_accessible: true,
+            remote_freshness: RemoteFreshnessTracker::default(),
         }
     }
 
@@ -402,14 +405,40 @@ pub struct SshCloneMapping {
     pub local_path: PathBuf,
 }
 
+fn default_periodic_fetch_interval_secs() -> u64 {
+    DEFAULT_PERIODIC_FETCH_INTERVAL_SECS
+}
+
 /// Preferencias persistentes independientes de los repositorios.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemePreference,
     pub cursor_cli_path: Option<PathBuf>,
     pub cursor_context_consent: bool,
     #[serde(default)]
     pub default_clone_directory: Option<PathBuf>,
+    /// Fetch automático desactivado por defecto.
+    #[serde(default)]
+    pub periodic_fetch_enabled: bool,
+    #[serde(default = "default_periodic_fetch_interval_secs")]
+    pub periodic_fetch_interval_secs: u64,
+    /// Remote preferido por repositorio cuando existen varios remotes.
+    #[serde(default)]
+    pub repository_preferred_remotes: HashMap<String, String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::default(),
+            cursor_cli_path: None,
+            cursor_context_consent: false,
+            default_clone_directory: None,
+            periodic_fetch_enabled: false,
+            periodic_fetch_interval_secs: DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
+            repository_preferred_remotes: HashMap::new(),
+        }
+    }
 }
 
 /// Preferencia de tema visual.

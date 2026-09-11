@@ -19,6 +19,7 @@ sincronizar con remotes y consultar el historial.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
 - Crear commits sin añadir archivos automáticamente.
 - Ejecutar `fetch`, `pull --ff-only` y `push`, incluida la primera publicación de una rama.
+- Ver la antigüedad de las referencias remotas y activar fetch automático (desactivado por defecto; Shift+clic alterna 5/15/30 min).
 - Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
@@ -180,9 +181,12 @@ la trazabilidad de código están en [docs/technical-decisions.md](docs/technica
   conflictos.
 - La vista de ramas es informativa: consultar otra rama carga su historial por referencia sin
   modificar `HEAD`, el índice ni el working tree. Las referencias remotas reflejan el último
-  `fetch` y no consultan la red por sí mismas.
+  `fetch` y no consultan la red por sí mismas. La barra de acciones indica la frescura del remote
+  principal; `Actualizar estado` solo relee refs locales. El fetch automático está desactivado por
+  defecto, respeta un intervalo configurable (5 minutos por defecto) y se pospone durante mutaciones
+  o generación de mensajes.
 - Si existen varios remotes y no hay upstream, algunas operaciones necesitan una selección
-  explícita.
+  explícita; esa elección se recuerda para fetch manual y automático.
 - El instalador aún no está firmado digitalmente.
 - GPUI todavía es pre-1.0 y puede exigir cambios al actualizar su revisión.
 

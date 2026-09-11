@@ -6,8 +6,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, PromptButton,
-    PromptLevel, Render, Subscription, Window, div, prelude::*, px, rgba, size, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, MouseButton, MouseDownEvent,
+    PathPromptOptions, PromptButton, PromptLevel, Render, Subscription, Window, div, prelude::*,
+    px, rgba, size, uniform_list,
 };
 
 use crate::{
@@ -23,10 +24,12 @@ use crate::{
         resolve_cursor_executable, validate_generation_result,
     },
     domain::{
-        AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
-        FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState, OperationKind,
-        RefreshState, RepositoryId, RepositorySession, RepositoryView, SshCloneMapping,
-        WorkingTreeSnapshot,
+        AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
+        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
+        OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
+        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
+        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
+        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -154,6 +157,14 @@ struct GenerationCompletion {
     staged_changed: bool,
 }
 
+/// Metadatos de un fetch en curso para actualizar frescura remota al terminar.
+#[derive(Clone, Debug)]
+struct FetchContext {
+    remote_name: String,
+    origin: FetchOrigin,
+    suppress_error_banner: bool,
+}
+
 /// Almacén localizado durante el arranque; su contenido se lee después en background.
 pub struct StartupState {
     pub store: AppStateStore,
@@ -195,6 +206,10 @@ pub struct MainWindow {
     pending_existing_clone_open: Option<(String, PathBuf)>,
     pending_startup_repository: Option<PathBuf>,
     instance_request_receiver: Option<InstanceRequestReceiver>,
+    periodic_fetch_generation: u64,
+    periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
+    active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
+    pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
 }
 
 #[allow(
@@ -248,6 +263,10 @@ impl MainWindow {
             pending_existing_clone_open: None,
             pending_startup_repository: startup.open_repository,
             instance_request_receiver: Some(instance_request_receiver),
+            periodic_fetch_generation: 0,
+            periodic_fetch_in_flight: HashSet::new(),
+            active_fetch_contexts: HashMap::new(),
+            pending_fetch_refresh: HashMap::new(),
         }
     }
 
@@ -451,6 +470,93 @@ impl MainWindow {
         .detach();
 
         self.open_perf_repository_hook(cx);
+        self.start_periodic_fetch_loop(cx);
+    }
+
+    fn start_periodic_fetch_loop(&mut self, cx: &mut Context<Self>) {
+        self.periodic_fetch_generation = self.periodic_fetch_generation.saturating_add(1);
+        let generation = self.periodic_fetch_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let timer = cx
+                    .background_executor()
+                    .timer(periodic_fetch_poll_interval());
+                timer.await;
+                let should_continue = this
+                    .update(cx, |this, cx| {
+                        if this.periodic_fetch_generation != generation {
+                            return false;
+                        }
+                        this.tick_periodic_fetch(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tick_periodic_fetch(&mut self, cx: &mut Context<Self>) {
+        let now_secs = SystemClock.now_secs();
+        let Some(candidate) = select_periodic_fetch(
+            now_secs,
+            self.state.active_repository_id,
+            &self.state.repositories,
+            self.state.settings.periodic_fetch_enabled,
+            self.state.settings.periodic_fetch_interval_secs,
+            &self.state.settings.repository_preferred_remotes,
+            &self.periodic_fetch_in_flight,
+        ) else {
+            return;
+        };
+        self.execute_fetch(
+            candidate.repository_id,
+            candidate.remote_name,
+            FetchOrigin::Periodic,
+            true,
+            cx,
+        );
+    }
+
+    fn toggle_periodic_fetch(&mut self, cx: &mut Context<Self>) {
+        self.state.settings.periodic_fetch_enabled = !self.state.settings.periodic_fetch_enabled;
+        if self.state.settings.periodic_fetch_enabled {
+            let now_secs = SystemClock.now_secs();
+            for repository in &mut self.state.repositories {
+                repository.remote_freshness.schedule_immediately(now_secs);
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn cycle_periodic_fetch_interval(&mut self, cx: &mut Context<Self>) {
+        self.state.settings.periodic_fetch_interval_secs =
+            next_periodic_fetch_interval(self.state.settings.periodic_fetch_interval_secs);
+        if self.state.settings.periodic_fetch_enabled {
+            let now_secs = SystemClock.now_secs();
+            for repository in &mut self.state.repositories {
+                repository.remote_freshness.schedule_immediately(now_secs);
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn remember_preferred_remote(
+        &mut self,
+        repository_root: &Path,
+        remote_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.state
+            .settings
+            .repository_preferred_remotes
+            .insert(normalized_repo_key(repository_root), remote_name.to_owned());
+        self.save_state(cx);
     }
 
     /// Abre automáticamente el repositorio indicado en `GH_PERF_OPEN_REPO`.
@@ -1116,6 +1222,10 @@ impl MainWindow {
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
         self.expanded_errors.remove(&repository_id);
         self.change_rows.remove(&repository_id);
+        self.active_fetch_contexts.remove(&repository_id);
+        self.pending_fetch_refresh.remove(&repository_id);
+        self.periodic_fetch_in_flight
+            .retain(|(id, _)| *id != repository_id);
         if was_active {
             self.state.active_repository_id = self
                 .state
@@ -1577,6 +1687,33 @@ impl MainWindow {
                     repository.history_loading = false;
                 }
                 repository.has_loaded_snapshot = true;
+                let remotes = repository
+                    .working_tree
+                    .remotes
+                    .iter()
+                    .map(|remote| remote.name.clone())
+                    .collect::<Vec<_>>();
+                let branches = repository.working_tree.branches.clone();
+                let now_secs = SystemClock.now_secs();
+                if let Some((remote_name, origin)) =
+                    self.pending_fetch_refresh.remove(&repository_id)
+                {
+                    repository.remote_freshness.mark_fetch_succeeded(
+                        &remote_name,
+                        origin,
+                        now_secs,
+                        &branches,
+                        self.state.settings.periodic_fetch_interval_secs,
+                    );
+                    self.periodic_fetch_in_flight
+                        .remove(&(repository_id, remote_name));
+                } else {
+                    repository.remote_freshness.detect_external_updates(
+                        &remotes,
+                        &branches,
+                        now_secs,
+                    );
+                }
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
                 };
@@ -1599,6 +1736,26 @@ impl MainWindow {
                 let details = error.technical_details();
                 if history_included {
                     repository.history_loading = false;
+                }
+                let is_cancelled = is_cancelled_error(&error);
+                if let Some((remote_name, _origin)) =
+                    self.pending_fetch_refresh.remove(&repository_id)
+                {
+                    self.periodic_fetch_in_flight
+                        .remove(&(repository_id, remote_name.clone()));
+                    if is_cancelled {
+                        repository
+                            .remote_freshness
+                            .record_mut(&remote_name)
+                            .fetch_in_progress = false;
+                    } else {
+                        repository.remote_freshness.mark_fetch_failed(
+                            &remote_name,
+                            SystemClock.now_secs(),
+                            error.to_string(),
+                            self.state.settings.periodic_fetch_interval_secs,
+                        );
+                    }
                 }
                 match classify_git_process_failure(&error) {
                     ProcessFailure::Cancelled => {
@@ -2492,17 +2649,69 @@ impl MainWindow {
         if !repository.can_mutate() {
             return;
         }
+        let preferred = self
+            .state
+            .settings
+            .repository_preferred_remotes
+            .get(&normalized_repo_key(&repository.root_path))
+            .map(String::as_str);
         let plan = plan_fetch(
             repository.working_tree.upstream.as_ref(),
             &repository.working_tree.remotes,
-            None,
+            preferred,
         );
         match plan {
             Err(GitError::RemoteSelectionRequired { remotes }) => {
                 self.prompt_for_remote(repository_id, OperationKind::Fetch, remotes, window, cx);
             }
+            Ok(RemoteOperationPlan::Fetch { remote_name }) => {
+                self.execute_fetch(repository_id, remote_name, FetchOrigin::Manual, false, cx);
+            }
             plan => self.run_remote_plan(repository_id, OperationKind::Fetch, plan, cx),
         }
+    }
+
+    fn execute_fetch(
+        &mut self,
+        repository_id: RepositoryId,
+        remote_name: String,
+        origin: FetchOrigin,
+        suppress_error_banner: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        if !repository.can_mutate() {
+            return;
+        }
+        let now_secs = SystemClock.now_secs();
+        let interval_secs = self.state.settings.periodic_fetch_interval_secs;
+        if origin == FetchOrigin::Manual {
+            repository
+                .remote_freshness
+                .reset_schedule_after_manual_fetch(now_secs, interval_secs);
+        }
+        repository
+            .remote_freshness
+            .mark_fetch_started(&remote_name, now_secs);
+        self.periodic_fetch_in_flight
+            .insert((repository_id, remote_name.clone()));
+        self.active_fetch_contexts.insert(
+            repository_id,
+            FetchContext {
+                remote_name: remote_name.clone(),
+                origin,
+                suppress_error_banner,
+            },
+        );
+        let plan = Ok(RemoteOperationPlan::Fetch { remote_name });
+        self.run_remote_plan(repository_id, OperationKind::Fetch, plan, cx);
     }
 
     fn pull(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -2592,22 +2801,32 @@ impl MainWindow {
                 else {
                     return;
                 };
+                let root_path = repository.root_path.clone();
+                let upstream = repository.working_tree.upstream.clone();
+                let remotes = repository.working_tree.remotes.clone();
+                let head = repository.working_tree.head.clone();
+                this.remember_preferred_remote(&root_path, &remote_name, cx);
                 let plan = match kind {
-                    OperationKind::Fetch => plan_fetch(
-                        repository.working_tree.upstream.as_ref(),
-                        &repository.working_tree.remotes,
-                        Some(&remote_name),
-                    ),
-                    OperationKind::Push => plan_push(
-                        &repository.working_tree.head,
-                        repository.working_tree.upstream.as_ref(),
-                        &repository.working_tree.remotes,
-                        Some(&remote_name),
-                    ),
+                    OperationKind::Fetch => {
+                        plan_fetch(upstream.as_ref(), &remotes, Some(&remote_name))
+                    }
+                    OperationKind::Push => {
+                        plan_push(&head, upstream.as_ref(), &remotes, Some(&remote_name))
+                    }
                     _ => return,
                 };
                 if kind == OperationKind::Fetch {
-                    this.run_remote_plan(repository_id, kind, plan, cx);
+                    if let Ok(RemoteOperationPlan::Fetch { remote_name }) = plan {
+                        this.execute_fetch(
+                            repository_id,
+                            remote_name,
+                            FetchOrigin::Manual,
+                            false,
+                            cx,
+                        );
+                    } else {
+                        this.run_remote_plan(repository_id, kind, plan, cx);
+                    }
                 } else {
                     match plan {
                         Ok(plan) => {
@@ -2768,6 +2987,7 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 this.active_mutation_cancellations.remove(&repository_id);
+                let fetch_context = this.active_fetch_contexts.remove(&repository_id);
                 let mut refresh_immediately = false;
                 match result {
                     Ok(()) => {
@@ -2775,6 +2995,14 @@ impl MainWindow {
                             && let Some(input) = this.commit_inputs.get(&repository_id)
                         {
                             input.update(cx, CommitInput::clear);
+                        }
+                        if let Some(fetch_context) = &fetch_context
+                            && kind == OperationKind::Fetch
+                        {
+                            this.pending_fetch_refresh.insert(
+                                repository_id,
+                                (fetch_context.remote_name.clone(), fetch_context.origin),
+                            );
                         }
                         if let Some(repository) = this
                             .state
@@ -2805,6 +3033,38 @@ impl MainWindow {
                     }
                     Err(error) => {
                         refresh_immediately = true;
+                        let suppress_error = fetch_context
+                            .as_ref()
+                            .is_some_and(|context| context.suppress_error_banner);
+                        if let Some(context) = &fetch_context
+                            && kind == OperationKind::Fetch
+                        {
+                            let interval_secs = this.state.settings.periodic_fetch_interval_secs;
+                            if let Some(repository) = this
+                                .state
+                                .repositories
+                                .iter_mut()
+                                .find(|repository| repository.id == repository_id)
+                            {
+                                let is_cancelled = is_cancelled_error(&error);
+                                if is_cancelled {
+                                    repository
+                                        .remote_freshness
+                                        .record_mut(&context.remote_name)
+                                        .fetch_in_progress = false;
+                                } else {
+                                    repository.remote_freshness.mark_fetch_failed(
+                                        &context.remote_name,
+                                        SystemClock.now_secs(),
+                                        error.to_string(),
+                                        interval_secs,
+                                    );
+                                }
+                            }
+                            this.periodic_fetch_in_flight
+                                .remove(&(repository_id, context.remote_name.clone()));
+                            this.pending_fetch_refresh.remove(&repository_id);
+                        }
                         if let Some(repository) = this
                             .state
                             .repositories
@@ -2839,8 +3099,24 @@ impl MainWindow {
                                         message: error.to_string(),
                                         details: error.technical_details(),
                                     };
-                                    repository.status_message = "La operación falló".to_owned();
-                                    repository.error = Some(error.technical_details());
+                                    repository.status_message =
+                                        if kind == OperationKind::Fetch && suppress_error {
+                                            repository.remote_freshness.label_for_remote(
+                                                fetch_context.as_ref().map_or(
+                                                    "remote",
+                                                    |context| context.remote_name.as_str(),
+                                                ),
+                                                SystemClock.now_secs(),
+                                            )
+                                        } else {
+                                            "La operación falló".to_owned()
+                                        };
+                                    repository.error =
+                                        if kind == OperationKind::Fetch && suppress_error {
+                                            None
+                                        } else {
+                                            Some(error.technical_details())
+                                        };
                                 }
                             }
                         }
@@ -3005,6 +3281,15 @@ impl MainWindow {
                 upstream.full_name, upstream.ahead, upstream.behind
             )
         });
+        let remote_freshness = primary_remote_label(
+            repository,
+            &self.state.settings.repository_preferred_remotes,
+            SystemClock.now_secs(),
+        );
+        let periodic_fetch_label = format_periodic_fetch_interval_label(
+            self.state.settings.periodic_fetch_enabled,
+            self.state.settings.periodic_fetch_interval_secs,
+        );
         let can_mutate = repository.can_mutate();
         let is_refreshing = repository.is_refreshing();
         div()
@@ -3043,6 +3328,16 @@ impl MainWindow {
                                 .text_ellipsis()
                                 .child(upstream),
                         )
+                    })
+                    .when_some(remote_freshness, |row, label| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(WARNING_COLOR)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        )
                     }),
             )
             .child(
@@ -3052,6 +3347,18 @@ impl MainWindow {
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
+                    .child(
+                        action_button("auto-fetch", periodic_fetch_label, true).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                if event.modifiers.shift {
+                                    this.cycle_periodic_fetch_interval(cx);
+                                } else {
+                                    this.toggle_periodic_fetch(cx);
+                                }
+                            }),
+                        ),
+                    )
                     .child(
                         action_button("fetch", "Fetch", can_mutate).on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -3868,11 +4175,30 @@ impl MainWindow {
         // elegir otra fila, así que no se ofrece un botón que no haría nada.
         let can_retry_details = detail_error.is_some() && selected_commit.is_some();
         let has_details_panel = details_loading || detail_error.is_some() || details.is_some();
+        let remote_freshness_notice = primary_remote_label(
+            repository,
+            &self.state.settings.repository_preferred_remotes,
+            SystemClock.now_secs(),
+        );
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .when_some(remote_freshness_notice, |history, notice| {
+                history.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(BORDER_COLOR)
+                        .text_xs()
+                        .text_color(MUTED_TEXT_COLOR)
+                        .child(format!(
+                            "Las referencias remotas reflejan el último fetch local. {notice}. Actualizar estado solo relee refs locales; usa Fetch para consultar el servidor."
+                        )),
+                )
+            })
             .child(
                 div()
                     .id("branch-inventory")
@@ -4994,6 +5320,13 @@ fn classify_cursor_failure(error: &crate::cursor::CursorError) -> ProcessFailure
 
 /// Formatea un timeout para texto visible: `Duration` en `Debug` produce
 /// unidades inconsistentes (`2s`, `1.5s`, `350ms`) dentro de una misma frase.
+fn is_cancelled_error(error: &GitError) -> bool {
+    matches!(
+        error,
+        GitError::Process(crate::process::ProcessError::Cancelled)
+    )
+}
+
 fn format_timeout(timeout: Duration) -> String {
     let seconds = timeout.as_secs_f64();
     if seconds >= 1.0 {
@@ -5148,7 +5481,77 @@ mod tests {
             pending_existing_clone_open: None,
             pending_startup_repository: None,
             instance_request_receiver: None,
+            periodic_fetch_generation: 0,
+            periodic_fetch_in_flight: HashSet::new(),
+            active_fetch_contexts: HashMap::new(),
+            pending_fetch_refresh: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn failed_refresh_after_fetch_releases_periodic_fetch_state() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        {
+            let working_tree = Arc::make_mut(&mut repository.working_tree);
+            working_tree.remotes.push(crate::domain::Remote {
+                name: "origin".to_owned(),
+            });
+            working_tree.upstream = Some(crate::domain::UpstreamState {
+                remote_name: "origin".to_owned(),
+                branch_name: "main".to_owned(),
+                full_name: "origin/main".to_owned(),
+                ahead: 0,
+                behind: 0,
+            });
+        }
+        repository
+            .remote_freshness
+            .mark_fetch_started("origin", 100);
+        repository.remote_freshness.schedule_immediately(100);
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.settings.periodic_fetch_enabled = true;
+        window
+            .pending_fetch_refresh
+            .insert(repository_id, ("origin".to_owned(), FetchOrigin::Periodic));
+        window
+            .periodic_fetch_in_flight
+            .insert((repository_id, "origin".to_owned()));
+
+        let pending = window.prepare_refresh(repository_id).unwrap();
+        let outcome = window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            true,
+            Err(GitError::InvalidStatus {
+                message: "refresh roto".to_owned(),
+            }),
+        );
+
+        assert!(!outcome.succeeded);
+        assert!(window.pending_fetch_refresh.is_empty());
+        assert!(window.periodic_fetch_in_flight.is_empty());
+        let repository = &window.state.repositories[0];
+        assert!(
+            !repository
+                .remote_freshness
+                .record("origin")
+                .expect("debe existir el remote")
+                .fetch_in_progress
+        );
+        assert!(
+            select_periodic_fetch(
+                u64::MAX / 2,
+                Some(repository_id),
+                &window.state.repositories,
+                true,
+                crate::domain::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
+                &window.state.settings.repository_preferred_remotes,
+                &window.periodic_fetch_in_flight,
+            )
+            .is_some()
+        );
     }
 
     #[test]
