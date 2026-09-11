@@ -108,6 +108,20 @@ Al cerrar una pestaña se cancelan los tokens activos, se eliminan watchers y se
 cuya generación ya no coincide con la sesión. Un watcher que termine de instalarse después del cierre
 no se registra ni procesa eventos.
 
+## Selección de detalles del historial
+
+La selección de un commit se trata como una petición versionada por sesión, generación de historial,
+referencia, OID y hash del commit. Al seleccionar otra fila se cancela la petición anterior y se
+notifica inmediatamente el nuevo estado; una respuesta solo puede actualizar la vista si todavía
+coincide con toda esa identidad. Cerrar la pestaña o cambiar de rama invalida y cancela las
+peticiones pendientes.
+
+Los detalles correctos se cachean por hash de commit en una caché LRU sencilla de 64 entradas. La
+caché se conserva al cambiar de rama para que volver a un commit conocido no lance otro proceso
+Git. Los errores no se cachean y permanecen asociados a la selección actual para permitir reintento.
+Al refrescar, la selección se conserva solo si el commit sigue en la referencia; en caso contrario
+el fallback es dejarla vacía.
+
 ## Persistencia
 
 El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
