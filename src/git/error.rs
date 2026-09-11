@@ -53,6 +53,8 @@ pub enum GitError {
     MissingRemote,
     #[error("HEAD está separado; esta operación no está disponible")]
     DetachedHead,
+    #[error("la rama actual todavía no tiene commits; no se puede hacer push")]
+    UnbornHead,
     #[error("no se puede descartar un conflicto desde Git Helper")]
     ConflictDiscardUnsupported,
     #[error("un cambio staged no se puede descartar antes del primer commit")]

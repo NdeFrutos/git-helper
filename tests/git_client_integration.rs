@@ -5,7 +5,7 @@ use std::{
 };
 
 use git_helper::{
-    domain::ChangeKind,
+    domain::{BranchUpstream, ChangeKind, HeadState},
     git::{
         GitClient, classify_remote_failure, parse_ssh_url, plan_clone_destination, plan_discard,
         plan_pull, plan_push,
@@ -411,6 +411,15 @@ fn enumerates_branches_and_reads_selected_history_without_checkout() {
         snapshot
             .branches
             .iter()
+            .find(|branch| branch.name == "sin-upstream")
+            .expect("debe listar ramas locales sin upstream")
+            .upstream,
+        BranchUpstream::NoUpstream
+    ));
+    assert!(matches!(
+        snapshot
+            .branches
+            .iter()
             .find(|branch| branch.name == "upstream-eliminado")
             .expect("debe conservar el upstream configurado")
             .upstream,
@@ -446,6 +455,112 @@ fn enumerates_branches_and_reads_selected_history_without_checkout() {
         .branches(&repository, &cancellation)
         .expect("debe invalidar la caché de referencias");
     assert!(refreshed.iter().any(|branch| branch.name == "externa"));
+}
+
+#[test]
+fn unborn_and_detached_heads_keep_branch_inventory_consistent() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    let unborn = client
+        .branches(temporary.path(), &cancellation)
+        .expect("debe listar la rama activa en un repositorio unborn");
+    let main = unborn
+        .iter()
+        .find(|branch| branch.name == "main")
+        .expect("debe exponer main como rama activa sin commits");
+    assert!(main.is_active);
+    assert!(main.oid.is_none());
+    assert_eq!(main.upstream, BranchUpstream::NoUpstream);
+
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+    client.invalidate_branches(temporary.path());
+    require_git(temporary.path(), &["checkout", "--detach", "HEAD"]);
+    let detached_status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer HEAD separado");
+    assert!(matches!(detached_status.head, HeadState::Detached { .. }));
+
+    let detached = client
+        .branches(temporary.path(), &cancellation)
+        .expect("debe conservar el inventario con HEAD separado");
+    assert!(detached.iter().all(|branch| !branch.is_active));
+    assert!(detached.iter().any(|branch| branch.name == "main"));
+}
+
+#[test]
+fn lists_remote_tracking_refs_from_multiple_remotes() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+    let head_oid = String::from_utf8(run_git(temporary.path(), &["rev-parse", "HEAD"]).stdout)
+        .expect("OID UTF-8")
+        .trim()
+        .to_owned();
+
+    let origin = temporary.path().join("origin.git");
+    let team = temporary.path().join("team.git");
+    fs::create_dir_all(&origin).expect("debe crear origin");
+    fs::create_dir_all(&team).expect("debe crear team");
+    require_git(&origin, &["init", "--bare"]);
+    require_git(&team, &["init", "--bare"]);
+    require_git(
+        temporary.path(),
+        &["remote", "add", "origin", &origin.display().to_string()],
+    );
+    require_git(
+        temporary.path(),
+        &["remote", "add", "team", &team.display().to_string()],
+    );
+    require_git(
+        temporary.path(),
+        &["update-ref", "refs/remotes/origin/main", &head_oid],
+    );
+    require_git(
+        temporary.path(),
+        &["update-ref", "refs/remotes/team/main", &head_oid],
+    );
+
+    let snapshot = client
+        .snapshot(temporary.path(), &cancellation)
+        .expect("debe enumerar refs de varios remotes");
+    assert_eq!(snapshot.remotes.len(), 2);
+    assert!(
+        snapshot
+            .remotes
+            .iter()
+            .any(|remote| remote.name == "origin")
+    );
+    assert!(snapshot.remotes.iter().any(|remote| remote.name == "team"));
+    assert!(
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "origin/main")
+    );
+    assert!(
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "team/main")
+    );
 }
 
 #[test]

@@ -1783,7 +1783,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.working_tree.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.working_tree.head);
         let is_directory = repository.root_path.join(&change.path).is_dir();
         let plan = match plan_discard(change, discard_staged, has_head, is_directory) {
             Ok(plan) => plan,
@@ -1854,7 +1854,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.working_tree.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.working_tree.head);
         let mut planned_paths = HashSet::new();
         let mut plans = Vec::new();
         for change in &repository.working_tree.changes {
@@ -2894,11 +2894,7 @@ impl MainWindow {
 
     fn render_toolbar(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
         let repository_id = repository.id;
-        let branch = match &repository.working_tree.head {
-            HeadState::Branch { name, .. } => name.clone(),
-            HeadState::Detached { .. } => "HEAD separado".to_owned(),
-            HeadState::Unborn => "Sin commit inicial".to_owned(),
-        };
+        let branch = head_label(&repository.working_tree.head);
         let upstream = repository.working_tree.upstream.as_ref().map(|upstream| {
             format!(
                 "{}  ↑{} ↓{}",
@@ -3570,13 +3566,23 @@ impl MainWindow {
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
-                            if repository.history_generation != generation
-                                || !history_target_is_current(
-                                    repository,
-                                    &page.reference,
-                                    &page.oid,
-                                )
-                            {
+                            if repository.history_generation != generation {
+                                return;
+                            }
+                            if !history_target_is_current(
+                                repository,
+                                &page.reference,
+                                &page.oid,
+                            ) {
+                                repository.history_loading = false;
+                                repository.history_loaded = false;
+                                repository.status_message =
+                                    "La selección de historial cambió".to_owned();
+                                repository.error = Some(
+                                    "Se descartó el resultado obsoleto; vuelve a seleccionar la rama."
+                                        .to_owned(),
+                                );
+                                cx.notify();
                                 return;
                             }
                             let history = Arc::make_mut(&mut repository.history);
@@ -4120,6 +4126,22 @@ impl Render for MainWindow {
                 )
             })
             .child(self.render_status_bar(active_repository.as_ref()))
+    }
+}
+
+fn repository_has_commits(head: &HeadState) -> bool {
+    match head {
+        HeadState::Branch { oid: Some(_), .. } | HeadState::Detached { .. } => true,
+        HeadState::Branch { oid: None, .. } | HeadState::Unborn => false,
+    }
+}
+
+fn head_label(head: &HeadState) -> String {
+    match head {
+        HeadState::Branch { name, oid: Some(_) } => name.clone(),
+        HeadState::Branch { name, oid: None } => format!("{name} (sin commits)"),
+        HeadState::Detached { .. } => "HEAD separado".to_owned(),
+        HeadState::Unborn => "Sin commit inicial".to_owned(),
     }
 }
 
@@ -4818,6 +4840,24 @@ mod tests {
             Some(("deadbeef".to_owned(), "deadbeef".to_owned()))
         );
         assert_eq!(history_target_for_head(&HeadState::Unborn), None);
+    }
+
+    #[test]
+    fn labels_an_unborn_branch_without_hiding_its_name() {
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: None,
+            }),
+            "main (sin commits)"
+        );
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("abc".to_owned()),
+            }),
+            "main"
+        );
     }
 
     #[test]
