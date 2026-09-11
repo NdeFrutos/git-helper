@@ -364,7 +364,8 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            descendant_command(),
+            false,
+            SURVIVING_DESCENDANT_LIFETIME,
             TIMEOUT_FIXTURE_LIMIT,
         );
         let started_at = std::time::Instant::now();
@@ -374,7 +375,12 @@ mod tests {
 
         let descendant_pid =
             read_descendant_pid(&temporary.path().join("child.pid"), Duration::from_secs(3))
-                .expect("el fixture debe publicar el PID del descendiente");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "el fixture debe publicar el PID del descendiente; {}",
+                        fixture_diagnostics(temporary.path())
+                    )
+                });
         let result = worker
             .join()
             .expect("el runner no debe dejar un worker colgado");
@@ -390,7 +396,8 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            descendant_command(),
+            false,
+            SURVIVING_DESCENDANT_LIFETIME,
             Duration::from_secs(10),
         );
         let cancellation = CancellationToken::default();
@@ -401,7 +408,12 @@ mod tests {
 
         let descendant_pid =
             read_descendant_pid(&temporary.path().join("child.pid"), Duration::from_secs(3))
-                .expect("el fixture debe publicar el PID del descendiente antes de cancelar");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "el fixture debe publicar el PID antes de cancelar; {}",
+                        fixture_diagnostics(temporary.path())
+                    )
+                });
         cancellation.cancel();
         let result = worker
             .join()
@@ -418,7 +430,8 @@ mod tests {
         let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
         let request = write_fixture(
             temporary.path(),
-            normal_exit_descendant_command(),
+            true,
+            Duration::from_secs(2),
             Duration::from_secs(10),
         );
         let started_at = std::time::Instant::now();
@@ -427,8 +440,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(started_at.elapsed() < Duration::from_secs(3));
         assert!(
-            wait_for_file(&temporary.path().join("marker.txt"), Duration::from_secs(5)),
-            "el descendiente heredado debe terminar sin bloquear al padre"
+            wait_for_file(
+                &temporary.path().join("marker.txt"),
+                Duration::from_secs(10)
+            ),
+            "el descendiente heredado debe terminar sin bloquear al padre; {}",
+            fixture_diagnostics(temporary.path())
         );
     }
 
@@ -462,7 +479,8 @@ mod tests {
             let temporary = tempfile::tempdir().expect("debe crear el directorio temporal");
             let request = write_fixture(
                 temporary.path(),
-                descendant_command(),
+                false,
+                SURVIVING_DESCENDANT_LIFETIME,
                 Duration::from_secs(10),
             );
             let pid_path = temporary.path().join("child.pid");
@@ -471,8 +489,13 @@ mod tests {
             let worker =
                 std::thread::spawn(move || SystemProcessRunner.run(request, &worker_cancellation));
 
-            let child_pid = read_descendant_pid(&pid_path, Duration::from_secs(3))
-                .unwrap_or_else(|| panic!("el fixture {iteration} no publicó el PID"));
+            let child_pid =
+                read_descendant_pid(&pid_path, Duration::from_secs(3)).unwrap_or_else(|| {
+                    panic!(
+                        "el fixture {iteration} no publicó el PID; {}",
+                        fixture_diagnostics(temporary.path())
+                    )
+                });
             cancellation.cancel();
             assert!(matches!(
                 worker
@@ -484,8 +507,64 @@ mod tests {
         }
     }
 
+    /// Directorio donde el descendiente publica su PID y su marca de final.
     #[cfg(windows)]
-    fn write_fixture(directory: &Path, command: &str, timeout: Duration) -> ProcessRequest {
+    const FIXTURE_DIRECTORY_VARIABLE: &str = "GIT_HELPER_PROCESS_FIXTURE_DIR";
+    /// Milisegundos que el descendiente permanece vivo antes de marcar su final.
+    #[cfg(windows)]
+    const FIXTURE_LIFETIME_VARIABLE: &str = "GIT_HELPER_PROCESS_FIXTURE_MS";
+    #[cfg(windows)]
+    const FIXTURE_DESCENDANT_TEST: &str = "process::tests::process_tree_fixture_descendant";
+    /// Vida del descendiente que debe sobrevivir a su padre y ser terminado
+    /// por el runner: más larga que cualquier plazo de las pruebas.
+    #[cfg(windows)]
+    const SURVIVING_DESCENDANT_LIFETIME: Duration = Duration::from_secs(30);
+
+    /// Descendiente de las pruebas de árbol de procesos.
+    ///
+    /// El propio binario de pruebas hace de fixture. Depender de
+    /// `powershell.exe` dejaba el resultado en manos del arranque del
+    /// intérprete, que en CI tarda lo suficiente como para que la prueba no
+    /// llegue a comprobar nada. Sin la variable de entorno no hace nada, así
+    /// que en una ejecución normal de la suite es un test vacío.
+    #[cfg(windows)]
+    #[test]
+    fn process_tree_fixture_descendant() {
+        let Ok(directory) = std::env::var(FIXTURE_DIRECTORY_VARIABLE) else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let lifetime = std::env::var(FIXTURE_LIFETIME_VARIABLE)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(SURVIVING_DESCENDANT_LIFETIME, Duration::from_millis);
+        fs::write(directory.join("child.pid"), std::process::id().to_string())
+            .expect("el descendiente debe publicar su PID");
+        std::thread::sleep(lifetime);
+        let _ = fs::write(directory.join("marker.txt"), "survivor");
+    }
+
+    /// Prepara un `cmd.exe` que lanza el descendiente heredando sus handles.
+    ///
+    /// Con `detached`, `cmd.exe` termina de inmediato y deja al descendiente
+    /// vivo con los handles de salida heredados.
+    #[cfg(windows)]
+    fn write_fixture(
+        directory: &Path,
+        detached: bool,
+        lifetime: Duration,
+        timeout: Duration,
+    ) -> ProcessRequest {
+        let descendant = std::env::current_exe().expect("el binario de pruebas debe existir");
+        let launch = format!(
+            r#""{}" {FIXTURE_DESCENDANT_TEST} --exact --nocapture"#,
+            descendant.display()
+        );
+        let command = if detached {
+            format!(r#"start "" /B {launch}"#)
+        } else {
+            launch
+        };
         let script = directory.join("process-tree-fixture.cmd");
         fs::write(&script, format!("@echo off\r\n{command}\r\n"))
             .expect("debe escribir el fixture de procesos");
@@ -493,7 +572,16 @@ mod tests {
             label: "process-tree-fixture",
             program: PathBuf::from("cmd.exe"),
             arguments: vec!["/D".into(), "/S".into(), "/C".into(), script.into()],
-            environment: Vec::new(),
+            environment: vec![
+                (
+                    FIXTURE_DIRECTORY_VARIABLE.into(),
+                    directory.as_os_str().to_owned(),
+                ),
+                (
+                    FIXTURE_LIFETIME_VARIABLE.into(),
+                    lifetime.as_millis().to_string().into(),
+                ),
+            ],
             removed_environment: Vec::new(),
             current_directory: Some(directory.to_path_buf()),
             stdin: None,
@@ -501,14 +589,20 @@ mod tests {
         }
     }
 
+    /// Contenido del directorio del fixture, para que un fallo en CI diga si
+    /// llegó a arrancar el descendiente o no.
     #[cfg(windows)]
-    fn descendant_command() -> &'static str {
-        r#"powershell.exe -NoProfile -NonInteractive -Command "$PID | Set-Content -LiteralPath child.pid; Start-Sleep -Seconds 30; Set-Content -LiteralPath marker.txt survivor""#
-    }
-
-    #[cfg(windows)]
-    fn normal_exit_descendant_command() -> &'static str {
-        r#"start "" /B powershell.exe -NoProfile -NonInteractive -Command "$PID | Set-Content -LiteralPath child.pid; Start-Sleep -Seconds 2; Set-Content -LiteralPath marker.txt survivor""#
+    fn fixture_diagnostics(directory: &Path) -> String {
+        fs::read_dir(directory).map_or_else(
+            |error| format!("no se pudo listar {}: {error}", directory.display()),
+            |entries| {
+                let names: Vec<String> = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                format!("contenido del fixture: {names:?}")
+            },
+        )
     }
 
     #[cfg(windows)]

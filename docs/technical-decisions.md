@@ -53,9 +53,10 @@ cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda 
 
 Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
 los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
-fixture publica el PID del descendiente y las pruebas comprueban su desaparición con `tasklist.exe`;
-no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta antes incluso de
-que el descendiente pudiera escribirlo. La
+descendiente es el propio binario de pruebas —no un intérprete externo, cuyo arranque decidía en CI
+si la prueba llegaba a comprobar algo—, publica su PID y las pruebas verifican su desaparición con
+`tasklist.exe`; no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta
+antes incluso de que el descendiente pudiera escribirlo. La
 comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
 puede no tener Cargo o Windows disponible.
 
