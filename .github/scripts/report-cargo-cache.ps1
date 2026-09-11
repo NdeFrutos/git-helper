@@ -4,9 +4,10 @@
     tamaño en disco de las rutas cacheadas.
 
 .DESCRIPTION
-    Lee CACHE_HIT, MATCHED_KEY y PRIMARY_KEY del entorno (salidas de actions/cache)
-    y escribe un bloque en el resumen del job. Además expone duration_seconds,
-    cache_hit y cache_size_mb como salidas del paso para que otros jobs las usen.
+    Lee CACHE_HIT y MATCHED_KEY del entorno (salidas de actions/cache) y escribe un
+    bloque en el resumen del job. Además expone duration_seconds, cache_hit y
+    cache_size_mb como salidas del paso para que otros jobs las usen. La clave
+    primaria no se repite aquí: la imprime el propio paso de actions/cache.
 
     Los tamaños son los del contenido descomprimido en disco, no los del archivo
     que GitHub almacena; sirven para vigilar el límite de 10 GB por repositorio.
@@ -49,14 +50,12 @@ $totalMb = [math]::Round(($rows | Measure-Object -Property SizeMb -Sum).Sum, 1)
 $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$StartedAt
 $exactHit = if ($env:CACHE_HIT -eq "true") { "sí" } else { "no" }
 $matched = if ([string]::IsNullOrWhiteSpace($env:MATCHED_KEY)) { "ninguna (ejecución fría)" } else { $env:MATCHED_KEY }
-$primary = if ([string]::IsNullOrWhiteSpace($env:PRIMARY_KEY)) { "desconocida" } else { $env:PRIMARY_KEY }
 
 $summary = @(
     "## Caché de Cargo: $Phase",
     "",
     "- Duración del job: $duration s",
     "- Acierto exacto: $exactHit",
-    "- Clave primaria: ``$primary``",
     "- Clave restaurada: ``$matched``",
     "- Tamaño total en disco de las rutas cacheadas: $totalMb MB",
     "",

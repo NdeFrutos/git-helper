@@ -70,7 +70,6 @@ jobs:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
           MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
-          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
         run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Checks" -StartedAt $env:STARTED_AT
 
   warm-release-cache:
@@ -118,5 +117,4 @@ jobs:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
           MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
-          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
         run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Warm release cache" -StartedAt $env:STARTED_AT

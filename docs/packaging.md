@@ -139,18 +139,24 @@ Cambio | Efecto
 ## Medición de la caché
 
 `.github/scripts/report-cargo-cache.ps1` se ejecuta al final de cada job cacheado y publica en el
-resumen de Actions la duración del job, si hubo acierto exacto, la clave primaria, la clave
-realmente restaurada y el tamaño en disco de cada ruta cacheada. Los tamaños son del contenido
-descomprimido; el archivo que GitHub almacena es menor, y el límite del repositorio es de 10 GB.
+resumen de Actions la duración del job, si hubo acierto exacto, la clave realmente restaurada y el
+tamaño en disco de cada ruta cacheada. Los tamaños son del contenido descomprimido; el archivo que
+GitHub almacena es bastante menor (zstd), y el límite del repositorio es de 10 GB.
 
-Mediciones tomadas en la PR de esta issue (`windows-latest`, job `Checks`, perfil dev):
+Mediciones tomadas en la PR de la issue #22 (`windows-latest`, job `Checks`, perfil dev, mismo
+lockfile y mismo toolchain en ambas):
 
-Ejecución | Acierto exacto | Duración del job | Tamaño en disco de las rutas cacheadas
+Ejecución | Acierto exacto | Trabajo del job | Tamaño en disco
 --- | --- | ---: | ---:
-Fría (clave `v2` recién estrenada) | PENDIENTE_FRIA_HIT | PENDIENTE_FRIA_TIEMPO | PENDIENTE_FRIA_TAMANO
-Caliente (mismo lockfile y toolchain) | PENDIENTE_CALIENTE_HIT | PENDIENTE_CALIENTE_TIEMPO | PENDIENTE_CALIENTE_TAMANO
+Fría ([run 34594828329](https://github.com/NdeFrutos/git-helper/actions/runs/34594828329)) | no, ninguna clave restaurada | 408 s (job completo 7 min 36 s, incluida la subida de la caché) | PENDIENTE_FRIA_TAMANO
+Caliente ([run PENDIENTE_CALIENTE_RUN](https://github.com/NdeFrutos/git-helper/actions/runs/PENDIENTE_CALIENTE_RUN)) | PENDIENTE_CALIENTE_HIT | PENDIENTE_CALIENTE_TIEMPO | PENDIENTE_CALIENTE_TAMANO
 
-Enlaces a los resúmenes: PENDIENTE_ENLACES
+Desglose del tamaño en la ejecución fría: `target` 2448,5 MB, `~/.cargo/git` 846,6 MB,
+`~/.cargo/registry` 360,1 MB y `~/.cargo/bin` 169,9 MB (esta última la ocupa sobre todo el
+herramental preinstalado del runner). El archivo comprimido que se subió a la caché ocupó 1,44 GB,
+así que dos claves vivas (checks y release) caben holgadamente en el límite de 10 GB, pero no habría
+sitio para muchas más variantes simultáneas: por eso las claves se mantienen acotadas y sin
+`github.ref`.
 
 Para repetir la medición en el perfil release sin publicar nada, lanzar `Release` con
 `workflow_dispatch`, `dry_run=true` y `failure_mode=none` sobre `main`: el job `package` debe
