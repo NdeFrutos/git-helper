@@ -93,6 +93,36 @@ credenciales ni contenido sensible.
 ## Registro de UX-06
 
 - [x] `cargo build --release --locked` completó correctamente en Windows durante esta revisión.
-- [ ] La inspección interactiva de 960×640 y DPI 100/125/150/200 % queda pendiente cuando haya un
-  entorno de captura nativa disponible; el conector usado en esta revisión no expuso ventanas de
-  aplicaciones de escritorio.
+- [x] Inspección de la ventana compacta con capturas en `docs/evidence/ux-06/`:
+  - `960x640-100.png`: tamaño por defecto (960×640) al 100 %. Pestañas, rama, lista de cambios y
+    zona de commit visibles sin solapamientos.
+  - `960x640-200.png`: el mismo estado con factor de escala 2 (equivalente a DPI 200 %). Las
+    acciones principales siguen visibles y la jerarquía se mantiene.
+  - `diez-pestanas-960x640.png`: diez repositorios abiertos en 960×640. La barra de pestañas
+    conserva su scroll horizontal, el botón «+» queda fijo, los nombres se truncan y la ruta completa
+    del repositorio activo sigue visible en la barra inferior. Con nombres de prefijo idéntico el
+    texto truncado no basta para distinguirlos: la identificación depende de la ruta y del
+    `aria_label` de cada pestaña.
+  - `estrecha-300-antes.png` / `estrecha-300-despues.png`: ventana estrechada a 300 px. Antes del
+    arreglo, las acciones de la fila saltaban de línea dentro de una fila de 56 px fijos y se
+    solapaban con la fila siguiente; después, el nombre y la ruta se truncan y las acciones
+    permanecen en su fila.
+- [ ] Pendiente en Windows: repetir la inspección con el backend nativo y con la escala real del
+  sistema al 125 % y 150 %.
+
+### Cómo se obtuvieron las capturas
+
+Las capturas se tomaron en Linux, no en Windows, porque el entorno de revisión no dispone de una
+sesión de escritorio Windows. Procedimiento, por si hay que reproducirlo:
+
+1. `Xvfb :99 -screen 0 2600x1800x24` como servidor X sin gestor de ventanas.
+2. Compilación local habilitando temporalmente la característica `x11` de `gpui`/`gpui_platform`
+   (el `Cargo.toml` del repositorio no la activa porque el objetivo es Windows; sin ella GPUI arranca
+   en modo headless y no crea ventana). Ese cambio **no** forma parte del commit.
+3. `LOCALAPPDATA` apuntando a un directorio temporal con un `state.json` que abre un repositorio de
+   prueba con cambios staged, sin stage, sin seguimiento y rutas largas.
+4. `GPUI_X11_SCALE_FACTOR=2` para emular DPI 200 %; `xdotool windowsize` para estrechar la ventana e
+   `import` para capturar.
+
+Limitación conocida: el backend X11 de GPUI no es el de Windows, así que estas capturas validan el
+layout (elipsis, altura de fila, overflow) pero no el renderizado ni la escala nativos de Windows.
