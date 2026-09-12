@@ -13,5 +13,8 @@ actions!(
         ShowChanges,
         CreateCommit,
         GenerateCommitMessage,
+        OpenInEditor,
+        OpenTerminalHere,
+        RevealInFileManager,
     ]
 );

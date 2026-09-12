@@ -14,8 +14,8 @@ use gpui::{
 use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
-        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        NextRepository, OpenInEditor, OpenRepository, OpenTerminalHere, PreviousRepository,
+        RefreshRepository, RevealInFileManager, ShowChanges, ShowHistory,
     },
     app::AppStartup,
     cli::{InstanceRequest, InstanceRequestReceiver},
@@ -25,12 +25,14 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
-        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
-        OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
-        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
-        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
-        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
+        ExternalCommand, FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot,
+        MutationState, OperationKind, RefreshState, RemoteOperationPlan, RepositoryId,
+        RepositorySession, RepositoryView, SshCloneMapping, SystemClock, ToolArgument,
+        WorkingTreeSnapshot, format_periodic_fetch_interval_label, next_periodic_fetch_interval,
+        normalized_repo_key, periodic_fetch_poll_interval, primary_remote_label,
+        select_periodic_fetch,
     },
+    external::{self, ExternalTool, ExternalToolError},
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
         default_clone_destination, default_clone_root, parse_ssh_url, plan_clone_destination,
@@ -165,6 +167,21 @@ struct FetchContext {
     suppress_error_banner: bool,
 }
 
+/// Acción de editor que espera a que el usuario configure un ejecutable válido.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingEditorLaunch {
+    repository_id: RepositoryId,
+    file: Option<PathBuf>,
+}
+
+/// Efecto en la UI de una apertura de herramienta externa ya terminada.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExternalLaunchFeedback {
+    status: String,
+    error: Option<String>,
+    needs_editor_setup: bool,
+}
+
 /// Almacén localizado durante el arranque; su contenido se lee después en background.
 pub struct StartupState {
     pub store: AppStateStore,
@@ -210,6 +227,10 @@ pub struct MainWindow {
     periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
     active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
     pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    /// Apertura de editor que se reintentará en cuanto haya un ejecutable válido.
+    pending_editor_setup: Option<PendingEditorLaunch>,
+    /// Último error de herramienta externa mostrado, para poder retirarlo al acertar.
+    last_external_error: Option<(RepositoryId, String)>,
 }
 
 #[allow(
@@ -267,6 +288,8 @@ impl MainWindow {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            pending_editor_setup: None,
+            last_external_error: None,
         }
     }
 
@@ -2916,6 +2939,217 @@ impl MainWindow {
         );
     }
 
+    /// Abre el repositorio activo en el editor mediante su atajo de teclado.
+    fn open_active_in_editor(&mut self, _: &OpenInEditor, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository_id) = self.state.active_repository_id {
+            self.open_in_editor(repository_id, None, cx);
+        }
+    }
+
+    /// Abre una terminal en la raíz del repositorio activo.
+    fn open_active_terminal(
+        &mut self,
+        _: &OpenTerminalHere,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository_id) = self.state.active_repository_id {
+            self.open_terminal(repository_id, cx);
+        }
+    }
+
+    /// Muestra la carpeta del repositorio activo en el explorador de archivos.
+    fn reveal_active_repository(
+        &mut self,
+        _: &RevealInFileManager,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository_id) = self.state.active_repository_id {
+            self.reveal_in_file_manager(repository_id, None, cx);
+        }
+    }
+
+    /// Abre el repositorio o uno de sus archivos en el editor configurado.
+    ///
+    /// La resolución del ejecutable y el arranque ocurren en background: el hilo
+    /// de UI solo recibe el resultado.
+    fn open_in_editor(
+        &mut self,
+        repository_id: RepositoryId,
+        file: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root_path) = self.repository_root_path(repository_id) else {
+            return;
+        };
+        let configured = self.state.settings.editor_command.clone();
+        let requested_file = file.clone();
+        self.begin_external_launch(repository_id, ExternalTool::Editor, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    external::open_in_editor(
+                        configured.as_ref(),
+                        &root_path,
+                        requested_file.as_deref(),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_external_launch(repository_id, ExternalTool::Editor, file, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Abre una terminal visible cuyo directorio inicial es la raíz del repositorio.
+    fn open_terminal(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(root_path) = self.repository_root_path(repository_id) else {
+            return;
+        };
+        self.begin_external_launch(repository_id, ExternalTool::Terminal, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { external::open_terminal(&root_path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_external_launch(repository_id, ExternalTool::Terminal, None, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Muestra el repositorio o uno de sus archivos en el explorador de archivos.
+    fn reveal_in_file_manager(
+        &mut self,
+        repository_id: RepositoryId,
+        path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root_path) = self.repository_root_path(repository_id) else {
+            return;
+        };
+        self.begin_external_launch(repository_id, ExternalTool::FileManager, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    external::reveal_in_file_manager(&root_path, path.as_deref())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_external_launch(repository_id, ExternalTool::FileManager, None, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn repository_root_path(&self, repository_id: RepositoryId) -> Option<PathBuf> {
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+    }
+
+    fn begin_external_launch(
+        &mut self,
+        repository_id: RepositoryId,
+        tool: ExternalTool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_session_status(repository_id, &format!("Abriendo {}…", tool.label()));
+        cx.notify();
+    }
+
+    /// Aplica el resultado de una apertura externa al estado visible.
+    fn apply_external_launch(
+        &mut self,
+        repository_id: RepositoryId,
+        tool: ExternalTool,
+        file: Option<PathBuf>,
+        result: Result<String, ExternalToolError>,
+    ) {
+        let feedback = external_launch_feedback(tool, result);
+        if feedback.needs_editor_setup {
+            self.pending_editor_setup = Some(PendingEditorLaunch {
+                repository_id,
+                file,
+            });
+        } else if tool == ExternalTool::Editor {
+            self.pending_editor_setup = None;
+        }
+        let previous_error = self.last_external_error.take();
+        self.last_external_error = feedback
+            .error
+            .clone()
+            .map(|details| (repository_id, details));
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = feedback.status;
+            match feedback.error {
+                Some(details) => repository.error = Some(details),
+                // Un acierto retira el aviso anterior de esta misma acción sin
+                // tapar errores de Git, que tienen su propio estado.
+                None => {
+                    if previous_error.is_some_and(|(previous_id, details)| {
+                        previous_id == repository_id
+                            && repository.error.as_deref() == Some(details.as_str())
+                    }) {
+                        repository.error = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pide el ejecutable del editor y reintenta la acción que quedó pendiente.
+    fn choose_editor_executable(&mut self, cx: &mut Context<Self>) {
+        let path_receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Elegir el ejecutable del editor".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = path_receiver.await else {
+                return;
+            };
+            let Some(program) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.apply_editor_executable(program);
+                this.save_state(cx);
+                if let Some(pending) = this.pending_editor_setup.take() {
+                    this.open_in_editor(pending.repository_id, pending.file, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Guarda el ejecutable elegido conservando los argumentos ya configurados.
+    fn apply_editor_executable(&mut self, program: PathBuf) {
+        let arguments = self.state.settings.editor_command.as_ref().map_or_else(
+            || vec![ToolArgument::Target],
+            |command| command.arguments.clone(),
+        );
+        self.state.settings.editor_command = Some(ExternalCommand::new(program, arguments));
+    }
+
     fn cancel_active_operation(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
         let mut cancelled = false;
         if let Some(cancellation) = self.active_refresh_cancellations.get(&repository_id) {
@@ -3382,6 +3616,27 @@ impl MainWindow {
                                 this.force_refresh_repository(repository_id, cx);
                             })),
                     )
+                    .child(
+                        action_button("open-editor", "Editor", true)
+                            .aria_label("Abrir el repositorio en el editor (Ctrl+Mayús+E)")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_in_editor(repository_id, None, cx);
+                            })),
+                    )
+                    .child(
+                        action_button("open-terminal", "Terminal", true)
+                            .aria_label("Abrir una terminal en la raíz del repositorio (Ctrl+Mayús+T)")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_terminal(repository_id, cx);
+                            })),
+                    )
+                    .child(
+                        action_button("reveal-repository", "Explorador", true)
+                            .aria_label("Mostrar la carpeta del repositorio en el Explorador (Ctrl+Mayús+X)")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reveal_in_file_manager(repository_id, None, cx);
+                            })),
+                    )
                     .when(!can_mutate, |row| {
                         row.child(
                             action_button("cancel", "Cancelar", true).on_click(cx.listener(
@@ -3635,12 +3890,13 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_height = px(f32::from(row.height_px()));
-        let can_mutate = self
+        let session = self
             .state
             .repositories
             .iter()
-            .find(|repository| repository.id == repository_id)
-            .is_some_and(RepositorySession::can_mutate);
+            .find(|repository| repository.id == repository_id);
+        let can_mutate = session.is_some_and(RepositorySession::can_mutate);
+        let root_path = session.map(|repository| repository.root_path.clone());
         match row {
             ChangeListRow::Group {
                 title,
@@ -3747,59 +4003,106 @@ impl MainWindow {
                                 )
                             }),
                     )
-                    .when(can_discard, |row| {
-                        row.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .ml_auto()
-                                .flex_shrink_0()
-                                .child(
-                                    action_button(
-                                        change_row_action_id("discard", &path, representation),
-                                        "Descartar",
-                                        can_mutate,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.confirm_discard(
-                                                repository_id,
-                                                &discard_change,
-                                                is_staged,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    action_button(
-                                        change_row_action_id("stage-toggle", &path, representation),
-                                        if is_staged { "Unstage" } else { "Stage" },
-                                        can_mutate,
-                                    )
-                                    .flex_shrink_0()
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            if is_staged {
-                                                this.unstage_path(
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .ml_auto()
+                            .flex_shrink_0()
+                            .when_some(root_path, |actions, root_path| {
+                                // La ruta absoluta se compone aquí: el archivo se
+                                // resuelve dentro de su propio repositorio aunque
+                                // otra pestaña se llame igual.
+                                let editor_path = root_path.join(&path);
+                                let reveal_path = editor_path.clone();
+                                actions
+                                    .child(
+                                        action_button(
+                                            change_row_action_id("open", &path, representation),
+                                            "Abrir",
+                                            true,
+                                        )
+                                        .aria_label("Abrir el archivo en el editor")
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.open_in_editor(
                                                     repository_id,
-                                                    action_path.clone(),
+                                                    Some(editor_path.clone()),
                                                     cx,
                                                 );
-                                            } else {
-                                                this.stage_path(
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        action_button(
+                                            change_row_action_id("reveal", &path, representation),
+                                            "Mostrar",
+                                            true,
+                                        )
+                                        .aria_label("Mostrar el archivo en el Explorador")
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.reveal_in_file_manager(
                                                     repository_id,
-                                                    action_path.clone(),
+                                                    Some(reveal_path.clone()),
                                                     cx,
                                                 );
-                                            }
-                                        },
-                                    )),
-                                ),
-                        )
-                    })
+                                            }),
+                                        ),
+                                    )
+                            })
+                            .when(can_discard, |actions| {
+                                actions
+                                    .child(
+                                        action_button(
+                                            change_row_action_id("discard", &path, representation),
+                                            "Descartar",
+                                            can_mutate,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.confirm_discard(
+                                                    repository_id,
+                                                    &discard_change,
+                                                    is_staged,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        action_button(
+                                            change_row_action_id(
+                                                "stage-toggle",
+                                                &path,
+                                                representation,
+                                            ),
+                                            if is_staged { "Unstage" } else { "Stage" },
+                                            can_mutate,
+                                        )
+                                        .flex_shrink_0()
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if is_staged {
+                                                    this.unstage_path(
+                                                        repository_id,
+                                                        action_path.clone(),
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.stage_path(
+                                                        repository_id,
+                                                        action_path.clone(),
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                    )
+                            }),
+                    )
                     .into_any_element()
             }
         }
@@ -4458,7 +4761,16 @@ impl MainWindow {
                                 this.copy_error_details(details_for_copy.clone(), cx);
                             },
                         )),
-                    ),
+                    )
+                    .when(self.pending_editor_setup.is_some(), |actions| {
+                        actions.child(
+                            action_button("choose-editor", "Elegir editor…", true)
+                                .aria_label("Elegir el ejecutable del editor y reintentar")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.choose_editor_executable(cx);
+                                })),
+                        )
+                    }),
             )
             .when(is_expanded, |feedback| {
                 feedback.child(
@@ -4838,6 +5150,28 @@ fn repository_content_state(repository: &RepositorySession) -> RepositoryContent
     RepositoryContentState::Changes
 }
 
+/// Traduce el resultado de una apertura externa a mensajes de la UI.
+///
+/// Un editor ausente o movido no es un fallo terminal: se ofrece elegir el
+/// ejecutable y reintentar la acción que lo provocó.
+fn external_launch_feedback(
+    tool: ExternalTool,
+    result: Result<String, ExternalToolError>,
+) -> ExternalLaunchFeedback {
+    match result {
+        Ok(status) => ExternalLaunchFeedback {
+            status,
+            error: None,
+            needs_editor_setup: false,
+        },
+        Err(error) => ExternalLaunchFeedback {
+            status: format!("No se pudo abrir {}", tool.label()),
+            needs_editor_setup: tool == ExternalTool::Editor && error.suggests_editor_setup(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 fn repository_feedback(repository: &RepositorySession) -> Option<(String, String)> {
     match &repository.refresh_state {
         RefreshState::Failed { details, .. } => Some((
@@ -4876,6 +5210,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::show_changes))
             .on_action(cx.listener(Self::create_commit))
             .on_action(cx.listener(Self::generate_commit_message))
+            .on_action(cx.listener(Self::open_active_in_editor))
+            .on_action(cx.listener(Self::open_active_terminal))
+            .on_action(cx.listener(Self::reveal_active_repository))
             .flex()
             .flex_col()
             .size_full()
@@ -5483,6 +5820,8 @@ mod tests {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            pending_editor_setup: None,
+            last_external_error: None,
         }
     }
 
@@ -6437,6 +6776,149 @@ mod tests {
                 window.state.repositories[0].refresh_state,
                 RefreshState::Succeeded { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn a_missing_editor_offers_configuration_and_retries_the_pending_file() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let file = PathBuf::from("repo/src/main.rs");
+
+        window.apply_external_launch(
+            repository_id,
+            ExternalTool::Editor,
+            Some(file.clone()),
+            Err(ExternalToolError::EditorNotFound),
+        );
+
+        assert_eq!(
+            window.pending_editor_setup,
+            Some(PendingEditorLaunch {
+                repository_id,
+                file: Some(file),
+            })
+        );
+        let details = window.state.repositories[0]
+            .error
+            .clone()
+            .expect("el fallo debe ser visible");
+        assert!(details.contains("Elegir editor"));
+
+        window.apply_editor_executable(PathBuf::from("/herramientas/editor"));
+        window.apply_external_launch(
+            repository_id,
+            ExternalTool::Editor,
+            None,
+            Ok("main.rs abierto en el editor".to_owned()),
+        );
+
+        let configured = window
+            .state
+            .settings
+            .editor_command
+            .clone()
+            .expect("el ejecutable elegido debe guardarse");
+        assert_eq!(configured.program, PathBuf::from("/herramientas/editor"));
+        assert_eq!(configured.arguments, vec![ToolArgument::Target]);
+        assert!(window.pending_editor_setup.is_none());
+        assert!(window.state.repositories[0].error.is_none());
+        assert_eq!(
+            window.state.repositories[0].status_message,
+            "main.rs abierto en el editor"
+        );
+    }
+
+    #[test]
+    fn opening_a_tool_never_clears_an_unrelated_git_error() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].error = Some("Git rechazó el push".to_owned());
+
+        window.apply_external_launch(
+            repository_id,
+            ExternalTool::Terminal,
+            None,
+            Ok("Terminal abierta en repo".to_owned()),
+        );
+
+        assert_eq!(
+            window.state.repositories[0].error.as_deref(),
+            Some("Git rechazó el push")
+        );
+    }
+
+    #[test]
+    fn only_editor_failures_offer_to_choose_an_executable() {
+        let terminal = external_launch_feedback(
+            ExternalTool::Terminal,
+            Err(ExternalToolError::TerminalNotFound {
+                directory: "repo".to_owned(),
+            }),
+        );
+        let editor = external_launch_feedback(
+            ExternalTool::Editor,
+            Err(ExternalToolError::EditorMissing {
+                program: r"C:\Programas\editor.exe".to_owned(),
+            }),
+        );
+        let deleted_file = external_launch_feedback(
+            ExternalTool::Editor,
+            Err(ExternalToolError::PathMissing {
+                path: "repo/borrado.txt".to_owned(),
+            }),
+        );
+
+        assert!(!terminal.needs_editor_setup);
+        assert_eq!(terminal.status, "No se pudo abrir la terminal");
+        assert!(editor.needs_editor_setup);
+        assert!(!deleted_file.needs_editor_setup);
+        assert!(deleted_file.error.is_some());
+    }
+
+    #[test]
+    fn choosing_an_executable_preserves_the_configured_arguments() {
+        let mut window = test_window(GitClient::default(), Vec::new());
+        window.state.settings.editor_command = Some(ExternalCommand::new(
+            "editor-anterior",
+            vec![
+                ToolArgument::Literal("--new-window".to_owned()),
+                ToolArgument::Target,
+            ],
+        ));
+
+        window.apply_editor_executable(PathBuf::from("/herramientas/editor-nuevo"));
+
+        let configured = window
+            .state
+            .settings
+            .editor_command
+            .expect("debe conservarse la configuración");
+        assert_eq!(
+            configured.program,
+            PathBuf::from("/herramientas/editor-nuevo")
+        );
+        assert_eq!(
+            configured.arguments,
+            vec![
+                ToolArgument::Literal("--new-window".to_owned()),
+                ToolArgument::Target,
+            ]
+        );
+    }
+
+    #[test]
+    fn file_rows_offer_open_and_reveal_with_distinct_action_ids() {
+        let path = Path::new("src/main.rs");
+
+        for action in ["open", "reveal"] {
+            assert_ne!(
+                change_row_action_id(action, path, ChangeRepresentation::Staged),
+                change_row_action_id(action, path, ChangeRepresentation::Worktree),
+                "las filas staged y worktree no pueden compartir el id de {action}"
+            );
         }
     }
 }

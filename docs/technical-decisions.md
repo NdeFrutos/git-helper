@@ -198,3 +198,33 @@ receptor no controla quién escribe en el socket— y solo entonces entrega la s
 El cliente únicamente da el reenvío por bueno si recibe el ACK del protocolo; si no hay endpoint
 publicado, la conexión falla o la confirmación no llega, abre su propia ventana en lugar de
 terminar en silencio.
+
+## Apertura de herramientas externas (UX-12)
+
+`src/external.rs` traduce cada acción explícita —abrir en el editor, abrir una terminal o mostrar
+en el Explorador— a una única `LaunchRequest` de `src/process.rs`. Las rutas viajan como `OsString`
+literales, de modo que espacios, Unicode y metacaracteres llegan intactos al programa; nunca se
+compone una línea de comandos ni se consulta texto del repositorio, así que no hay forma de que un
+repositorio aporte el programa o sus argumentos. Tampoco se ejecutan sus scripts: las candidatas
+automáticas son ejecutables nativos, y los lanzadores `.cmd` de VS Code o Cursor se descartan
+porque necesitarían `cmd.exe`.
+
+El editor se configura con argumentos tipados (`ExternalCommand` y `ToolArgument` en
+`src/domain/external_tools.rs`), no con una plantilla de texto: `Target` marca dónde va la ruta y,
+si la configuración no la menciona, se añade al final. Si no hay configuración se detecta Cursor o
+VS Code en sus ubicaciones habituales. Un editor ausente o movido produce un error accionable y el
+banner ofrece «Elegir editor…», que guarda el ejecutable —conservando los argumentos ya
+configurados— y reintenta la acción pendiente.
+
+`launch_detached` no espera al hijo ni captura su salida, y la resolución del programa (que toca
+disco) ocurre en `background_spawn`: el hilo de UI solo recibe el mensaje final. La terminal se crea
+con `CREATE_NEW_CONSOLE` y **sin** redirigir stdin/stdout/stderr: al ser Git Helper una aplicación
+gráfica sin consola propia, la herencia por defecto entrega handles nulos y Windows conecta el hijo
+a la consola recién creada; redirigir a NUL abriría una ventana con una shell que lee EOF y se
+cierra al instante. Las aplicaciones gráficas usan `CREATE_NO_WINDOW` y sí anulan sus descriptores.
+
+El directorio de trabajo siempre es la raíz del repositorio de la pestaña, así que dos repositorios
+con el mismo nombre de carpeta abren cada uno el suyo. Un archivo eliminado no es un error al
+mostrarlo: se abre la carpeta existente más cercana sin salir nunca de la raíz del repositorio.
+Fuera de Windows la detección de editor, terminal y gestor de archivos es de conveniencia para el
+desarrollo; la validación funcional se hace en Windows con build release.

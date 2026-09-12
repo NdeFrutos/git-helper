@@ -44,9 +44,26 @@ credenciales ni contenido sensible.
   siguen en la misma línea: las filas tienen altura fija, así que nada debe desbordar hacia la fila
   siguiente.
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
+- [ ] Con la ventana estrecha, las cuatro acciones de fila (`Abrir`, `Mostrar`, `Descartar`,
+  `Stage`) permanecen en su fila de 56 px y lo que se trunca es el nombre y la ruta.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
 - [ ] Una ruta larga se trunca en la barra inferior sin ocultar el estado ni la versión de Git.
+
+## Herramientas externas (UX-12)
+
+- [ ] `Editor`, `Terminal` y `Explorador` de la barra de acciones abren el repositorio activo; el
+  directorio de trabajo es su raíz aunque haya otra pestaña con el mismo nombre de carpeta.
+- [ ] `Ctrl+Mayús+E`, `Ctrl+Mayús+T` y `Ctrl+Mayús+X` hacen lo mismo desde el teclado.
+- [ ] `Abrir` y `Mostrar` de una fila abren el archivo en el editor y lo seleccionan en el
+  Explorador, incluso con espacios, acentos y `&` en la ruta.
+- [ ] `Mostrar` sobre un archivo eliminado abre su carpeta y lo explica en la barra de estado, sin
+  tratarlo como error.
+- [ ] La terminal aparece visible y con su prompt utilizable (no se cierra al instante).
+- [ ] Abrir cualquiera de las tres herramientas no congela la ventana ni interrumpe un refresco.
+- [ ] Sin editor instalado —o con la ruta configurada movida— el aviso explica el problema y
+  `Elegir editor…` permite seleccionar el ejecutable y reintentar la acción.
+- [ ] Ninguna acción abre más de una aplicación ni ejecuta scripts del repositorio.
 
 ## Commit y Cursor CLI
 
@@ -109,6 +126,33 @@ credenciales ni contenido sensible.
     permanecen en su fila.
 - [ ] Pendiente en Windows: repetir la inspección con el backend nativo y con la escala real del
   sistema al 125 % y 150 %.
+
+## Registro de UX-12
+
+- [x] `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`
+  y `cargo test --all-targets --locked` en Linux. La única prueba roja es
+  `git::path::tests::rejects_empty_absolute_and_parent_paths`, anterior a este cambio: comprueba que
+  `C:\secreto.txt` es absoluta, algo que solo es cierto en Windows.
+- [x] Comprobación funcional del lanzamiento real sobre un repositorio de prueba con rutas con
+  espacios, acentos y `&`, usando un ejecutable de editor simulado que registra su `argv` y su
+  directorio de trabajo:
+  - La ruta llega como **un único argumento literal** junto a la opción configurada
+    (`--new-window`), sin comillas añadidas ni troceo por espacios.
+  - El directorio de trabajo es la raíz del repositorio en las dos variantes (archivo y raíz).
+  - Un archivo eliminado devuelve `PathMissing` y un ejecutable movido devuelve `EditorMissing`,
+    que es el error que ofrece `Elegir editor…`.
+  - Sin terminal ni gestor de archivos instalados (contenedor sin escritorio), las acciones
+    devuelven `TerminalNotFound` y `FileManagerNotFound` en vez de fallar en silencio.
+- [x] `editor_command` sobrevive al ciclo de carga y guardado del estado persistido.
+- [ ] Pendiente en Windows con build release: consola visible de la terminal (`wt.exe`,
+  PowerShell o `cmd.exe`), selección del archivo con `explorer.exe /select,` y el diálogo
+  `Elegir editor…`. No se pudieron comprobar aquí porque ninguno de esos programas existe en el
+  entorno de revisión.
+- [ ] Pendiente: inspección visual de la fila de cambios con sus cuatro acciones (`Abrir`,
+  `Mostrar`, `Descartar`, `Stage`) en ventana estrecha y de la barra de acciones con los tres
+  botones nuevos. El procedimiento de capturas de UX-06 no se pudo reproducir en esta revisión: con
+  el backend X11 compilado, la aplicación arranca y conecta con Xvfb, pero no llega a mapear una
+  ventana en este contenedor, así que no hay captura que comparar.
 
 ### Cómo se obtuvieron las capturas
 

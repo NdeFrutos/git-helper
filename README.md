@@ -22,6 +22,7 @@ sincronizar con remotes y consultar el historial.
 - Ver la antigüedad de las referencias remotas y activar fetch automático (desactivado por defecto; Shift+clic alterna 5/15/30 min).
 - Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
+- Abrir el repositorio o un archivo en el editor, abrir una terminal en su raíz y mostrarlo en el Explorador.
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
 
@@ -98,12 +99,48 @@ Atajos disponibles:
 | `Ctrl+1` / `Ctrl+2` | Mostrar historial / cambios |
 | `Ctrl+Enter` | Crear el commit |
 | `Ctrl+Shift+G` | Generar un mensaje con Cursor |
+| `Ctrl+Shift+E` | Abrir el repositorio en el editor |
+| `Ctrl+Shift+T` | Abrir una terminal en la raíz del repositorio |
+| `Ctrl+Shift+X` | Mostrar el repositorio en el Explorador |
+
+## Abrir el editor, la terminal y el Explorador
+
+La barra de acciones incluye `Editor`, `Terminal` y `Explorador` para el repositorio activo, y cada
+archivo de la vista `Cambios` añade `Abrir` y `Mostrar`. Todas usan la raíz del repositorio como
+directorio de trabajo, así que dos repositorios con el mismo nombre de carpeta abren cada uno el
+suyo. Mostrar un archivo que ya se eliminó abre la carpeta existente más cercana dentro del
+repositorio.
+
+Sin configuración se detecta Cursor o VS Code en sus ubicaciones habituales, y la terminal es
+Windows Terminal, PowerShell o `cmd.exe`, la primera que esté disponible. Si no hay editor
+—o el configurado se movió— el aviso ofrece `Elegir editor…` para indicar su ejecutable y reintentar
+la acción.
+
+Para fijar otro editor o añadirle opciones, edita `editor_command` en
+`%LOCALAPPDATA%\GitHelper\state.json` con Git Helper cerrado:
+
+```json
+{
+  "settings": {
+    "editor_command": {
+      "program": "C:\\Users\\dev\\AppData\\Local\\Programs\\cursor\\Cursor.exe",
+      "arguments": [{ "literal": "--new-window" }, "target"]
+    }
+  }
+}
+```
+
+Los argumentos son datos, no una línea de comandos: `"target"` marca dónde se sustituye la ruta que
+se abre y, si no aparece, se añade al final. Cada opción se entrega tal cual al programa.
 
 ## Privacidad y seguridad
 
 - No hay telemetría propia.
 - Git y Cursor CLI se ejecutan directamente, sin `cmd.exe` ni PowerShell y con argumentos
   separados.
+- El editor, la terminal y el Explorador solo se abren tras una acción explícita, uno por acción y
+  con las rutas como argumentos literales. Git Helper no ejecuta scripts del repositorio ni usa su
+  contenido para decidir qué programa lanzar.
 - Los mensajes de commit se entregan a Git por `stdin` y los hooks se respetan.
 - `pull` siempre usa `--ff-only` y `push` nunca usa opciones de fuerza.
 - Descartar cambios requiere confirmación explícita.
@@ -164,6 +201,7 @@ de GitHub.
 | `src/cursor/` | Contexto staged limitado, ejecución de `agent` y parser JSON |
 | `src/persistence/` | Estado versionado y escritura atómica |
 | `src/process.rs` | Procesos sin shell, captura aislada, cancelación y timeout |
+| `src/external.rs` | Apertura del editor, la terminal y el Explorador sin shell |
 | `src/ui/` | Ventana, entrada de commit, listas virtualizadas y tema GPUI |
 | `src/watcher/` | Observación del repositorio y debounce de eventos |
 
@@ -187,6 +225,8 @@ la trazabilidad de código están en [docs/technical-decisions.md](docs/technica
   o generación de mensajes.
 - Si existen varios remotes y no hay upstream, algunas operaciones necesitan una selección
   explícita; esa elección se recuerda para fetch manual y automático.
+- La acción `Mostrar` selecciona el archivo en el Explorador de Windows; fuera de Windows solo abre
+  su carpeta, porque no existe una acción equivalente y abrirlo delegaría en la aplicación asociada.
 - El instalador aún no está firmado digitalmente.
 - GPUI todavía es pre-1.0 y puede exigir cambios al actualizar su revisión.
 
