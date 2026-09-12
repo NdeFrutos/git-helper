@@ -14,6 +14,8 @@ sincronizar con remotes y consultar el historial.
 ## Qué permite hacer
 
 - Abrir varios repositorios locales y cambiar entre ellos mediante pestañas.
+- Reordenar las pestañas arrastrándolas o con el teclado, fijar repositorios como favoritos y
+  reabrir la última pestaña cerrada.
 - Clonar repositorios remotos accesibles por SSH y abrirlos en una pestaña.
 - Ver cambios staged, sin preparar, sin seguimiento y en conflicto.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
@@ -22,7 +24,7 @@ sincronizar con remotes y consultar el historial.
 - Ver la antigüedad de las referencias remotas y activar fetch automático (desactivado por defecto; Shift+clic alterna 5/15/30 min).
 - Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
-- Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
+- Restaurar los repositorios abiertos, su orden, los favoritos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
 
 Git Helper usa el Git instalado en el equipo, por lo que respeta sus credenciales, configuración,
@@ -93,7 +95,10 @@ Atajos disponibles:
 | `Ctrl+O` | Abrir repositorio |
 | `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar la pestaña activa |
+| `Ctrl+Shift+T` | Reabrir la última pestaña cerrada |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar de repositorio |
+| `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Mover la pestaña activa a la izquierda / derecha |
+| `Ctrl+Shift+B` | Fijar o quitar el repositorio activo de favoritos |
 | `F5` | Actualizar el estado |
 | `Ctrl+1` / `Ctrl+2` | Mostrar historial / cambios |
 | `Ctrl+Enter` | Crear el commit |

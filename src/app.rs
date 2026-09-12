@@ -9,8 +9,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
-        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        MoveRepositoryLeft, MoveRepositoryRight, NextRepository, OpenRepository,
+        PreviousRepository, RefreshRepository, ReopenClosedRepository, ShowChanges, ShowHistory,
+        ToggleFavoriteRepository,
     },
     cli::InstanceServer,
     persistence::{
@@ -46,8 +47,16 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-o", OpenRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-o", CloneRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-w", CloseActiveRepository, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-t", ReopenClosedRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-tab", NextRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-tab", PreviousRepository, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-pageup", MoveRepositoryLeft, Some("GitHelper")),
+            KeyBinding::new(
+                "ctrl-shift-pagedown",
+                MoveRepositoryRight,
+                Some("GitHelper"),
+            ),
+            KeyBinding::new("ctrl-shift-b", ToggleFavoriteRepository, Some("GitHelper")),
             KeyBinding::new("f5", RefreshRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-1", ShowHistory, Some("GitHelper")),
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),

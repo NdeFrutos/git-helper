@@ -16,8 +16,11 @@ pub use remote_freshness::{
     primary_remote_label, remote_ref_fingerprint, select_periodic_fetch,
 };
 pub use repository::{
-    AppSettings, AppState, ChangeCounters, HistorySnapshot, MutationState, OperationKind,
+    AppSettings, AppState, ChangeCounters, HistorySnapshot, MAX_FAVORITE_REPOSITORIES,
+    MAX_RECENT_REPOSITORIES, MAX_RECENTLY_CLOSED_REPOSITORIES, MutationState, OperationKind,
     RefreshCoordinator, RefreshState, RepositoryId, RepositorySession, RepositoryView,
-    SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
+    SshCloneMapping, ThemePreference, WorkingTreeSnapshot, append_repository_path,
+    contains_repository_path, deduplicate_repository_paths, forget_repository_path,
+    moved_tab_index, promote_repository_path,
 };
 pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};

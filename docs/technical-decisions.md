@@ -146,11 +146,24 @@ rama que se estaba mirando siga viva.
 
 ## Persistencia
 
-El esquema actual es la versión 3: v2 incorpora los mapeos de clones SSH y v3 los borradores y la
-geometría de ventana. `state.json` se lee una sola vez en background después de crear la ventana,
-para que un almacenamiento lento no bloquee el primer frame. Se escribe mediante un archivo
-temporal sincronizado y reemplazo atómico. Un JSON corrupto se mueve a
-`state.corrupt-<timestamp>.json` y el arranque continúa con estado vacío.
+El esquema actual es la versión 5: v2 incorpora los mapeos de clones SSH, v3 los borradores y la
+geometría de ventana, v4 los ajustes de fetch periódico y v5 los favoritos y las pestañas cerradas
+reabribles. `state.json` se lee una sola vez en background después de crear la ventana, para que un
+almacenamiento lento no bloquee el primer frame. Se escribe mediante un archivo temporal
+sincronizado y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el
+arranque continúa con estado vacío.
+
+La migración es una escalera de pasos `n → n + 1`, de modo que añadir uno nuevo no obliga a revisar
+los anteriores. Los campos añadidos por versiones posteriores se deserializan con `#[serde(default)]`:
+un estado al que le falta un campo es un estado antiguo que hay que migrar, no un archivo dañado, y
+tratarlo como corrupto descartaría pestañas y favoritos que sí se pueden recuperar.
+
+El orden de las pestañas no se guarda como un campo aparte: es el orden del vector `repositories`.
+Reordenar la barra solo mueve elementos dentro de ese vector, mientras que la sesión, su borrador y
+sus operaciones en curso viven en mapas indexados por `RepositoryId`, así que mover una pestaña no
+puede alterarlos. Recientes, favoritos y pestañas cerradas comparten la identidad canónica
+(`normalized_repo_key`) que ya usaban las pestañas, de forma que una misma ruta escrita con otra
+capitalización o con `/` no genera duplicados en ninguna de las listas.
 
 ## Working tree e historial desacoplados (PERF-03)
 

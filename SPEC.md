@@ -130,7 +130,12 @@ La ventana tendrá estas áreas:
 	- Ruta completa en tooltip.
 	- Indicador de cambios pendientes.
 	- Indicador visual de carga o error.
+	- Botón para fijar o quitar el repositorio de favoritos (`★` / `☆`).
 	- Botón para cerrar cada pestaña.
+	- Las pestañas se reordenan arrastrándolas sobre otra o con el teclado; llegar al extremo no
+	  da la vuelta. Reordenar solo cambia la posición: la sesión, su borrador y sus operaciones
+	  en curso se mantienen porque están indexados por identificador de repositorio.
+	- Botón `↩` para reabrir la última pestaña cerrada, visible solo cuando hay alguna.
 	- Botón `+` para abrir otro repositorio.
 
 2. **Barra de acciones**
@@ -158,6 +163,11 @@ Al iniciar sin repositorios abiertos se mostrará:
 - Botón `Abrir repositorio`.
 - Botón `Clonar repositorio` para URLs SSH.
 - Lista opcional de repositorios recientes que sigan existiendo.
+- Lista de favoritos fijados, con la entrada ya abierta marcada como tal para distinguir el
+  favorito de la pestaña. Cada fila permite abrir o reintentar y quitarlo de favoritos; quitar un
+  favorito no borra nada del disco ni cierra su pestaña. Un favorito cuya última apertura falló se
+  marca como no disponible en memoria, de modo que la lista no consulta el disco al renderizarse.
+- Acción opcional para reabrir la última pestaña cerrada.
 - Lista opcional de clones SSH recientes cuya ruta local siga existiendo.
 
 El selector de carpeta debe ser nativo de Windows. Una carpeta es válida si:
@@ -376,8 +386,12 @@ será LRU, acotada y se identificará por el hash del commit; los errores no se 
 | `Ctrl+O` | Abrir repositorio |
 | `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar pestaña activa |
+| `Ctrl+Shift+T` | Reabrir la última pestaña cerrada |
 | `Ctrl+Tab` | Siguiente repositorio |
 | `Ctrl+Shift+Tab` | Repositorio anterior |
+| `Ctrl+Shift+PageUp` | Mover la pestaña activa a la izquierda |
+| `Ctrl+Shift+PageDown` | Mover la pestaña activa a la derecha |
+| `Ctrl+Shift+B` | Fijar o quitar el repositorio activo de favoritos |
 | `F5` | Actualizar repositorio activo |
 | `Ctrl+1` | Abrir vista Historial |
 | `Ctrl+2` | Abrir vista Cambios |
@@ -636,6 +650,8 @@ Se persistirá:
 - Orden de las pestañas.
 - Repositorio activo.
 - Últimos repositorios abiertos.
+- Repositorios marcados como favoritos, independientes de las pestañas abiertas.
+- Últimas pestañas cerradas, para poder reabrirlas.
 - Vista seleccionada por repositorio.
 - Tamaño y posición válidos de la ventana.
 - Tema seleccionado.

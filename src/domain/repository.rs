@@ -1,13 +1,25 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
     BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote,
-    RemoteFreshnessTracker, UpstreamState, remote_freshness::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
+    RemoteFreshnessTracker, UpstreamState,
+    remote_freshness::{DEFAULT_PERIODIC_FETCH_INTERVAL_SECS, normalized_repo_key},
     status::FileChange,
 };
+
+/// Número de repositorios recientes recordados entre sesiones.
+pub const MAX_RECENT_REPOSITORIES: usize = 10;
+/// Número de favoritos permitidos; un panel compacto no debe crecer sin límite.
+pub const MAX_FAVORITE_REPOSITORIES: usize = 20;
+/// Profundidad de la pila de pestañas cerradas reabribles.
+pub const MAX_RECENTLY_CLOSED_REPOSITORIES: usize = 10;
 
 /// Identificador estable de una sesión de repositorio.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -456,6 +468,141 @@ pub struct AppState {
     pub repositories: Vec<RepositorySession>,
     pub active_repository_id: Option<RepositoryId>,
     pub recent_repositories: Vec<PathBuf>,
+    /// Repositorios fijados por el usuario; son independientes de las pestañas abiertas.
+    pub favorite_repositories: Vec<PathBuf>,
+    /// Pila de pestañas cerradas, de la más reciente a la más antigua.
+    pub recently_closed_repositories: Vec<PathBuf>,
     pub ssh_clone_mappings: Vec<SshCloneMapping>,
     pub settings: AppSettings,
+}
+
+/// Indica si la lista ya contiene esa ruta según la identidad canónica.
+#[must_use]
+pub fn contains_repository_path(paths: &[PathBuf], path: &Path) -> bool {
+    let key = normalized_repo_key(path);
+    paths
+        .iter()
+        .any(|candidate| normalized_repo_key(candidate) == key)
+}
+
+/// Coloca la ruta al frente de la lista sin duplicarla y respetando el límite.
+pub fn promote_repository_path(paths: &mut Vec<PathBuf>, path: PathBuf, limit: usize) {
+    forget_repository_path(paths, &path);
+    paths.insert(0, path);
+    paths.truncate(limit);
+}
+
+/// Añade la ruta al final si aún no está; devuelve `false` cuando ya estaba o no cabe.
+pub fn append_repository_path(paths: &mut Vec<PathBuf>, path: PathBuf, limit: usize) -> bool {
+    if contains_repository_path(paths, &path) || paths.len() >= limit {
+        return false;
+    }
+    paths.push(path);
+    true
+}
+
+/// Quita la ruta de la lista; nunca toca el disco. Devuelve `true` si había algo que quitar.
+pub fn forget_repository_path(paths: &mut Vec<PathBuf>, path: &Path) -> bool {
+    let key = normalized_repo_key(path);
+    let previous_length = paths.len();
+    paths.retain(|candidate| normalized_repo_key(candidate) != key);
+    paths.len() != previous_length
+}
+
+/// Descarta rutas vacías y repetidas manteniendo el primer aparecido.
+pub fn deduplicate_repository_paths(paths: &mut Vec<PathBuf>, limit: usize) {
+    let mut seen = Vec::with_capacity(paths.len());
+    paths.retain(|path| {
+        let key = normalized_repo_key(path);
+        if key.is_empty() || seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
+    paths.truncate(limit);
+}
+
+/// Posición destino al desplazar una pestaña; `None` cuando el movimiento no cabe.
+///
+/// A diferencia de cambiar de pestaña activa, reordenar no da la vuelta: llegar al
+/// extremo deja el orden como está en lugar de saltar al otro lado de la barra.
+#[must_use]
+pub fn moved_tab_index(count: usize, from: usize, direction: isize) -> Option<usize> {
+    if from >= count {
+        return None;
+    }
+    let target = from.cast_signed().checked_add(direction)?;
+    if target < 0 || target.cast_unsigned() >= count {
+        return None;
+    }
+    Some(target.cast_unsigned())
+}
+
+#[cfg(test)]
+mod path_list_tests {
+    use std::path::PathBuf;
+
+    use super::{
+        append_repository_path, contains_repository_path, deduplicate_repository_paths,
+        forget_repository_path, moved_tab_index, promote_repository_path,
+    };
+
+    #[test]
+    fn path_lists_share_the_canonical_repository_identity() {
+        let mut paths = vec![PathBuf::from(r"C:\repos\Alpha")];
+
+        assert!(contains_repository_path(
+            &paths,
+            &PathBuf::from(r"c:/repos/alpha\")
+        ));
+        assert!(!append_repository_path(
+            &mut paths,
+            PathBuf::from(r"c:/repos/alpha"),
+            10
+        ));
+        assert!(forget_repository_path(
+            &mut paths,
+            &PathBuf::from(r"c:\REPOS\alpha")
+        ));
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn promoting_a_path_moves_it_to_the_front_and_honours_the_limit() {
+        let mut paths = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+
+        promote_repository_path(&mut paths, PathBuf::from("c"), 2);
+
+        assert_eq!(paths, vec![PathBuf::from("c"), PathBuf::from("a")]);
+    }
+
+    #[test]
+    fn deduplication_keeps_the_first_occurrence_and_drops_empty_paths() {
+        let mut paths = vec![
+            PathBuf::from(r"C:\repos\alpha"),
+            PathBuf::new(),
+            PathBuf::from(r"c:/repos/alpha"),
+            PathBuf::from(r"C:\repos\beta"),
+        ];
+
+        deduplicate_repository_paths(&mut paths, 10);
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\repos\alpha"),
+                PathBuf::from(r"C:\repos\beta")
+            ]
+        );
+    }
+
+    #[test]
+    fn reordering_stops_at_the_edges_instead_of_wrapping_around() {
+        assert_eq!(moved_tab_index(3, 0, -1), None);
+        assert_eq!(moved_tab_index(3, 2, 1), None);
+        assert_eq!(moved_tab_index(3, 1, 1), Some(2));
+        assert_eq!(moved_tab_index(3, 1, -1), Some(0));
+        assert_eq!(moved_tab_index(0, 0, 1), None);
+    }
 }

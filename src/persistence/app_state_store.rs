@@ -14,14 +14,15 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, ChangeCounters, HistorySnapshot, MutationState, RefreshCoordinator,
+    AppSettings, AppState, ChangeCounters, HistorySnapshot, MAX_FAVORITE_REPOSITORIES,
+    MAX_RECENT_REPOSITORIES, MAX_RECENTLY_CLOSED_REPOSITORIES, MutationState, RefreshCoordinator,
     RefreshState, RepositoryId, RepositorySession, RepositoryView, SshCloneMapping,
-    WorkingTreeSnapshot,
+    WorkingTreeSnapshot, deduplicate_repository_paths,
 };
 
 /// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
 /// su brazo en `migrate`; nunca reutilices un número ya publicado por otra rama.
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -46,18 +47,30 @@ pub struct PersistedRepository {
 }
 
 /// Esquema versionado escrito en `%LOCALAPPDATA%`.
+///
+/// `repositories` se guarda en el orden visible de la barra de pestañas: reordenarlas
+/// solo cambia la posición de sus elementos, nunca su contenido.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PersistedAppState {
     pub schema_version: u32,
     #[serde(default)]
     pub repositories: Vec<PersistedRepository>,
+    /// Ausente en estados escritos por builds antiguas: falta el campo, no hay daño.
+    #[serde(default)]
     pub active_repository_id: Option<RepositoryId>,
     #[serde(default)]
     pub recent_repositories: Vec<PathBuf>,
+    /// Repositorios fijados; se conservan aunque su pestaña esté cerrada.
+    #[serde(default)]
+    pub favorite_repositories: Vec<PathBuf>,
+    /// Pestañas cerradas reabribles, de la más reciente a la más antigua.
+    #[serde(default)]
+    pub recently_closed_repositories: Vec<PathBuf>,
     #[serde(default)]
     pub ssh_clone_mappings: Vec<SshCloneMapping>,
     #[serde(default)]
     pub settings: AppSettings,
+    #[serde(default)]
     pub window_placement: Option<WindowPlacement>,
 }
 
@@ -68,6 +81,8 @@ impl Default for PersistedAppState {
             repositories: Vec::new(),
             active_repository_id: None,
             recent_repositories: Vec::new(),
+            favorite_repositories: Vec::new(),
+            recently_closed_repositories: Vec::new(),
             ssh_clone_mappings: Vec::new(),
             settings: AppSettings::default(),
             window_placement: None,
@@ -103,6 +118,8 @@ impl PersistedAppState {
                 .collect(),
             active_repository_id: app_state.active_repository_id,
             recent_repositories: app_state.recent_repositories.clone(),
+            favorite_repositories: app_state.favorite_repositories.clone(),
+            recently_closed_repositories: app_state.recently_closed_repositories.clone(),
             ssh_clone_mappings: app_state.ssh_clone_mappings.clone(),
             settings: app_state.settings.clone(),
             window_placement,
@@ -150,6 +167,8 @@ impl PersistedAppState {
                 repositories,
                 active_repository_id: self.active_repository_id,
                 recent_repositories: self.recent_repositories,
+                favorite_repositories: self.favorite_repositories,
+                recently_closed_repositories: self.recently_closed_repositories,
                 ssh_clone_mappings: self.ssh_clone_mappings,
                 settings: self.settings,
             },
@@ -331,6 +350,10 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
                 state = normalize_periodic_fetch_settings(state);
                 state.schema_version = 4;
             }
+            4 => {
+                normalize_repository_path_lists(&mut state);
+                state.schema_version = 5;
+            }
             unknown => {
                 warn!(
                     version = unknown,
@@ -342,8 +365,20 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
     }
     normalize_ssh_clone_mappings(&mut state);
     normalize_commit_drafts(&mut state);
+    normalize_repository_path_lists(&mut state);
     state = normalize_periodic_fetch_settings(state);
     state
+}
+
+/// v4 → v5: aparecen favoritos y pestañas cerradas; deja las tres listas de rutas sin
+/// duplicados según la identidad canónica y dentro de sus límites.
+fn normalize_repository_path_lists(state: &mut PersistedAppState) {
+    deduplicate_repository_paths(&mut state.recent_repositories, MAX_RECENT_REPOSITORIES);
+    deduplicate_repository_paths(&mut state.favorite_repositories, MAX_FAVORITE_REPOSITORIES);
+    deduplicate_repository_paths(
+        &mut state.recently_closed_repositories,
+        MAX_RECENTLY_CLOSED_REPOSITORIES,
+    );
 }
 
 fn normalize_periodic_fetch_settings(mut state: PersistedAppState) -> PersistedAppState {
@@ -616,6 +651,117 @@ mod tests {
 
         assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
         assert!(loaded.state.ssh_clone_mappings.is_empty());
+    }
+
+    #[test]
+    fn persists_tab_order_favorites_and_reopenable_tabs() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let mut app_state = AppState::default();
+        for name in ["alpha", "beta", "gamma"] {
+            app_state
+                .repositories
+                .push(RepositorySession::new(PathBuf::from(format!(
+                    r"C:\repos\{name}"
+                ))));
+        }
+        app_state.favorite_repositories = vec![PathBuf::from(r"C:\repos\beta")];
+        app_state.recently_closed_repositories = vec![PathBuf::from(r"C:\repos\delta")];
+        let persisted = PersistedAppState::from_app_state(&app_state, &HashMap::new(), None);
+
+        store.save(&persisted).expect("debe guardar");
+        let (restored, _) = store.load().expect("debe cargar").state.into_app_state();
+
+        assert_eq!(
+            restored
+                .repositories
+                .iter()
+                .map(|repository| repository.root_path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from(r"C:\repos\alpha"),
+                PathBuf::from(r"C:\repos\beta"),
+                PathBuf::from(r"C:\repos\gamma"),
+            ]
+        );
+        assert_eq!(
+            restored.favorite_repositories,
+            vec![PathBuf::from(r"C:\repos\beta")]
+        );
+        assert_eq!(
+            restored.recently_closed_repositories,
+            vec![PathBuf::from(r"C:\repos\delta")]
+        );
+    }
+
+    #[test]
+    fn migrates_v4_state_without_favorites_or_closed_tabs() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{
+                "schema_version": 4,
+                "repositories": [],
+                "recent_repositories": ["C:\\repos\\alpha", "c:/repos/alpha/", ""],
+                "settings": {
+                    "theme": "System",
+                    "cursor_cli_path": null,
+                    "cursor_context_consent": false
+                }
+            }"#,
+        )
+        .expect("debe escribir el fixture v4");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe migrar");
+
+        assert!(
+            loaded.corruption_backup.is_none(),
+            "un estado v4 legítimo debe migrarse, no tratarse como dañado"
+        );
+        assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert!(loaded.state.favorite_repositories.is_empty());
+        assert!(loaded.state.recently_closed_repositories.is_empty());
+        assert_eq!(
+            loaded.state.recent_repositories,
+            vec![PathBuf::from(r"C:\repos\alpha")],
+            "la migración debe descartar rutas repetidas o vacías sin perder la primera"
+        );
+    }
+
+    #[test]
+    fn migration_keeps_favorites_written_by_the_current_schema() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{
+                "schema_version": 5,
+                "repositories": [],
+                "favorite_repositories": ["C:\\repos\\alpha"],
+                "recently_closed_repositories": ["C:\\repos\\beta"],
+                "settings": {
+                    "theme": "System",
+                    "cursor_cli_path": null,
+                    "cursor_context_consent": false
+                }
+            }"#,
+        )
+        .expect("debe escribir el fixture v5");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe cargar sin perder datos");
+
+        assert!(loaded.corruption_backup.is_none());
+        assert_eq!(
+            loaded.state.favorite_repositories,
+            vec![PathBuf::from(r"C:\repos\alpha")]
+        );
+        assert_eq!(
+            loaded.state.recently_closed_repositories,
+            vec![PathBuf::from(r"C:\repos\beta")]
+        );
     }
 
     #[test]

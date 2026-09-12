@@ -14,8 +14,9 @@ use gpui::{
 use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
-        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        MoveRepositoryLeft, MoveRepositoryRight, NextRepository, OpenRepository,
+        PreviousRepository, RefreshRepository, ReopenClosedRepository, ShowChanges, ShowHistory,
+        ToggleFavoriteRepository,
     },
     app::AppStartup,
     cli::{InstanceRequest, InstanceRequestReceiver},
@@ -25,11 +26,14 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
-        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
-        OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
-        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
-        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
-        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
+        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot,
+        MAX_FAVORITE_REPOSITORIES, MAX_RECENT_REPOSITORIES, MAX_RECENTLY_CLOSED_REPOSITORIES,
+        MutationState, OperationKind, RefreshState, RemoteOperationPlan, RepositoryId,
+        RepositorySession, RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
+        append_repository_path, contains_repository_path, forget_repository_path,
+        format_periodic_fetch_interval_label, moved_tab_index, next_periodic_fetch_interval,
+        normalized_repo_key, periodic_fetch_poll_interval, primary_remote_label,
+        promote_repository_path, select_periodic_fetch,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -210,6 +214,33 @@ pub struct MainWindow {
     periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
     active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
     pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    /// Favoritos cuya última apertura falló, por clave canónica. Se recuerda en memoria
+    /// para marcar la lista sin comprobar el disco en cada fotograma.
+    unavailable_favorites: HashSet<String>,
+}
+
+/// Pestaña arrastrada; también se renderiza como vista previa del arrastre.
+#[derive(Clone)]
+struct DraggedRepositoryTab {
+    repository_id: RepositoryId,
+    label: gpui::SharedString,
+}
+
+impl Render for DraggedRepositoryTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(30.0))
+            .px_3()
+            .rounded_sm()
+            .border_1()
+            .border_color(ACCENT_COLOR)
+            .bg(ELEVATED_BACKGROUND_COLOR)
+            .text_color(PRIMARY_TEXT_COLOR)
+            .text_sm()
+            .child(self.label.clone())
+    }
 }
 
 #[allow(
@@ -267,6 +298,7 @@ impl MainWindow {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            unavailable_favorites: HashSet::new(),
         }
     }
 
@@ -391,8 +423,8 @@ impl MainWindow {
                     let current_active = this.state.active_repository_id;
                     loaded_state.repositories.retain(|loaded_repository| {
                         !this.state.repositories.iter().any(|current_repository| {
-                            normalized_path_key(&current_repository.root_path)
-                                == normalized_path_key(&loaded_repository.root_path)
+                            normalized_repo_key(&current_repository.root_path)
+                                == normalized_repo_key(&loaded_repository.root_path)
                         })
                     });
                     let restored = loaded_state
@@ -407,6 +439,9 @@ impl MainWindow {
                         this.state.active_repository_id = loaded_state.active_repository_id;
                     }
                     this.state.recent_repositories = loaded_state.recent_repositories;
+                    this.state.favorite_repositories = loaded_state.favorite_repositories;
+                    this.state.recently_closed_repositories =
+                        loaded_state.recently_closed_repositories;
                     this.state.ssh_clone_mappings = loaded_state
                         .ssh_clone_mappings
                         .into_iter()
@@ -713,8 +748,17 @@ impl MainWindow {
     }
 
     fn open_recent_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+        self.open_known_repository(root_path, "Abriendo repositorio reciente…", cx);
+    }
+
+    /// Abre una ruta ya conocida (reciente, favorita o pestaña cerrada) validándola antes.
+    ///
+    /// La validación con Git devuelve la raíz canónica, de modo que la comprobación de
+    /// duplicados de `finish_open_repository` reconoce la pestaña que ya estuviera abierta.
+    fn open_known_repository(&mut self, root_path: PathBuf, status: &str, cx: &mut Context<Self>) {
         let git_client = self.git_client.clone();
-        self.global_status_message = "Abriendo repositorio reciente…".to_owned();
+        self.global_status_message = status.to_owned();
+        let requested_path = root_path.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -727,9 +771,8 @@ impl MainWindow {
                         this.finish_open_repository(discovered_path, None, cx);
                     }
                     Err(error) => {
-                        this.global_error = Some(error.to_string());
-                        this.global_status_message =
-                            "No se pudo abrir el repositorio reciente".to_owned();
+                        this.report_known_repository_failure(&requested_path, &error.to_string());
+                        this.save_state(cx);
                     }
                 }
                 cx.notify();
@@ -737,6 +780,19 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// Marca el favorito como no disponible sin quitarlo: la decisión es del usuario.
+    fn report_known_repository_failure(&mut self, root_path: &Path, error: &str) {
+        self.global_error = Some(error.to_owned());
+        if self.is_favorite_repository(root_path) {
+            self.unavailable_favorites
+                .insert(normalized_repo_key(root_path));
+            self.global_status_message =
+                "El favorito no responde; puedes reintentar o quitarlo de favoritos".to_owned();
+        } else {
+            self.global_status_message = "No se pudo abrir el repositorio".to_owned();
+        }
     }
 
     fn open_repository(&mut self, _: &OpenRepository, _: &mut Window, cx: &mut Context<Self>) {
@@ -799,14 +855,10 @@ impl MainWindow {
         ssh_url_normalized: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let path_key = normalized_path_key(&root_path);
-        if let Some(repository_id) = self
-            .state
-            .repositories
-            .iter()
-            .find(|repository| normalized_path_key(&repository.root_path) == path_key)
-            .map(|repository| repository.id)
-        {
+        self.unavailable_favorites
+            .remove(&normalized_repo_key(&root_path));
+        forget_repository_path(&mut self.state.recently_closed_repositories, &root_path);
+        if let Some(repository_id) = self.repository_id_for_path(&root_path) {
             self.state.active_repository_id = Some(repository_id);
             self.global_status_message = "El repositorio ya estaba abierto".to_owned();
             if let Some(url) = ssh_url_normalized {
@@ -819,11 +871,11 @@ impl MainWindow {
         let repository_id = repository.id;
         self.state.repositories.push(repository);
         self.state.active_repository_id = Some(repository_id);
-        self.state
-            .recent_repositories
-            .retain(|recent| normalized_path_key(recent) != path_key);
-        self.state.recent_repositories.insert(0, root_path.clone());
-        self.state.recent_repositories.truncate(10);
+        promote_repository_path(
+            &mut self.state.recent_repositories,
+            root_path.clone(),
+            MAX_RECENT_REPOSITORIES,
+        );
         if let Some(url) = ssh_url_normalized {
             self.record_ssh_clone_mapping(url, root_path);
         }
@@ -835,11 +887,229 @@ impl MainWindow {
         self.refresh_repository(repository_id, cx);
     }
 
+    /// Identidad canónica compartida con recientes, favoritos y clones SSH.
+    fn repository_id_for_path(&self, root_path: &Path) -> Option<RepositoryId> {
+        let path_key = normalized_repo_key(root_path);
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| normalized_repo_key(&repository.root_path) == path_key)
+            .map(|repository| repository.id)
+    }
+
+    fn repository_index(&self, repository_id: RepositoryId) -> Option<usize> {
+        self.state
+            .repositories
+            .iter()
+            .position(|repository| repository.id == repository_id)
+    }
+
+    fn repository_path(&self, repository_id: RepositoryId) -> Option<PathBuf> {
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+    }
+
+    /// Reordena la barra moviendo la sesión completa.
+    ///
+    /// Solo cambia la posición dentro del vector: la sesión, su borrador y sus
+    /// operaciones viven en mapas indexados por `RepositoryId` y no se tocan.
+    fn reorder_repository(&mut self, repository_id: RepositoryId, target_index: usize) -> bool {
+        let Some(from) = self.repository_index(repository_id) else {
+            return false;
+        };
+        let last_index = self.state.repositories.len().saturating_sub(1);
+        let target = target_index.min(last_index);
+        if from == target {
+            return false;
+        }
+        let repository = self.state.repositories.remove(from);
+        self.state.repositories.insert(target, repository);
+        true
+    }
+
+    fn move_repository_left(
+        &mut self,
+        _: &MoveRepositoryLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_repository_tab(-1, cx);
+    }
+
+    fn move_repository_right(
+        &mut self,
+        _: &MoveRepositoryRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_active_repository_tab(1, cx);
+    }
+
+    /// Alternativa de teclado al arrastre; no da la vuelta al llegar al extremo.
+    fn move_active_repository_tab(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let Some(active_id) = self.state.active_repository_id else {
+            return;
+        };
+        let Some(from) = self.repository_index(active_id) else {
+            return;
+        };
+        let Some(target) = moved_tab_index(self.state.repositories.len(), from, direction) else {
+            self.global_status_message = "La pestaña ya está en el extremo de la barra".to_owned();
+            cx.notify();
+            return;
+        };
+        if self.reorder_repository(active_id, target) {
+            self.global_status_message = format!("Pestaña movida a la posición {}", target + 1);
+            self.save_state(cx);
+        }
+        cx.notify();
+    }
+
+    fn drop_repository_tab(
+        &mut self,
+        dragged_id: RepositoryId,
+        target_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target_index) = self.repository_index(target_id) else {
+            return;
+        };
+        if self.reorder_repository(dragged_id, target_index) {
+            self.global_status_message =
+                format!("Pestaña movida a la posición {}", target_index + 1);
+            self.save_state(cx);
+        }
+        cx.notify();
+    }
+
+    fn is_favorite_repository(&self, root_path: &Path) -> bool {
+        contains_repository_path(&self.state.favorite_repositories, root_path)
+    }
+
+    /// Claves canónicas de los favoritos, para resolver pertenencia en un solo recorrido.
+    fn favorite_repository_keys(&self) -> HashSet<String> {
+        self.state
+            .favorite_repositories
+            .iter()
+            .map(|favorite| normalized_repo_key(favorite))
+            .collect()
+    }
+
+    /// Claves canónicas de las pestañas abiertas; evita recorrerlas por cada favorito.
+    fn open_repository_keys(&self) -> HashSet<String> {
+        self.state
+            .repositories
+            .iter()
+            .map(|repository| normalized_repo_key(&repository.root_path))
+            .collect()
+    }
+
+    /// Alterna el favorito. Devuelve si quedó fijado, o `None` si no cabían más.
+    fn toggle_favorite_path(&mut self, root_path: &Path) -> Option<bool> {
+        if forget_repository_path(&mut self.state.favorite_repositories, root_path) {
+            self.unavailable_favorites
+                .remove(&normalized_repo_key(root_path));
+            return Some(false);
+        }
+        append_repository_path(
+            &mut self.state.favorite_repositories,
+            root_path.to_path_buf(),
+            MAX_FAVORITE_REPOSITORIES,
+        )
+        .then_some(true)
+    }
+
+    fn toggle_active_favorite(
+        &mut self,
+        _: &ToggleFavoriteRepository,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active_id) = self.state.active_repository_id {
+            self.toggle_favorite_repository(active_id, cx);
+        }
+    }
+
+    fn toggle_favorite_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(root_path) = self.repository_path(repository_id) else {
+            return;
+        };
+        self.global_status_message = match self.toggle_favorite_path(&root_path) {
+            Some(true) => "Repositorio añadido a favoritos".to_owned(),
+            Some(false) => "Repositorio quitado de favoritos".to_owned(),
+            None => format!("No se pueden fijar más de {MAX_FAVORITE_REPOSITORIES} favoritos"),
+        };
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Quita el favorito de la lista; no borra nada del disco ni cierra su pestaña.
+    fn remove_favorite_repository(&mut self, root_path: &Path, cx: &mut Context<Self>) {
+        if !forget_repository_path(&mut self.state.favorite_repositories, root_path) {
+            return;
+        }
+        self.unavailable_favorites
+            .remove(&normalized_repo_key(root_path));
+        self.global_status_message =
+            "Favorito quitado; el repositorio sigue en el disco".to_owned();
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn open_favorite_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(repository_id) = self.repository_id_for_path(&root_path) {
+            self.select_repository(repository_id, cx);
+            return;
+        }
+        self.open_known_repository(root_path, "Abriendo repositorio favorito…", cx);
+    }
+
+    /// Recuerda la pestaña cerrada para poder reabrirla más tarde.
+    fn remember_closed_repository(&mut self, root_path: PathBuf) {
+        promote_repository_path(
+            &mut self.state.recently_closed_repositories,
+            root_path,
+            MAX_RECENTLY_CLOSED_REPOSITORIES,
+        );
+    }
+
+    /// Extrae la última pestaña cerrada que no esté ya abierta, para no duplicarla.
+    fn take_reopenable_repository(&mut self) -> Option<PathBuf> {
+        while !self.state.recently_closed_repositories.is_empty() {
+            let root_path = self.state.recently_closed_repositories.remove(0);
+            if self.repository_id_for_path(&root_path).is_none() {
+                return Some(root_path);
+            }
+        }
+        None
+    }
+
+    fn reopen_closed_repository(
+        &mut self,
+        _: &ReopenClosedRepository,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reopen_last_closed_repository(cx);
+    }
+
+    fn reopen_last_closed_repository(&mut self, cx: &mut Context<Self>) {
+        let Some(root_path) = self.take_reopenable_repository() else {
+            self.global_status_message = "No hay pestañas cerradas para reabrir".to_owned();
+            cx.notify();
+            return;
+        };
+        self.open_known_repository(root_path, "Reabriendo la última pestaña cerrada…", cx);
+    }
+
     fn record_ssh_clone_mapping(&mut self, ssh_url_normalized: String, local_path: PathBuf) {
-        let local_key = normalized_path_key(&local_path);
+        let local_key = normalized_repo_key(&local_path);
         self.state.ssh_clone_mappings.retain(|mapping| {
             mapping.ssh_url_normalized != ssh_url_normalized
-                && normalized_path_key(&mapping.local_path) != local_key
+                && normalized_repo_key(&mapping.local_path) != local_key
         });
         self.state.ssh_clone_mappings.insert(
             0,
@@ -1202,15 +1472,11 @@ impl MainWindow {
         if let Some(cancellation) = self.active_mutation_cancellations.remove(&repository_id) {
             cancellation.cancel();
         }
-        let Some(index) = self
-            .state
-            .repositories
-            .iter()
-            .position(|repository| repository.id == repository_id)
-        else {
+        let Some(index) = self.repository_index(repository_id) else {
             return;
         };
-        self.state.repositories.remove(index);
+        let closed = self.state.repositories.remove(index);
+        self.remember_closed_repository(closed.root_path);
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
@@ -1242,7 +1508,8 @@ impl MainWindow {
                 self.refresh_repository(active_id, cx);
             }
         }
-        self.global_status_message = "Pestaña cerrada".to_owned();
+        self.global_status_message =
+            "Pestaña cerrada; puedes reabrirla con Ctrl+Shift+T".to_owned();
         self.save_state(cx);
         cx.notify();
     }
@@ -3149,6 +3416,9 @@ impl MainWindow {
 
     fn render_repository_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let active_id = self.state.active_repository_id;
+        // Una sola pasada por favoritos en lugar de compararlos con cada pestaña:
+        // la barra se redibuja en cada fotograma y ambas listas pueden ser largas.
+        let favorite_keys = self.favorite_repository_keys();
         div()
             .flex()
             .min_w(px(0.0))
@@ -3175,6 +3445,12 @@ impl MainWindow {
                             .to_owned();
                         let full_path = repository.root_path.display().to_string();
                         let change_count = repository.working_tree.changes.len();
+                        let is_favorite =
+                            favorite_keys.contains(&normalized_repo_key(&repository.root_path));
+                        let dragged = DraggedRepositoryTab {
+                            repository_id,
+                            label: name.clone().into(),
+                        };
                         div()
                             .id(format!("repository-tab-{repository_id:?}"))
                             .flex()
@@ -3192,6 +3468,21 @@ impl MainWindow {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_repository(repository_id, cx);
                             }))
+                            .on_drag(dragged, |dragged, _offset, _window, cx| {
+                                cx.new(|_| dragged.clone())
+                            })
+                            .drag_over::<DraggedRepositoryTab>(|style, _, _, _| {
+                                style.bg(HOVER_BACKGROUND_COLOR).border_color(ACCENT_COLOR)
+                            })
+                            .on_drop(cx.listener(
+                                move |this, dragged: &DraggedRepositoryTab, _, cx| {
+                                    this.drop_repository_tab(
+                                        dragged.repository_id,
+                                        repository_id,
+                                        cx,
+                                    );
+                                },
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -3223,6 +3514,30 @@ impl MainWindow {
                             })
                             .child(
                                 div()
+                                    .id(format!("favorite-repository-tab-{repository_id:?}"))
+                                    .px_1()
+                                    .text_xs()
+                                    .aria_label(if is_favorite {
+                                        "Quitar de favoritos"
+                                    } else {
+                                        "Fijar en favoritos"
+                                    })
+                                    .text_color(if is_favorite {
+                                        WARNING_COLOR
+                                    } else {
+                                        MUTED_TEXT_COLOR
+                                    })
+                                    .hover(|style| {
+                                        style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_favorite_repository(repository_id, cx);
+                                    }))
+                                    .child(if is_favorite { "★" } else { "☆" }),
+                            )
+                            .child(
+                                div()
                                     .id(format!("close-repository-tab-{repository_id:?}"))
                                     .px_1()
                                     .text_color(MUTED_TEXT_COLOR)
@@ -3237,6 +3552,24 @@ impl MainWindow {
                             )
                     })),
             )
+            .when(!self.state.recently_closed_repositories.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .id("reopen-repository-tab")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(38.0))
+                        .h_full()
+                        .text_sm()
+                        .aria_label("Reabrir la última pestaña cerrada (Ctrl+Shift+T)")
+                        .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reopen_last_closed_repository(cx);
+                        }))
+                        .child("↩"),
+                )
+            })
             .child(
                 div()
                     .id("clone-repository-tab")
@@ -3246,6 +3579,7 @@ impl MainWindow {
                     .w(px(38.0))
                     .h_full()
                     .text_sm()
+                    .aria_label("Clonar repositorio por SSH (Ctrl+Shift+O)")
                     .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_clone_panel(cx);
@@ -4524,6 +4858,68 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// Lista de favoritos reutilizada por el estado vacío y el panel de clonado.
+    ///
+    /// Un favorito es una marca persistente, no una pestaña: la fila indica si ya está
+    /// abierto y ofrece quitarlo sin cerrar nada ni tocar el disco. La disponibilidad
+    /// procede de `unavailable_favorites`, que se actualiza al intentar abrirlo, de modo
+    /// que renderizar la lista no consulta el sistema de archivos.
+    fn render_favorites_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let open_keys = self.open_repository_keys();
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child("Favoritos"),
+            )
+            .children(self.state.favorite_repositories.iter().map(|favorite| {
+                let label = favorite
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Repositorio")
+                    .to_owned();
+                let favorite_key = normalized_repo_key(favorite);
+                let is_open = open_keys.contains(&favorite_key);
+                let is_unavailable = self.unavailable_favorites.contains(&favorite_key);
+                let path_to_open = favorite.clone();
+                let path_to_forget = favorite.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        action_button(
+                            format!("favorite-{favorite_key}"),
+                            if is_unavailable {
+                                format!("{label} — no disponible")
+                            } else if is_open {
+                                format!("{label} — abierto")
+                            } else {
+                                label
+                            },
+                            true,
+                        )
+                        .aria_label(favorite.display().to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_favorite_repository(path_to_open.clone(), cx);
+                        })),
+                    )
+                    .child(
+                        action_button(format!("forget-favorite-{favorite_key}"), "✕", true)
+                            .aria_label("Quitar de favoritos sin borrar nada del disco")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_favorite_repository(&path_to_forget, cx);
+                            })),
+                    )
+            }))
+            .into_any_element()
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
         // La existencia en disco se comprueba al cargar el estado y al abrir cada clon:
         // repetirla en cada frame de render supondría un acceso a disco por fotograma.
@@ -4561,6 +4957,20 @@ impl MainWindow {
                                 this.show_clone_panel(cx);
                             })),
                     ),
+            )
+            .when(!self.state.favorite_repositories.is_empty(), |panel| {
+                panel.child(self.render_favorites_section(cx))
+            })
+            .when(
+                !self.state.recently_closed_repositories.is_empty(),
+                |panel| {
+                    panel.child(
+                        action_button("reopen-empty", "Reabrir última pestaña cerrada", true)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reopen_last_closed_repository(cx);
+                            })),
+                    )
+                },
             )
             .when(!ssh_clones.is_empty(), |panel| {
                 panel.child(
@@ -4670,6 +5080,9 @@ impl MainWindow {
                         )
                     }),
             )
+            .when(!self.state.favorite_repositories.is_empty(), |panel| {
+                panel.child(div().mt_4().child(self.render_favorites_section(cx)))
+            })
             .when(!self.state.recent_repositories.is_empty(), |panel| {
                 panel.child(
                     div()
@@ -4711,6 +5124,8 @@ impl MainWindow {
     ) -> AnyElement {
         let repository_id = repository.id;
         let path = repository.root_path.display().to_string();
+        let favorite_path = repository.root_path.clone();
+        let is_favorite = self.is_favorite_repository(&repository.root_path);
         div()
             .flex()
             .flex_1()
@@ -4743,7 +5158,22 @@ impl MainWindow {
                                 this.close_repository(repository_id, cx);
                             }),
                         ),
-                    ),
+                    )
+                    .when(is_favorite, |actions| {
+                        actions.child(
+                            action_button(
+                                "forget-favorite-inaccessible",
+                                "Quitar de favoritos",
+                                true,
+                            )
+                            .aria_label("Quitar de favoritos sin borrar nada del disco")
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.remove_favorite_repository(&favorite_path, cx);
+                                },
+                            )),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -4869,8 +5299,12 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::open_repository))
             .on_action(cx.listener(Self::clone_repository))
             .on_action(cx.listener(Self::close_active_repository))
+            .on_action(cx.listener(Self::reopen_closed_repository))
             .on_action(cx.listener(Self::next_repository))
             .on_action(cx.listener(Self::previous_repository))
+            .on_action(cx.listener(Self::move_repository_left))
+            .on_action(cx.listener(Self::move_repository_right))
+            .on_action(cx.listener(Self::toggle_active_favorite))
             .on_action(cx.listener(Self::refresh_active_repository))
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::show_changes))
@@ -5226,13 +5660,6 @@ fn capture_window_placement(window: &Window) -> WindowPlacement {
     }
 }
 
-fn normalized_path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
-}
-
 fn change_row_action_id(action: &str, path: &Path, representation: ChangeRepresentation) -> String {
     let representation = match representation {
         ChangeRepresentation::Conflict => "conflict",
@@ -5483,7 +5910,185 @@ mod tests {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            unavailable_favorites: HashSet::new(),
         }
+    }
+
+    /// Crea una ventana con varias pestañas nombradas para las pruebas de ordenación.
+    fn window_with_tabs(names: &[&str]) -> MainWindow {
+        let repositories = names
+            .iter()
+            .map(|name| RepositorySession::new(PathBuf::from(format!(r"C:\repos\{name}"))))
+            .collect();
+        test_window(GitClient::default(), repositories)
+    }
+
+    fn tab_names(window: &MainWindow) -> Vec<String> {
+        window
+            .state
+            .repositories
+            .iter()
+            .map(|repository| {
+                repository
+                    .root_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reordering_a_tab_preserves_its_session_draft_and_pending_work() {
+        let mut window = window_with_tabs(&["alpha", "beta", "gamma"]);
+        let moved_id = window.state.repositories[0].id;
+        window.state.repositories[0].status_message = "Estado propio".to_owned();
+        window.pending_refreshes.insert(moved_id);
+        window.expanded_errors.insert(moved_id);
+        window.state.active_repository_id = Some(moved_id);
+
+        assert!(window.reorder_repository(moved_id, 2));
+
+        assert_eq!(tab_names(&window), vec!["beta", "gamma", "alpha"]);
+        assert_eq!(window.repository_index(moved_id), Some(2));
+        assert_eq!(
+            window.state.active_repository_id,
+            Some(moved_id),
+            "mover una pestaña no debe cambiar cuál está activa"
+        );
+        let moved = &window.state.repositories[2];
+        assert_eq!(moved.id, moved_id);
+        assert_eq!(moved.status_message, "Estado propio");
+        assert!(window.pending_refreshes.contains(&moved_id));
+        assert!(window.expanded_errors.contains(&moved_id));
+    }
+
+    #[test]
+    fn dropping_a_tab_inserts_it_at_the_position_of_the_target() {
+        let mut window = window_with_tabs(&["alpha", "beta", "gamma"]);
+        let last_id = window.state.repositories[2].id;
+
+        assert!(window.reorder_repository(last_id, 0));
+        assert_eq!(tab_names(&window), vec!["gamma", "alpha", "beta"]);
+
+        assert!(
+            !window.reorder_repository(last_id, 0),
+            "soltar una pestaña sobre sí misma no debe reordenar ni marcar cambios"
+        );
+    }
+
+    #[test]
+    fn keyboard_reordering_stops_at_the_edges_of_the_tab_bar() {
+        let window = window_with_tabs(&["alpha", "beta", "gamma"]);
+        let count = window.state.repositories.len();
+
+        assert_eq!(moved_tab_index(count, 0, -1), None);
+        assert_eq!(moved_tab_index(count, 2, 1), None);
+        assert_eq!(moved_tab_index(count, 0, 1), Some(1));
+    }
+
+    #[test]
+    fn favorites_are_independent_from_the_open_tabs() {
+        let mut window = window_with_tabs(&["alpha"]);
+        let favorite = PathBuf::from(r"C:\repos\beta");
+
+        assert_eq!(window.toggle_favorite_path(&favorite), Some(true));
+
+        assert!(window.is_favorite_repository(&favorite));
+        assert!(
+            window.repository_id_for_path(&favorite).is_none(),
+            "fijar un favorito no debe abrir su pestaña"
+        );
+        assert_eq!(window.state.repositories.len(), 1);
+
+        assert_eq!(window.toggle_favorite_path(&favorite), Some(false));
+        assert!(window.state.favorite_repositories.is_empty());
+        assert_eq!(
+            window.state.repositories.len(),
+            1,
+            "quitar un favorito no debe cerrar ninguna pestaña"
+        );
+    }
+
+    #[test]
+    fn favorites_use_the_canonical_identity_and_honour_their_limit() {
+        let mut window = window_with_tabs(&["alpha"]);
+
+        assert_eq!(
+            window.toggle_favorite_path(&PathBuf::from(r"C:\repos\Alpha")),
+            Some(true)
+        );
+        assert!(window.is_favorite_repository(&PathBuf::from(r"c:/repos/alpha\")));
+
+        for index in 0..MAX_FAVORITE_REPOSITORIES {
+            window
+                .toggle_favorite_path(&PathBuf::from(format!(r"C:\repos\extra-{index}")))
+                .unwrap_or(false);
+        }
+
+        assert_eq!(
+            window.state.favorite_repositories.len(),
+            MAX_FAVORITE_REPOSITORIES
+        );
+        assert_eq!(
+            window.toggle_favorite_path(&PathBuf::from(r"C:\repos\sobra")),
+            None,
+            "al llegar al límite debe avisarse en lugar de descartar otro favorito"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_favorite_is_marked_without_being_removed() {
+        let mut window = window_with_tabs(&["alpha"]);
+        let favorite = PathBuf::from(r"C:\repos\beta");
+        window.toggle_favorite_path(&favorite);
+
+        window.report_known_repository_failure(&favorite, "la ruta no responde");
+
+        assert!(window.is_favorite_repository(&favorite));
+        assert!(
+            window
+                .unavailable_favorites
+                .contains(&normalized_repo_key(&favorite))
+        );
+
+        assert_eq!(window.toggle_favorite_path(&favorite), Some(false));
+        assert!(
+            window.unavailable_favorites.is_empty(),
+            "quitar el favorito debe olvidar también su marca de no disponible"
+        );
+    }
+
+    #[test]
+    fn reopening_skips_repositories_that_are_already_open() {
+        let mut window = window_with_tabs(&["alpha"]);
+        let open_path = window.state.repositories[0].root_path.clone();
+        window.remember_closed_repository(PathBuf::from(r"C:\repos\beta"));
+        window.remember_closed_repository(open_path);
+
+        assert_eq!(
+            window.take_reopenable_repository(),
+            Some(PathBuf::from(r"C:\repos\beta")),
+            "la pestaña que ya está abierta no debe duplicarse al reabrir"
+        );
+        assert_eq!(window.take_reopenable_repository(), None);
+    }
+
+    #[test]
+    fn the_reopen_stack_keeps_the_most_recent_entry_without_duplicates() {
+        let mut window = window_with_tabs(&[]);
+        window.remember_closed_repository(PathBuf::from(r"C:\repos\alpha"));
+        window.remember_closed_repository(PathBuf::from(r"C:\repos\beta"));
+        window.remember_closed_repository(PathBuf::from(r"c:/repos/alpha"));
+
+        assert_eq!(
+            window.state.recently_closed_repositories,
+            vec![
+                PathBuf::from(r"c:/repos/alpha"),
+                PathBuf::from(r"C:\repos\beta"),
+            ]
+        );
     }
 
     #[test]
