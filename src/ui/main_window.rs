@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,7 +14,7 @@ use gpui::{
 
 use crate::{
     actions::{
-        CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
+        CloneRepository, CloseActiveRepository, CreateCommit, FindInView, GenerateCommitMessage,
         NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
         ShowHistory,
     },
@@ -25,11 +26,12 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
-        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
-        OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
-        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
-        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
-        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
+        CommitSummary, FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot,
+        MutationState, OperationKind, RefreshState, RemoteOperationPlan, RepositoryId,
+        RepositorySession, RepositoryView, SearchQuery, SshCloneMapping, SystemClock,
+        WorkingTreeSnapshot, change_matches, commit_matches, format_periodic_fetch_interval_label,
+        next_periodic_fetch_interval, normalized_repo_key, periodic_fetch_poll_interval,
+        primary_remote_label, select_periodic_fetch,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -45,7 +47,7 @@ use crate::{
 };
 
 use super::{
-    commit_input::{CommitInput, CommitMessageChanged},
+    commit_input::{CommitInput, CommitInputDismissed, CommitMessageChanged, InputAppearance},
     history_selection::{
         BeginDetailsSelection, DetailsCompletion, HistoryDetailsController, HistoryDetailsKey,
     },
@@ -60,6 +62,101 @@ const INITIAL_HISTORY_LIMIT: usize = 200;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
 const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 56;
 const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 56;
+/// Commits leídos de Git en cada página del recorrido de búsqueda.
+const HISTORY_SEARCH_PAGE: usize = 500;
+/// Resultados acumulados antes de parar y ofrecer «Buscar más».
+///
+/// Sin este tope una consulta muy común recorrería la referencia entera antes
+/// de enseñar nada; el usuario ya puede trabajar con los primeros resultados.
+const HISTORY_SEARCH_MATCH_TARGET: usize = 100;
+/// Espera tras teclear antes de lanzar Git, para no encadenar procesos.
+const HISTORY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Vista sobre la que actúa una caja de búsqueda.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SearchScope {
+    Changes,
+    History,
+}
+
+/// Caja de búsqueda de una vista: campo de texto y consulta ya aplicada.
+struct SearchBox {
+    input: Entity<CommitInput>,
+    /// Consulta sin espacios sobrantes; vacía significa búsqueda inactiva.
+    query: String,
+    /// Mantiene vivas las suscripciones de texto y de Escape.
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Recorrido paginado de la referencia seleccionada para una consulta.
+///
+/// La coincidencia se evalúa en Rust sobre los commits ya leídos: la consulta
+/// nunca llega a Git como patrón, así que no hay expresiones regulares
+/// implícitas ni argumentos construidos con texto del usuario.
+#[derive(Default)]
+struct HistorySearch {
+    /// Consulta aplicada; vacía significa búsqueda inactiva.
+    query: String,
+    /// Se incrementa al cambiar la consulta o la referencia seleccionada.
+    generation: u64,
+    /// Referencia y OID sobre los que se pagina, fijados al iniciar.
+    reference: Option<String>,
+    oid: Option<String>,
+    matches: Vec<CommitSummary>,
+    /// Commits ya recorridos de la referencia.
+    scanned: usize,
+    /// La referencia se recorrió por completo.
+    exhausted: bool,
+    scanning: bool,
+    error: Option<String>,
+}
+
+/// Resultado de aplicar una página leída al recorrido de búsqueda.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistorySearchPage {
+    /// La página pertenece al recorrido vigente y se acumuló.
+    Applied,
+    /// Venía de otra consulta, otra referencia u otra posición: se descarta.
+    Stale,
+}
+
+impl HistorySearch {
+    /// Indica si el recorrido puede continuar sin intervención del usuario.
+    const fn can_continue(&self) -> bool {
+        !self.exhausted && self.error.is_none()
+    }
+
+    /// Acumula las coincidencias de una página si sigue siendo pertinente.
+    ///
+    /// Comprobar generación, referencia, OID y posición evita mezclar
+    /// resultados de una consulta o una rama que el usuario ya abandonó.
+    fn apply_page(
+        &mut self,
+        generation: u64,
+        offset: usize,
+        query: &SearchQuery,
+        page: HistoryPage,
+    ) -> HistorySearchPage {
+        if self.generation != generation
+            || self.reference.as_deref() != Some(page.reference.as_str())
+            || self.oid.as_deref() != Some(page.oid.as_str())
+            || self.scanned != offset
+        {
+            return HistorySearchPage::Stale;
+        }
+        let read = page.commits.len();
+        self.scanned = offset.saturating_add(read);
+        // Git devuelve menos commits de los pedidos solo al agotar la referencia.
+        self.exhausted = read < HISTORY_SEARCH_PAGE;
+        self.matches.extend(
+            page.commits
+                .into_iter()
+                .map(|commit| commit.summary)
+                .filter(|commit| commit_matches(commit, query)),
+        );
+        HistorySearchPage::Applied
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryContentState {
@@ -196,6 +293,12 @@ pub struct MainWindow {
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
     expanded_errors: HashSet<RepositoryId>,
     change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
+    /// Cajas de búsqueda por repositorio y vista; cada pestaña busca aparte.
+    search_boxes: HashMap<(RepositoryId, SearchScope), SearchBox>,
+    /// Estado del recorrido paginado del historial por repositorio.
+    history_searches: HashMap<RepositoryId, HistorySearch>,
+    /// Cancelación del recorrido de historial en vuelo.
+    history_search_cancellations: HashMap<RepositoryId, CancellationToken>,
     git_version: Option<String>,
     global_status_message: String,
     global_error: Option<String>,
@@ -253,6 +356,9 @@ impl MainWindow {
             collapsed_groups: HashSet::new(),
             expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
+            search_boxes: HashMap::new(),
+            history_searches: HashMap::new(),
+            history_search_cancellations: HashMap::new(),
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
             global_error: None,
@@ -1222,6 +1328,11 @@ impl MainWindow {
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
         self.expanded_errors.remove(&repository_id);
         self.change_rows.remove(&repository_id);
+        self.search_boxes.retain(|(id, _), _| *id != repository_id);
+        self.history_searches.remove(&repository_id);
+        if let Some(cancellation) = self.history_search_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
         self.active_fetch_contexts.remove(&repository_id);
         self.pending_fetch_refresh.remove(&repository_id);
         self.periodic_fetch_in_flight
@@ -1799,20 +1910,40 @@ impl MainWindow {
         outcome
     }
 
+    /// Indica si un commit figura entre los resultados de búsqueda vigentes.
+    fn commit_is_in_history_search(&self, repository_id: RepositoryId, commit_id: &str) -> bool {
+        self.history_searches
+            .get(&repository_id)
+            .is_some_and(|search| {
+                search
+                    .matches
+                    .iter()
+                    .any(|commit| commit.id.as_str() == commit_id)
+            })
+    }
+
     fn reconcile_selected_commit(&mut self, repository_id: RepositoryId) -> Option<String> {
+        let found_by_search = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .and_then(|repository| repository.selected_commit.as_deref())
+            .is_some_and(|selected| self.commit_is_in_history_search(repository_id, selected));
         let repository = self
             .state
             .repositories
             .iter_mut()
             .find(|repository| repository.id == repository_id)?;
         let selected_commit = repository.selected_commit.clone();
-        let is_visible = selected_commit.as_ref().is_some_and(|selected| {
-            repository
-                .history
-                .commits
-                .iter()
-                .any(|commit| &commit.id == selected)
-        });
+        let is_visible = found_by_search
+            || selected_commit.as_ref().is_some_and(|selected| {
+                repository
+                    .history
+                    .commits
+                    .iter()
+                    .any(|commit| &commit.id == selected)
+            });
         if !is_visible {
             // Si la referencia ya no contiene el commit, el fallback explícito es
             // dejar la selección vacía; nunca se muestra un detalle ajeno al historial.
@@ -3429,17 +3560,383 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// Crea, si falta, la caja de búsqueda de una vista del repositorio.
+    ///
+    /// Cada pestaña tiene su propia caja: cambiar de repositorio no arrastra
+    /// la consulta de otro ni descarta la que se estaba usando.
+    fn ensure_search_box(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_boxes.contains_key(&(repository_id, scope)) {
+            return;
+        }
+        let appearance = match scope {
+            SearchScope::Changes => {
+                InputAppearance::single_line("change-search-input", "Filtra por ruta o nombre…")
+            }
+            SearchScope::History => InputAppearance::single_line(
+                "history-search-input",
+                "Busca por mensaje, autor o hash…",
+            ),
+        };
+        let input = cx.new(|cx| CommitInput::with_appearance(appearance, cx));
+        let changed = cx.subscribe(&input, move |this, input, _: &CommitMessageChanged, cx| {
+            let query = input.read(cx).content().trim().to_owned();
+            this.apply_search_query(repository_id, scope, query, cx);
+        });
+        let dismissed = cx.subscribe(&input, move |this, _, _: &CommitInputDismissed, cx| {
+            this.clear_search(repository_id, scope, cx);
+        });
+        self.search_boxes.insert(
+            (repository_id, scope),
+            SearchBox {
+                input,
+                query: String::new(),
+                _subscriptions: vec![changed, dismissed],
+            },
+        );
+    }
+
+    /// Consulta activa de una vista, ya normalizada.
+    fn search_query(&self, repository_id: RepositoryId, scope: SearchScope) -> Option<SearchQuery> {
+        self.search_boxes
+            .get(&(repository_id, scope))
+            .and_then(|search| SearchQuery::parse(&search.query))
+    }
+
+    fn apply_search_query(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.search_boxes.get_mut(&(repository_id, scope)) else {
+            return;
+        };
+        if search.query == query {
+            return;
+        }
+        search.query = query;
+        match scope {
+            // El filtro forma parte de las filas ya calculadas.
+            SearchScope::Changes => {
+                self.change_rows.remove(&repository_id);
+            }
+            SearchScope::History => self.restart_history_search(repository_id, cx),
+        }
+        cx.notify();
+    }
+
+    /// Vacía la consulta de una vista; la invoca Escape dentro del campo.
+    fn clear_search(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return;
+        };
+        if search.input.read(cx).content().is_empty() {
+            return;
+        }
+        let input = search.input.clone();
+        input.update(cx, CommitInput::clear);
+        cx.notify();
+    }
+
+    fn focus_search(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_search_box(repository_id, scope, cx);
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return;
+        };
+        let input = search.input.clone();
+        input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn find_in_view(&mut self, _: &FindInView, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((repository_id, view)) = self
+            .active_repository()
+            .map(|repository| (repository.id, repository.selected_view))
+        else {
+            return;
+        };
+        self.focus_search(repository_id, search_scope_for(view), window, cx);
+    }
+
+    /// Reinicia el recorrido del historial tras cambiar consulta o referencia.
+    ///
+    /// Subir la generación deja obsoleta cualquier página en vuelo: su
+    /// resultado se descarta en lugar de mezclarse con la búsqueda nueva.
+    fn restart_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.history_search_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
+        let generation = self
+            .history_searches
+            .get(&repository_id)
+            .map_or(0, |search| search.generation)
+            .saturating_add(1);
+        let query = self
+            .search_boxes
+            .get(&(repository_id, SearchScope::History))
+            .map(|search| search.query.clone())
+            .unwrap_or_default();
+        if query.is_empty() {
+            self.history_searches.remove(&repository_id);
+            cx.notify();
+            return;
+        }
+        let (reference, oid) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map_or((None, None), |repository| {
+                (
+                    repository.history.history_reference.clone(),
+                    repository.history.history_oid.clone(),
+                )
+            });
+        self.history_searches.insert(
+            repository_id,
+            HistorySearch {
+                query,
+                generation,
+                reference,
+                oid,
+                ..HistorySearch::default()
+            },
+        );
+        self.scan_history_search(repository_id, generation, true, cx);
+        cx.notify();
+    }
+
+    /// Descarta los resultados si la referencia mostrada dejó de ser la buscada.
+    fn synchronize_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(search) = self.history_searches.get(&repository_id) else {
+            return;
+        };
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        if search.reference == repository.history.history_reference
+            && search.oid == repository.history.history_oid
+        {
+            return;
+        }
+        self.restart_history_search(repository_id, cx);
+    }
+
+    /// Lee una página de la referencia y acumula las coincidencias.
+    ///
+    /// `debounce` espera a que el tecleo cese para no encadenar un proceso de
+    /// Git por cada pulsación.
+    fn scan_history_search(
+        &mut self,
+        repository_id: RepositoryId,
+        generation: u64,
+        debounce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root_path) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+        else {
+            return;
+        };
+        let Some(search) = self.history_searches.get_mut(&repository_id) else {
+            return;
+        };
+        if search.generation != generation || search.scanning || search.exhausted {
+            return;
+        }
+        let Some(query) = SearchQuery::parse(&search.query) else {
+            return;
+        };
+        let (Some(reference), Some(oid)) = (search.reference.clone(), search.oid.clone()) else {
+            search.error =
+                Some("No hay una referencia de historial seleccionada para buscar.".to_owned());
+            cx.notify();
+            return;
+        };
+        let offset = search.scanned;
+        search.scanning = true;
+        search.error = None;
+        let git_client = self.git_client.clone();
+        let cancellation = CancellationToken::default();
+        self.history_search_cancellations
+            .insert(repository_id, cancellation.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor()
+                    .timer(HISTORY_SEARCH_DEBOUNCE)
+                    .await;
+                if cancellation.is_cancelled() {
+                    return;
+                }
+            }
+            let request_cancellation = cancellation.clone();
+            let result = cx
+                .background_spawn(async move {
+                    git_client.history_for_oid(
+                        &root_path,
+                        &reference,
+                        &oid,
+                        HISTORY_SEARCH_PAGE,
+                        offset,
+                        &request_cancellation,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.finish_history_search_page(
+                    repository_id,
+                    generation,
+                    offset,
+                    &query,
+                    result,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_history_search_page(
+        &mut self,
+        repository_id: RepositoryId,
+        generation: u64,
+        offset: usize,
+        query: &SearchQuery,
+        result: Result<HistoryPage, GitError>,
+        cx: &mut Context<Self>,
+    ) {
+        // La consulta o la rama cambiaron mientras Git respondía: el resultado
+        // ya no describe lo que la vista está mostrando.
+        if self
+            .history_searches
+            .get(&repository_id)
+            .is_none_or(|search| search.generation != generation)
+        {
+            return;
+        }
+        self.history_search_cancellations.remove(&repository_id);
+        let Some(search) = self.history_searches.get_mut(&repository_id) else {
+            return;
+        };
+        search.scanning = false;
+        match result {
+            Ok(page) => {
+                if search.apply_page(generation, offset, query, page) == HistorySearchPage::Stale {
+                    cx.notify();
+                    return;
+                }
+            }
+            Err(error) => search.error = Some(error.technical_details()),
+        }
+        let should_continue =
+            search.can_continue() && search.matches.len() < HISTORY_SEARCH_MATCH_TARGET;
+        cx.notify();
+        if should_continue {
+            self.scan_history_search(repository_id, generation, false, cx);
+        }
+    }
+
+    /// Continúa el recorrido a petición del usuario, sin esperar al tecleo.
+    fn continue_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(generation) = self
+            .history_searches
+            .get(&repository_id)
+            .map(|search| search.generation)
+        else {
+            return;
+        };
+        self.scan_history_search(repository_id, generation, false, cx);
+    }
+
+    fn render_search_bar(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        summary: String,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_search_box(repository_id, scope, cx);
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return div().into_any_element();
+        };
+        let input = search.input.clone();
+        let has_query = !search.query.is_empty();
+        let clear_id = match scope {
+            SearchScope::Changes => "clear-change-search",
+            SearchScope::History => "clear-history-search",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(BORDER_COLOR)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(input))
+                    .child(
+                        action_button(clear_id, "Limpiar", has_query).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.clear_search(repository_id, scope, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(div().text_xs().text_color(MUTED_TEXT_COLOR).child(summary))
+            .when_some(error, |bar, error| {
+                bar.child(div().text_xs().text_color(ERROR_COLOR).child(error))
+            })
+            .into_any_element()
+    }
+
     fn render_changes(
         &mut self,
         repository: &RepositorySession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content_state = repository_content_state(repository);
+        self.ensure_search_box(repository.id, SearchScope::Changes, cx);
+        let query = self.search_query(repository.id, SearchScope::Changes);
         if !self.change_rows.contains_key(&repository.id) {
             let rows = Arc::new(build_change_rows(
                 repository.id,
                 &repository.working_tree.changes,
                 &self.collapsed_groups,
+                query.as_ref(),
             ));
             self.change_rows.insert(repository.id, rows);
         }
@@ -3457,12 +3954,46 @@ impl MainWindow {
             .as_ref()
             .is_none_or(|input| input.read(cx).content().trim().is_empty());
         let commit_enabled = staged_count > 0 && !message_is_empty && can_mutate;
+        let total_changes = repository.working_tree.changes.len();
+        let matching_changes = query.as_ref().map_or(total_changes, |query| {
+            repository
+                .working_tree
+                .changes
+                .iter()
+                .filter(|change| change_matches(change, query))
+                .count()
+        });
+        let filtered_empty = query.is_some() && matching_changes == 0;
+        let search_summary = query.as_ref().map_or_else(
+            || "Filtra por ruta o nombre con Ctrl+F. Escape limpia la consulta.".to_owned(),
+            |query| {
+                if matching_changes == 0 {
+                    format!(
+                        "Consulta «{}» · sin coincidencias entre {total_changes} archivos",
+                        query.raw()
+                    )
+                } else {
+                    format!(
+                        "Consulta «{}» · {matching_changes} de {total_changes} archivos",
+                        query.raw()
+                    )
+                }
+            },
+        );
+        let search_bar = self.render_search_bar(
+            repository_id,
+            SearchScope::Changes,
+            search_summary,
+            None,
+            cx,
+        );
 
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .child(search_bar)
             .child(match content_state {
                 RepositoryContentState::Loading => state_card(
                     "change-state-loading",
@@ -3488,10 +4019,11 @@ impl MainWindow {
                     "Prepara los archivos y crea el primer commit. Descartar staged requiere hacer unstage antes.",
                     WARNING_COLOR,
                 ),
-                RepositoryContentState::Changes => uniform_change_list(
+                RepositoryContentState::Changes => change_list_or_empty(
                     rows.clone(),
                     row_count,
                     repository_id,
+                    filtered_empty,
                     cx,
                 ),
                 RepositoryContentState::Refreshing => div()
@@ -3504,7 +4036,13 @@ impl MainWindow {
                         "Mostrando el último estado correcto mientras Git responde.",
                         ACCENT_COLOR,
                     ))
-                    .child(uniform_change_list(rows.clone(), row_count, repository_id, cx))
+                    .child(change_list_or_empty(
+                        rows.clone(),
+                        row_count,
+                        repository_id,
+                        filtered_empty,
+                        cx,
+                    ))
                     .into_any_element(),
                 RepositoryContentState::Stale => div()
                     .flex()
@@ -3516,7 +4054,13 @@ impl MainWindow {
                         "La actualización falló; los cambios visibles pueden estar desactualizados. Pulsa Actualizar.",
                         ERROR_COLOR,
                     ))
-                    .child(uniform_change_list(rows, row_count, repository_id, cx))
+                    .child(change_list_or_empty(
+                        rows,
+                        row_count,
+                        repository_id,
+                        filtered_empty,
+                        cx,
+                    ))
                     .into_any_element(),
             })
             .when(
@@ -3928,6 +4472,9 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_history_details(repository_id);
+        // Un resultado de búsqueda puede venir de una página que el historial
+        // visible aún no ha cargado, pero pertenece a la misma referencia.
+        let found_by_search = self.commit_is_in_history_search(repository_id, &commit_id);
         let Some(repository) = self
             .state
             .repositories
@@ -3936,11 +4483,12 @@ impl MainWindow {
         else {
             return;
         };
-        if !repository
-            .history
-            .commits
-            .iter()
-            .any(|commit| commit.id == commit_id)
+        if !found_by_search
+            && !repository
+                .history
+                .commits
+                .iter()
+                .any(|commit| commit.id == commit_id)
         {
             repository.selected_commit = None;
             self.history_detail_errors.insert(
@@ -4157,12 +4705,39 @@ impl MainWindow {
         .detach();
     }
 
-    fn render_history(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
-        let commits = Arc::clone(&repository.history.commits);
-        let count = commits.len();
+    fn render_history(
+        &mut self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let repository_id = repository.id;
+        self.ensure_search_box(repository_id, SearchScope::History, cx);
+        self.synchronize_history_search(repository_id, cx);
+        let query = self.search_query(repository_id, SearchScope::History);
+        let search = self.history_searches.get(&repository_id);
+        let searching = query.is_some();
+        let scanning = search.is_some_and(|search| search.scanning);
+        // Tras un error el botón sigue disponible: reintentar retoma el
+        // recorrido desde la misma posición en lugar de empezar de cero.
+        let can_search_more = search.is_some_and(|search| !search.exhausted && !search.scanning);
+        let search_error = search.and_then(|search| search.error.clone());
+        let search_summary = history_search_summary(query.as_ref(), search);
+        let commits = match (searching, search) {
+            (true, Some(search)) => Arc::new(search.matches.clone()),
+            (true, None) => Arc::new(Vec::new()),
+            (false, _) => Arc::clone(&repository.history.commits),
+        };
+        let search_empty = searching && commits.is_empty() && !scanning;
+        let search_bar = self.render_search_bar(
+            repository_id,
+            SearchScope::History,
+            search_summary,
+            search_error,
+            cx,
+        );
+        let count = commits.len();
         let selected_commit = repository.selected_commit.clone();
-        let has_more = repository.history.has_more_commits;
+        let has_more = repository.history.has_more_commits && !searching;
         let selected_reference = repository.history.history_reference.clone();
         let branches = repository.working_tree.branches.clone();
         let details = self.selected_commit_details.get(&repository_id).cloned();
@@ -4264,7 +4839,15 @@ impl MainWindow {
                             )
                     })),
             )
-            .child(
+            .child(search_bar)
+            .child(if search_empty {
+                state_card(
+                    "history-state-no-matches",
+                    "Sin coincidencias",
+                    "Ningún commit explorado de esta referencia coincide con la consulta. Pulsa Escape en la búsqueda o usa Limpiar para volver al historial completo.",
+                    MUTED_TEXT_COLOR,
+                )
+            } else {
                 uniform_list(
                     "history-list",
                     count,
@@ -4334,8 +4917,26 @@ impl MainWindow {
                             .collect()
                     }),
                 )
-                .flex_1(),
-            )
+                .flex_1()
+                .into_any_element()
+            })
+            .when(can_search_more, |history| {
+                history.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(BORDER_COLOR)
+                        .child(
+                            action_button("search-more-history", "Buscar más", true).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.continue_history_search(repository_id, cx);
+                                }),
+                            ),
+                        ),
+                )
+            })
             .when(has_more, |history| {
                 history.child(
                     div()
@@ -4749,6 +5350,25 @@ impl MainWindow {
     }
 }
 
+/// Lista de cambios o aviso de que el filtro no deja nada visible.
+fn change_list_or_empty(
+    rows: Arc<Vec<ChangeListRow>>,
+    row_count: usize,
+    repository_id: RepositoryId,
+    filtered_empty: bool,
+    cx: &mut Context<MainWindow>,
+) -> AnyElement {
+    if filtered_empty {
+        return state_card(
+            "change-state-no-matches",
+            "Sin coincidencias",
+            "Ningún archivo con cambios coincide con la consulta. Pulsa Escape en la búsqueda o usa Limpiar para volver a verlos todos.",
+            MUTED_TEXT_COLOR,
+        );
+    }
+    uniform_change_list(rows, row_count, repository_id, cx)
+}
+
 fn uniform_change_list(
     rows: Arc<Vec<ChangeListRow>>,
     row_count: usize,
@@ -4811,6 +5431,40 @@ fn state_card(id: &str, title: &str, message: &str, color: gpui::Rgba) -> AnyEle
                 .child(message.to_owned()),
         )
         .into_any_element()
+}
+
+const fn search_scope_for(view: RepositoryView) -> SearchScope {
+    match view {
+        RepositoryView::Changes => SearchScope::Changes,
+        RepositoryView::History => SearchScope::History,
+    }
+}
+
+/// Describe la consulta activa, los resultados y el avance del recorrido.
+fn history_search_summary(query: Option<&SearchQuery>, search: Option<&HistorySearch>) -> String {
+    let Some(query) = query else {
+        return "Busca por mensaje, autor o hash con Ctrl+F. Escape limpia la consulta.".to_owned();
+    };
+    let Some(search) = search else {
+        return format!("Consulta «{}» · preparando búsqueda…", query.raw());
+    };
+    let results = if search.matches.is_empty() && !search.scanning {
+        "sin coincidencias".to_owned()
+    } else {
+        format!("{} resultados", search.matches.len())
+    };
+    let progress = if search.scanning {
+        "buscando…"
+    } else if search.exhausted {
+        "referencia explorada por completo"
+    } else {
+        "quedan commits por explorar"
+    };
+    format!(
+        "Consulta «{}» · {results} · {} commits explorados · {progress}",
+        query.raw(),
+        search.scanned
+    )
 }
 
 fn repository_content_state(repository: &RepositorySession) -> RepositoryContentState {
@@ -4876,6 +5530,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::show_changes))
             .on_action(cx.listener(Self::create_commit))
             .on_action(cx.listener(Self::generate_commit_message))
+            .on_action(cx.listener(Self::find_in_view))
             .flex()
             .flex_col()
             .size_full()
@@ -5119,11 +5774,31 @@ fn branch_upstream_label(upstream: &BranchUpstream) -> String {
     }
 }
 
+/// Agrupa los cambios visibles, aplicando el filtro por ruta si lo hay.
+///
+/// Cada grupo conserva su propia entrada para un mismo archivo: filtrar no
+/// fusiona la fila staged con la unstaged ni comparte sus acciones.
+///
+/// Con filtro activo los botones de grupo desaparecen: `Stage todo` y
+/// `Unstage todo` actúan sobre el repositorio entero, no sobre lo visible, y
+/// ofrecerlos junto a una lista recortada invitaría a tocar archivos ocultos.
 fn build_change_rows(
     repository_id: RepositoryId,
     changes: &[FileChange],
     collapsed_groups: &HashSet<(RepositoryId, ChangeRepresentation)>,
+    query: Option<&SearchQuery>,
 ) -> Vec<ChangeListRow> {
+    let changes = match query {
+        Some(query) => Cow::Owned(
+            changes
+                .iter()
+                .filter(|change| change_matches(change, query))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        None => Cow::Borrowed(changes),
+    };
+    let group_action = |action: GroupAction| query.is_none().then_some(action);
     let groups = [
         (
             "Conflictos",
@@ -5138,7 +5813,7 @@ fn build_change_rows(
         (
             "Cambios staged",
             ChangeRepresentation::Staged,
-            Some(GroupAction::UnstageAll),
+            group_action(GroupAction::UnstageAll),
             changes
                 .iter()
                 .filter(|change| change.has_staged_change())
@@ -5148,7 +5823,7 @@ fn build_change_rows(
         (
             "Cambios",
             ChangeRepresentation::Worktree,
-            Some(GroupAction::StageAll),
+            group_action(GroupAction::StageAll),
             changes
                 .iter()
                 .filter(|change| change.has_worktree_change())
@@ -5158,7 +5833,7 @@ fn build_change_rows(
         (
             "Sin seguimiento",
             ChangeRepresentation::Untracked,
-            Some(GroupAction::StageAll),
+            group_action(GroupAction::StageAll),
             changes
                 .iter()
                 .filter(|change| change.is_untracked())
@@ -5469,6 +6144,9 @@ mod tests {
             collapsed_groups: HashSet::new(),
             expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
+            search_boxes: HashMap::new(),
+            history_searches: HashMap::new(),
+            history_search_cancellations: HashMap::new(),
             git_version: None,
             global_status_message: String::new(),
             global_error: None,
@@ -6265,6 +6943,250 @@ mod tests {
                 "las filas staged y worktree no pueden compartir el id de {action}"
             );
         }
+    }
+
+    fn tracked_change(path: &str) -> FileChange {
+        FileChange {
+            path: PathBuf::from(path),
+            original_path: None,
+            index_status: ChangeKind::Modified,
+            worktree_status: ChangeKind::Modified,
+            is_conflicted: false,
+        }
+    }
+
+    fn row_paths(rows: &[ChangeListRow], wanted: ChangeRepresentation) -> Vec<PathBuf> {
+        rows.iter()
+            .filter_map(|row| match row {
+                ChangeListRow::File {
+                    change,
+                    representation,
+                } if *representation == wanted => Some(change.path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filtering_changes_keeps_staged_and_worktree_rows_independent() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![
+            tracked_change("src/ui/main_window.rs"),
+            tracked_change("README.md"),
+        ];
+        let query = SearchQuery::parse("MAIN_window").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        // El mismo archivo sigue teniendo una fila staged y otra de worktree,
+        // cada una con su propia acción.
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Staged),
+            vec![PathBuf::from("src/ui/main_window.rs")]
+        );
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Worktree),
+            vec![PathBuf::from("src/ui/main_window.rs")]
+        );
+        assert_ne!(
+            change_row_action_id(
+                "stage-toggle",
+                Path::new("src/ui/main_window.rs"),
+                ChangeRepresentation::Staged
+            ),
+            change_row_action_id(
+                "stage-toggle",
+                Path::new("src/ui/main_window.rs"),
+                ChangeRepresentation::Worktree
+            )
+        );
+    }
+
+    #[test]
+    fn filtering_changes_hides_bulk_group_actions() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![tracked_change("src/main.rs")];
+
+        let unfiltered = build_change_rows(repository_id, &changes, &HashSet::new(), None);
+        let query = SearchQuery::parse("main").unwrap();
+        let filtered = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        let has_action = |rows: &[ChangeListRow]| {
+            rows.iter().any(|row| {
+                matches!(
+                    row,
+                    ChangeListRow::Group {
+                        action: Some(_),
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(has_action(&unfiltered));
+        // «Stage todo» actuaría sobre archivos que el filtro está ocultando.
+        assert!(!has_action(&filtered));
+    }
+
+    #[test]
+    fn filtering_changes_without_matches_leaves_no_rows() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![tracked_change("src/main.rs")];
+        let query = SearchQuery::parse("inexistente").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn filtering_ten_thousand_changes_keeps_only_the_matching_paths() {
+        let repository_id = RepositoryId::default();
+        let changes = (0..10_000)
+            .map(|index| tracked_change(&format!("src/modulo{index}/archivo.rs")))
+            .collect::<Vec<_>>();
+        let query = SearchQuery::parse("modulo7/").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        // Solo `src/modulo7/`: los prefijos como `modulo70` no llevan barra ahí.
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Staged),
+            vec![PathBuf::from("src/modulo7/archivo.rs")]
+        );
+    }
+
+    fn search_page(reference: &str, oid: &str, subjects: &[&str]) -> HistoryPage {
+        HistoryPage {
+            reference: reference.to_owned(),
+            oid: oid.to_owned(),
+            commits: subjects
+                .iter()
+                .enumerate()
+                .map(|(index, subject)| CommitDetails {
+                    summary: CommitSummary {
+                        id: format!("{index:040x}"),
+                        short_id: format!("{index:07x}"),
+                        subject: (*subject).to_owned(),
+                        author_name: "Autora".to_owned(),
+                        author_email: "autora@example.test".to_owned(),
+                        authored_at: 0,
+                        references: Vec::new(),
+                    },
+                    body: String::new(),
+                    committer_name: "Autora".to_owned(),
+                    committer_email: "autora@example.test".to_owned(),
+                    committed_at: 0,
+                    parent_ids: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn started_search(query: &str) -> HistorySearch {
+        HistorySearch {
+            query: query.to_owned(),
+            generation: 3,
+            reference: Some("refs/heads/main".to_owned()),
+            oid: Some("abc".to_owned()),
+            ..HistorySearch::default()
+        }
+    }
+
+    #[test]
+    fn history_search_accumulates_matches_across_pages() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let first = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno", "otra cosa"]),
+        );
+
+        assert_eq!(first, HistorySearchPage::Applied);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.scanned, 2);
+        // Una página más corta de lo pedido significa referencia agotada.
+        assert!(search.exhausted);
+    }
+
+    #[test]
+    fn history_search_discards_pages_from_a_previous_query() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let outcome = search.apply_page(
+            2,
+            0,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno"]),
+        );
+
+        assert_eq!(outcome, HistorySearchPage::Stale);
+        assert!(search.matches.is_empty());
+        assert_eq!(search.scanned, 0);
+    }
+
+    #[test]
+    fn history_search_discards_pages_from_another_reference() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let other_reference = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/otra", "abc", &["arreglo uno"]),
+        );
+        let other_oid = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/main", "def", &["arreglo uno"]),
+        );
+
+        assert_eq!(other_reference, HistorySearchPage::Stale);
+        assert_eq!(other_oid, HistorySearchPage::Stale);
+        assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn history_search_discards_pages_read_from_another_offset() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let outcome = search.apply_page(
+            3,
+            120,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno"]),
+        );
+
+        assert_eq!(outcome, HistorySearchPage::Stale);
+        assert_eq!(search.scanned, 0);
+    }
+
+    #[test]
+    fn history_search_summary_reports_query_results_and_progress() {
+        let query = SearchQuery::parse("arreglo").unwrap();
+        let mut search = started_search("arreglo");
+        search.scanned = 500;
+        search.scanning = true;
+
+        let scanning = history_search_summary(Some(&query), Some(&search));
+        assert!(scanning.contains("«arreglo»"), "{scanning}");
+        assert!(scanning.contains("500 commits explorados"), "{scanning}");
+        assert!(scanning.contains("buscando"), "{scanning}");
+
+        search.scanning = false;
+        search.exhausted = true;
+        let empty = history_search_summary(Some(&query), Some(&search));
+        assert!(empty.contains("sin coincidencias"), "{empty}");
+        assert!(empty.contains("por completo"), "{empty}");
+
+        let inactive = history_search_summary(None, None);
+        assert!(inactive.contains("Ctrl+F"), "{inactive}");
     }
 
     #[cfg(windows)]
