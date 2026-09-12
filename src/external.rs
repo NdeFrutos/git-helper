@@ -493,8 +493,11 @@ mod tests {
     #[test]
     fn a_repository_folder_that_disappeared_is_reported_before_launching() {
         let directory = tempfile::tempdir().expect("debe crear el directorio temporal");
+        // El editor existe: lo que falta es la carpeta, y ese debe ser el error.
+        let program = directory.path().join("editor-de-prueba");
+        fs::write(&program, b"").expect("debe crear el ejecutable simulado");
+        let configured = ExternalCommand::with_target(program);
         let root = directory.path().join("repositorio-que-ya-no-esta");
-        let configured = ExternalCommand::with_target("editor");
 
         let error = open_in_editor(Some(&configured), &root, None).expect_err("la raíz no existe");
 
