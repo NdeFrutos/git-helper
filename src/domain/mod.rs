@@ -1,4 +1,5 @@
 mod branch;
+mod external_tools;
 mod history;
 mod remote;
 mod remote_freshness;
@@ -6,6 +7,7 @@ mod repository;
 mod status;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
+pub use external_tools::{ExternalCommand, ToolArgument};
 pub use history::{CommitDetails, CommitId, CommitSummary, HistoryPage, Reference};
 pub use remote::{Remote, RemoteOperationPlan, UpstreamState};
 pub use remote_freshness::{

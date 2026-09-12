@@ -9,8 +9,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     actions::{
         CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
-        NextRepository, OpenRepository, PreviousRepository, RefreshRepository, ShowChanges,
-        ShowHistory,
+        NextRepository, OpenInEditor, OpenRepository, OpenTerminalHere, PreviousRepository,
+        RefreshRepository, RevealInFileManager, ShowChanges, ShowHistory,
     },
     cli::InstanceServer,
     persistence::{
@@ -53,6 +53,9 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-e", OpenInEditor, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-t", OpenTerminalHere, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-x", RevealInFileManager, Some("GitHelper")),
         ]);
         let persisted_startup = locate_startup_store();
         let bounds = initial_window_bounds(cx, None);
