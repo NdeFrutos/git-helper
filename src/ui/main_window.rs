@@ -25,11 +25,14 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
-        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
-        OperationKind, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
-        RepositoryView, SshCloneMapping, SystemClock, WorkingTreeSnapshot,
+        CommitMessagePreferences, CommitPreferenceField, EffectiveCommitPreferences, FetchOrigin,
+        FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState, OperationKind,
+        PreferenceScope, RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession,
+        RepositoryView, SshCloneMapping, SystemClock, TemplateApplication, WorkingTreeSnapshot,
+        commit_message_guidance, cycle_commit_preference, effective_commit_preferences,
         format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
-        periodic_fetch_poll_interval, primary_remote_label, select_periodic_fetch,
+        periodic_fetch_poll_interval, plan_commit_template, primary_remote_label,
+        select_periodic_fetch,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -210,6 +213,8 @@ pub struct MainWindow {
     periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
     active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
     pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    /// Capa que editan los controles de preferencias; no se persiste.
+    commit_preference_scope: PreferenceScope,
 }
 
 #[allow(
@@ -267,6 +272,7 @@ impl MainWindow {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
     }
 
@@ -544,6 +550,190 @@ impl MainWindow {
         }
         self.save_state(cx);
         cx.notify();
+    }
+
+    /// Clave persistente de las sobrescrituras de un repositorio abierto.
+    fn commit_preference_key(&self, repository_id: RepositoryId) -> Option<String> {
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| normalized_repo_key(&repository.root_path))
+    }
+
+    /// Preferencias efectivas del repositorio: global salvo sobrescritura propia.
+    fn commit_preferences(&self, repository_id: RepositoryId) -> EffectiveCommitPreferences {
+        effective_commit_preferences(
+            self.state.settings.commit_message_preferences,
+            &self.state.settings.repository_commit_message_preferences,
+            self.commit_preference_key(repository_id)
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn set_repository_status(&mut self, repository_id: RepositoryId, message: impl Into<String>) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.into();
+        }
+    }
+
+    /// Alterna entre editar el valor global y el del repositorio activo.
+    fn toggle_commit_preference_scope(&mut self, cx: &mut Context<Self>) {
+        self.commit_preference_scope = self.commit_preference_scope.toggled();
+        cx.notify();
+    }
+
+    /// Avanza una preferencia en la capa seleccionada y persiste el resultado.
+    fn cycle_commit_preference_field(
+        &mut self,
+        repository_id: RepositoryId,
+        field: CommitPreferenceField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        let scope = self.commit_preference_scope;
+        let mut global = self.state.settings.commit_message_preferences;
+        let mut overrides = self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .get(&repository_key)
+            .copied()
+            .unwrap_or_default();
+        cycle_commit_preference(field, scope, &mut global, &mut overrides);
+        self.state.settings.commit_message_preferences = global;
+        if overrides.is_empty() {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        } else {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .insert(repository_key, overrides);
+        }
+        let message = match scope {
+            PreferenceScope::Global
+                if self
+                    .commit_preferences(repository_id)
+                    .has_repository_overrides() =>
+            {
+                "Preferencia global actualizada; este repositorio conserva sus propios ajustes"
+            }
+            PreferenceScope::Global => "Preferencias globales del mensaje actualizadas",
+            PreferenceScope::Repository => {
+                "Preferencias del mensaje guardadas para este repositorio"
+            }
+        };
+        self.set_repository_status(repository_id, message);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Devuelve el repositorio a la herencia de las preferencias globales.
+    fn clear_repository_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        if self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .remove(&repository_key)
+            .is_none()
+        {
+            return;
+        }
+        self.set_repository_status(
+            repository_id,
+            "Este repositorio vuelve a usar las preferencias globales",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Restaura los valores predeterminados globales y quita la sobrescritura activa.
+    fn restore_default_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.settings.commit_message_preferences = CommitMessagePreferences::default();
+        if let Some(repository_key) = self.commit_preference_key(repository_id) {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        }
+        self.set_repository_status(
+            repository_id,
+            "Preferencias del mensaje restauradas a los valores predeterminados",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Escribe la plantilla manual; un borrador con texto exige confirmación.
+    fn insert_commit_template(
+        &mut self,
+        repository_id: RepositoryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.commit_inputs.get(&repository_id).cloned() else {
+            return;
+        };
+        let preferences = self.commit_preferences(repository_id).values();
+        let draft = input.read(cx).content().to_owned();
+        match plan_commit_template(&draft, preferences) {
+            TemplateApplication::Apply(template) => {
+                input.update(cx, |input, cx| input.set_content(template, cx));
+                self.set_repository_status(
+                    repository_id,
+                    "Plantilla insertada; edítala antes del commit",
+                );
+                cx.notify();
+            }
+            TemplateApplication::ConfirmReplace(template) => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let confirmation = cx.prompt(
+                        PromptLevel::Warning,
+                        "Sustituir el borrador por la plantilla",
+                        Some("El mensaje escrito se perderá."),
+                        &["Sustituir", "Cancelar"],
+                    );
+                    if !matches!(confirmation.await, Ok(0)) {
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        let Some(input) = this.commit_inputs.get(&repository_id).cloned() else {
+                            return;
+                        };
+                        input.update(cx, |input, cx| input.set_content(template, cx));
+                        this.set_repository_status(
+                            repository_id,
+                            "Plantilla insertada; edítala antes del commit",
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
     }
 
     fn remember_preferred_remote(
@@ -2249,11 +2439,13 @@ impl MainWindow {
             .get(&repository_id)
             .map(|input| input.read(cx).content_version())
             .unwrap_or_default();
+        let preferences = self.commit_preferences(repository_id).values();
         self.next_generation_request_id = self.next_generation_request_id.saturating_add(1);
         let request = CommitMessageRequest {
             session_id: repository_id,
             request_id: self.next_generation_request_id,
             draft_version,
+            preferences,
         };
         self.generation_requests
             .insert(repository_id, request.clone());
@@ -2301,7 +2493,7 @@ impl MainWindow {
                                     message: error.to_string(),
                                 },
                             })?;
-                        build_cursor_context(&data)
+                        build_cursor_context(&data, preferences)
                             .map_err(|error| GenerationPreparationError::Message {
                                 message: error.to_string(),
                                 timed_out: false,
@@ -2514,6 +2706,7 @@ impl MainWindow {
         if self.generation_requests.get(&repository_id) != Some(&completion.request) {
             return;
         }
+        let current_preferences = self.commit_preferences(repository_id).values();
         self.active_mutation_cancellations.remove(&repository_id);
         let input = self.commit_inputs.get(&repository_id).cloned();
         if let Some(input) = &input {
@@ -2536,6 +2729,7 @@ impl MainWindow {
                         &completion.request,
                         self.generation_requests.get(&repository_id),
                         input.read(cx).content_version(),
+                        current_preferences,
                         expected,
                         current,
                     ),
@@ -2565,6 +2759,19 @@ impl MainWindow {
                         mutation_state = MutationState::Cancelled {
                             kind: OperationKind::GenerateCommitMessage,
                             message: "El borrador cambió durante la generación".to_owned(),
+                        };
+                    }
+                    GenerationApplyDecision::PreferencesChanged => {
+                        status_message =
+                            "Propuesta no aplicada; cambiaron las preferencias del mensaje"
+                                .to_owned();
+                        error_message = Some(
+                            "La respuesta se generó con las preferencias anteriores. Pulsa «Generar con Cursor» para repetirla con las actuales."
+                                .to_owned(),
+                        );
+                        mutation_state = MutationState::Cancelled {
+                            kind: OperationKind::GenerateCommitMessage,
+                            message: "Las preferencias cambiaron durante la generación".to_owned(),
                         };
                     }
                     GenerationApplyDecision::IndexChanged => completion.staged_changed = true,
@@ -3456,7 +3663,13 @@ impl MainWindow {
         let message_is_empty = input
             .as_ref()
             .is_none_or(|input| input.read(cx).content().trim().is_empty());
-        let commit_enabled = staged_count > 0 && !message_is_empty && can_mutate;
+        // Las convenciones orientan la propuesta: el aviso no participa en esta condición.
+        let commit_enabled = can_create_commit(staged_count, message_is_empty, can_mutate);
+        let preferences = self.commit_preferences(repository_id).values();
+        let guidance = input
+            .as_ref()
+            .and_then(|input| commit_message_guidance(input.read(cx).content(), preferences));
+        let preferences_row = self.render_commit_preferences(repository_id, cx);
 
         div()
             .flex()
@@ -3534,6 +3747,10 @@ impl MainWindow {
                     .border_t_1()
                     .border_color(BORDER_COLOR)
                     .when_some(input, gpui::ParentElement::child)
+                    .when_some(guidance, |footer, note| {
+                        footer.child(div().text_xs().text_color(WARNING_COLOR).child(note))
+                    })
+                    .child(preferences_row)
                     .child(
                         div()
                             .flex()
@@ -3568,6 +3785,16 @@ impl MainWindow {
                                                 this.confirm_discard_all(repository_id, window, cx);
                                             }),
                                         ),
+                                    )
+                                    .child(
+                                        action_button("commit-template", "Plantilla", true)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.insert_commit_template(
+                                                    repository_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                     )
                                     .child(
                                         action_button(
@@ -3606,6 +3833,109 @@ impl MainWindow {
                     ),
                     )
                 },
+            )
+            .into_any_element()
+    }
+
+    /// Controles compactos de las preferencias aplicadas a la propuesta.
+    ///
+    /// Cada botón avanza el valor de la capa seleccionada; el sufijo `·repo`
+    /// señala los campos que este repositorio no hereda del ajuste global.
+    fn render_commit_preferences(
+        &self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let effective = self.commit_preferences(repository_id);
+        let values = effective.values();
+        let scope = self.commit_preference_scope;
+        let has_repository_overrides = effective.has_repository_overrides();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(
+                div()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .flex_shrink_0()
+                    .child("Mensaje:"),
+            )
+            .child(
+                action_button(
+                    "commit-preference-scope",
+                    format!("Editando: {}", scope.label()),
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_commit_preference_scope(cx);
+                })),
+            )
+            .child(commit_preference_button(
+                "commit-preference-language",
+                format!(
+                    "Idioma: {}{}",
+                    effective.language.value.label(),
+                    effective.language.source.suffix()
+                ),
+                CommitPreferenceField::Language,
+                repository_id,
+                cx,
+            ))
+            .child(commit_preference_button(
+                "commit-preference-convention",
+                format!(
+                    "Formato: {}{}",
+                    effective.convention.value.label(),
+                    effective.convention.source.suffix()
+                ),
+                CommitPreferenceField::Convention,
+                repository_id,
+                cx,
+            ))
+            .when(values.scope_applies(), |row| {
+                row.child(commit_preference_button(
+                    "commit-preference-scope-usage",
+                    format!(
+                        "{}{}",
+                        effective.scope.value.label(),
+                        effective.scope.source.suffix()
+                    ),
+                    CommitPreferenceField::Scope,
+                    repository_id,
+                    cx,
+                ))
+            })
+            .child(commit_preference_button(
+                "commit-preference-length",
+                format!(
+                    "Asunto ≤{}{}",
+                    effective.subject_max_length.value,
+                    effective.subject_max_length.source.suffix()
+                ),
+                CommitPreferenceField::SubjectMaxLength,
+                repository_id,
+                cx,
+            ))
+            .child(
+                action_button(
+                    "commit-preference-inherit",
+                    "Usar global",
+                    has_repository_overrides,
+                )
+                .when(has_repository_overrides, |button| {
+                    button.on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_repository_commit_preferences(repository_id, cx);
+                    }))
+                }),
+            )
+            .child(
+                action_button("commit-preference-defaults", "Predeterminados", true).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.restore_default_commit_preferences(repository_id, cx);
+                    }),
+                ),
             )
             .into_any_element()
     }
@@ -5361,6 +5691,25 @@ fn action_button(
         .child(label.into())
 }
 
+/// Botón que avanza una preferencia del mensaje en la capa seleccionada.
+fn commit_preference_button(
+    id: &'static str,
+    label: String,
+    field: CommitPreferenceField,
+    repository_id: RepositoryId,
+    cx: &mut Context<MainWindow>,
+) -> gpui::Stateful<gpui::Div> {
+    action_button(id, label, true).on_click(cx.listener(move |this, _, _, cx| {
+        this.cycle_commit_preference_field(repository_id, field, cx);
+    }))
+}
+
+/// El commit depende solo del estado Git y del borrador: las convenciones
+/// orientan la propuesta y nunca bloquean un mensaje escrito a mano.
+const fn can_create_commit(staged_count: usize, message_is_empty: bool, can_mutate: bool) -> bool {
+    staged_count > 0 && !message_is_empty && can_mutate
+}
+
 fn tab_button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<gpui::SharedString>,
@@ -5483,7 +5832,66 @@ mod tests {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
+    }
+
+    #[test]
+    fn repository_overrides_only_affect_their_own_session() {
+        use crate::domain::{
+            CommitMessageLanguage, CommitMessagePreferenceOverrides, CommitMessagePreferences,
+        };
+
+        let overridden = RepositorySession::new(PathBuf::from(r"C:\repos\uno"));
+        let inherited = RepositorySession::new(PathBuf::from(r"C:\repos\dos"));
+        let overridden_id = overridden.id;
+        let inherited_id = inherited.id;
+        let mut window = test_window(GitClient::default(), vec![overridden, inherited]);
+        window.state.settings.commit_message_preferences = CommitMessagePreferences {
+            language: CommitMessageLanguage::Spanish,
+            ..CommitMessagePreferences::default()
+        };
+        window
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .insert(
+                normalized_repo_key(Path::new(r"C:\repos\uno")),
+                CommitMessagePreferenceOverrides {
+                    language: Some(CommitMessageLanguage::English),
+                    ..CommitMessagePreferenceOverrides::default()
+                },
+            );
+
+        let overridden_preferences = window.commit_preferences(overridden_id);
+        let inherited_preferences = window.commit_preferences(inherited_id);
+
+        assert_eq!(
+            overridden_preferences.values().language,
+            CommitMessageLanguage::English
+        );
+        assert!(overridden_preferences.has_repository_overrides());
+        assert_eq!(
+            inherited_preferences.values().language,
+            CommitMessageLanguage::Spanish
+        );
+        assert!(!inherited_preferences.has_repository_overrides());
+    }
+
+    #[test]
+    fn conventions_never_block_a_manual_commit() {
+        use crate::domain::{CommitMessageConvention, CommitMessagePreferences};
+
+        let preferences = CommitMessagePreferences {
+            convention: CommitMessageConvention::ConventionalCommits,
+            subject_max_length: 20,
+            ..CommitMessagePreferences::default()
+        };
+        let message = "Mensaje manual que ignora la convención y la longitud orientativa";
+
+        assert!(commit_message_guidance(message, preferences).is_some());
+        assert!(can_create_commit(1, message.trim().is_empty(), true));
+        assert!(!can_create_commit(0, message.trim().is_empty(), true));
     }
 
     #[test]

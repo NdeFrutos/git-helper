@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use super::{
     BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote,
-    RemoteFreshnessTracker, UpstreamState, remote_freshness::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
+    RemoteFreshnessTracker, UpstreamState,
+    commit_preferences::{CommitMessagePreferenceOverrides, CommitMessagePreferences},
+    remote_freshness::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
     status::FileChange,
 };
 
@@ -425,6 +427,12 @@ pub struct AppSettings {
     /// Remote preferido por repositorio cuando existen varios remotes.
     #[serde(default)]
     pub repository_preferred_remotes: HashMap<String, String>,
+    /// Preferencias globales del mensaje de commit compartidas por los proveedores.
+    #[serde(default)]
+    pub commit_message_preferences: CommitMessagePreferences,
+    /// Sobrescrituras por repositorio; los campos ausentes heredan del global.
+    #[serde(default)]
+    pub repository_commit_message_preferences: HashMap<String, CommitMessagePreferenceOverrides>,
 }
 
 impl Default for AppSettings {
@@ -437,6 +445,8 @@ impl Default for AppSettings {
             periodic_fetch_enabled: false,
             periodic_fetch_interval_secs: DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
             repository_preferred_remotes: HashMap::new(),
+            commit_message_preferences: CommitMessagePreferences::default(),
+            repository_commit_message_preferences: HashMap::new(),
         }
     }
 }

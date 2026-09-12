@@ -24,6 +24,8 @@ sincronizar con remotes y consultar el historial.
 - Consultar el historial y los detalles de cada commit.
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
+- Configurar idioma, convención, alcance y longitud del asunto del mensaje, con valores
+  globales y sobrescritura por repositorio, e insertar una plantilla manual editable.
 
 Git Helper usa el Git instalado en el equipo, por lo que respeta sus credenciales, configuración,
 hooks, filtros y atributos. No incluye un motor Git propio.
@@ -86,6 +88,29 @@ aparece en el menú Inicio.
 3. Escribe el mensaje —o solicita una propuesta a Cursor— y pulsa `Commit`.
 4. Usa `Fetch`, `Pull` o `Push` desde la barra superior cuando necesites sincronizar.
 
+### Preferencias del mensaje de commit
+
+Bajo el cuadro de mensaje hay una fila compacta con las preferencias que orientan la propuesta:
+
+| Control | Qué hace |
+|---|---|
+| `Editando: global` / `Editando: este repo` | Elige la capa sobre la que actúan los botones siguientes |
+| `Idioma` | Recorre `según el historial`, `español` e `inglés` |
+| `Formato` | Alterna entre `texto libre` y `conventional` |
+| `alcance opcional` | Solo con `conventional`: recorre `sin alcance`, `alcance opcional` y `alcance obligatorio` |
+| `Asunto ≤N` | Recorre las longitudes orientativas 50, 60, 72 y 100 |
+| `Usar global` | Elimina las sobrescrituras del repositorio activo |
+| `Predeterminados` | Restaura los valores de fábrica globales y del repositorio activo |
+| `Plantilla` | Escribe una plantilla editable acorde a las preferencias efectivas |
+
+Un valor marcado con `·repo` procede del repositorio activo; el resto se hereda del ajuste global.
+Cualquier proveedor de generación recibe exactamente las mismas preferencias normalizadas.
+
+Las convenciones son una guía: el aviso naranja bajo el cuadro señala cuándo el asunto se aleja de
+lo configurado, pero nunca impide crear un commit escrito a mano. `Plantilla` tampoco sustituye un
+borrador con texto sin confirmarlo antes, y una propuesta generada con preferencias distintas a las
+vigentes se descarta en lugar de pisar el borrador.
+
 Atajos disponibles:
 
 | Atajo | Acción |
@@ -109,6 +134,8 @@ Atajos disponibles:
 - Descartar cambios requiere confirmación explícita.
 - Cursor solo recibe el contexto staged tras una acción y consentimiento explícitos. El contexto
   está limitado a 200 KiB, excluye binarios y no se guarda ni se registra.
+- Las preferencias del mensaje se guardan en el estado local de la aplicación; no se leen
+  instrucciones del repositorio ni se envía nada más que el contexto staged.
 - La detección básica de posibles secretos antes de usar Cursor es una ayuda, no una garantía.
 
 ## Compilar desde el código fuente
