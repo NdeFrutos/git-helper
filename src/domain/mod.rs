@@ -1,4 +1,5 @@
 mod branch;
+mod commit_preferences;
 mod history;
 mod remote;
 mod remote_freshness;
@@ -6,6 +7,15 @@ mod repository;
 mod status;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
+pub use commit_preferences::{
+    CommitMessageConvention, CommitMessageLanguage, CommitMessagePreferenceOverrides,
+    CommitMessagePreferences, CommitPreferenceField, CommitScopeUsage, DEFAULT_SUBJECT_MAX_LENGTH,
+    EffectiveCommitPreferences, MAX_SUBJECT_MAX_LENGTH, MIN_SUBJECT_MAX_LENGTH, PreferenceScope,
+    PreferenceSource, ResolvedPreference, SUBJECT_MAX_LENGTH_OPTIONS, TemplateApplication,
+    commit_message_guidance, commit_message_template, commit_preferences_instructions,
+    cycle_commit_preference, effective_commit_preferences, next_subject_max_length,
+    normalize_subject_max_length, plan_commit_template, resolve_commit_preferences,
+};
 pub use history::{CommitDetails, CommitId, CommitSummary, HistoryPage, Reference};
 pub use remote::{Remote, RemoteOperationPlan, UpstreamState};
 pub use remote_freshness::{
