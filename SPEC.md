@@ -172,6 +172,26 @@ Un mismo archivo puede aparecer tanto en `Cambios staged` como en `Cambios` si t
 
 Seleccionar una fila solo la resalta y habilita sus acciones. El MVP no leerá ni mostrará el contenido ni el diff del archivo.
 
+#### Selección múltiple
+
+La vista admite seleccionar varias filas para hacer stage o unstage de un subconjunto:
+
+- Clic: sustituye la selección por la fila pulsada, que pasa a ser el ancla.
+- `Ctrl`+clic: añade o quita esa fila y la convierte en el nuevo ancla.
+- `Mayús`+clic: sustituye la selección por el rango visual entre el ancla y la fila pulsada.
+- `Ctrl`+`Mayús`+clic: añade ese rango a la selección existente en lugar de sustituirla.
+- Equivalentes de teclado con el foco en la lista: `↑`/`↓` mueven la fila activa, `Mayús`+`↑`/`↓` extienden el rango, `Ctrl`+`Espacio` alterna la fila activa, `Ctrl`+`A` selecciona todas las filas visibles y `Esc` vacía la selección. `Ctrl`+`Mayús`+`S` y `Ctrl`+`Mayús`+`U` ejecutan las acciones sobre la selección.
+
+Reglas de la selección:
+
+- Cada fila se identifica por ruta **y** representación. Las filas `staged` y `worktree` de un mismo archivo son independientes y nunca se mezclan.
+- La identidad nunca es posicional: cuando Git deja de reportar una fila, esa fila sale de la selección y las demás la conservan. Una fila nueva que ocupe su posición no queda seleccionada.
+- Las filas que dejan de verse al plegar un grupo o al aplicar un filtro salen de la selección, de modo que el contador describa siempre lo que se ve.
+- Los conflictos no son seleccionables: el MVP no los resuelve.
+- La selección es efímera y no se persiste entre sesiones.
+
+La UI muestra el número de filas seleccionadas y dos acciones, `Stage selección` y `Unstage selección`, cuyo rótulo incluye el número exacto de rutas al que afectarán. `Stage selección` actúa sobre las filas de `Cambios` y `Sin seguimiento`; `Unstage selección` actúa sobre las de `Cambios staged`. El descarte múltiple queda fuera de esta funcionalidad.
+
 ### 4.4 Stage y unstage
 
 Comandos requeridos:
@@ -191,11 +211,23 @@ git -C <repo> rm --cached -- <ruta>
 
 o el comando equivalente validado por pruebas de integración. No se debe borrar el archivo del working tree.
 
+Para actuar sobre una selección se usan los mismos comandos con varios pathspecs:
+
+```text
+git -C <repo> add -- <ruta> <ruta>…
+git -C <repo> restore --staged -- <ruta> <ruta>…
+git -C <repo> rm --cached -- <ruta> <ruta>…
+```
+
+Todas las rutas se validan como relativas y contenidas en el repositorio **antes** de ejecutar nada: un pathspec inseguro aborta el lote completo sin tocar el repositorio. El lote se reparte en tantas invocaciones como haga falta para no superar el límite de línea de comandos de Windows (`CreateProcessW`, 32 767 unidades UTF-16), manteniendo el orden de las rutas.
+
+Git no ofrece atomicidad entre rutas y la aplicación no debe fingirla. Cuando una invocación falla, el lote se repite ruta a ruta para atribuir el error, y el resultado indica cuántas rutas se aplicaron, cuántas se pidieron y el motivo de cada fallo. Después siempre se reconcilia el estado con Git.
+
 Después de cualquier operación se actualizarán el estado y el historial si el HEAD ha cambiado.
 
 Las acciones:
 
-- Permanecerán deshabilitadas mientras exista otra mutación Git activa para ese repositorio.
+- Permanecerán deshabilitadas mientras exista otra mutación Git activa para ese repositorio, incluidas las de selección: solo hay una mutación activa por repositorio.
 - No bloquearán operaciones de solo lectura en otras pestañas.
 - Mostrarán stderr si fallan.
 - No asumirán que el estado previo sigue vigente después de ejecutar el comando.
@@ -348,6 +380,20 @@ referencias simbólicas se excluyen del inventario. Las referencias remotas repr
 | `Ctrl+2` | Abrir vista Cambios |
 | `Ctrl+Enter` | Crear commit cuando el foco esté en el mensaje |
 | `Ctrl+Shift+G` | Generar mensaje de commit con Cursor |
+| `Ctrl+Shift+S` | Stage de la selección, solo en la vista Cambios |
+| `Ctrl+Shift+U` | Unstage de la selección, solo en la vista Cambios |
+
+Con el foco en la lista de cambios:
+
+| Atajo | Acción |
+|---|---|
+| `↑` / `↓` | Mover la fila activa |
+| `Mayús+↑` / `Mayús+↓` | Extender la selección desde el ancla |
+| `Ctrl+Espacio` | Añadir o quitar la fila activa |
+| `Ctrl+A` | Seleccionar todas las filas visibles |
+| `Esc` | Vaciar la selección |
+
+La lista de cambios es un contenedor enfocable con su propio contexto de teclado, de modo que sus atajos no compiten con el editor del mensaje de commit. Debe mostrar un indicador de foco visible.
 
 Los botones deben tener tooltip y las acciones principales deben poder ejecutarse con teclado.
 

@@ -44,6 +44,26 @@ recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
 `CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
 las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
 
+## Lotes de rutas para stage y unstage
+
+Actuar sobre una selección envía varios pathspecs al mismo comando. `src/git/path.rs` valida el
+lote completo antes de ejecutar nada —un pathspec inseguro lo aborta sin lanzar ningún proceso— y
+lo reparte con `plan_pathspec_batches` en invocaciones que caben en `CreateProcessW`, cuyo límite
+son 32 767 unidades UTF-16. Se reserva presupuesto para el prefijo fijo (`git -C <raíz> add --`) y
+se aplican dos cotas: `COMMAND_LINE_BUDGET = 30 000` unidades, que deja margen para el
+entrecomillado que añade el runtime, y `MAX_PATHS_PER_BATCH = 512`, para no construir procesos con
+miles de argumentos. El orden de las rutas se conserva.
+
+Se prefirió el troceado a `--pathspec-from-file=- --pathspec-file-nul` para no depender de Git
+2.25 o superior; si en el futuro se fija una versión mínima, esa opción elimina el troceado entero.
+
+Git no ofrece atomicidad entre rutas y la aplicación no la finge. Cuando Git **rechaza** un lote no
+indica qué ruta lo provocó, así que ese lote se repite ruta a ruta y el resultado se informa como
+`GitError::PartialBatch` con las rutas aplicadas, las pedidas y el motivo de cada fallo. Un fallo
+del proceso —cancelación, timeout o `git.exe` no disponible— afecta a todo el lote y **no** se
+reintenta ruta a ruta: hacerlo multiplicaría la espera y el bloqueo del repositorio sin aportar
+información. Después de cualquier resultado se reconcilia el estado con Git.
+
 ## Inventario de ramas e historial
 
 Las ramas locales y referencias remote-tracking se obtienen con una única lectura NUL-delimitada

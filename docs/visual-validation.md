@@ -32,6 +32,31 @@ Ejecutar en un monitor con escala DPI del 100 % y, opcionalmente, repetir al 125
   juntas a una segunda línea sin solaparse con el fichero.
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
+
+### Selección múltiple
+
+- [ ] Un clic en una fila la resalta; `Ctrl+clic` añade y quita filas sueltas; `Mayús+clic`
+  selecciona el rango visible entre el ancla y la fila pulsada; `Ctrl+Mayús+clic` suma el rango a
+  lo ya seleccionado.
+- [ ] La lista muestra un borde de acento cuando tiene el foco, y un clic en cualquier parte de
+  ella (incluido el espacio vacío) se lo da.
+- [ ] `Ctrl+Shift+S` / `Ctrl+Shift+U` no hacen nada mientras la vista `Historial` está abierta.
+- [ ] Los botones `Stage selección (0)` / `Unstage selección (0)` atenuados no ejecutan nada al
+  pulsarlos ni muestran un error.
+- [ ] Con el foco en la lista, `↑` / `↓` mueven la marca de fila activa y `Mayús+↑` / `Mayús+↓`
+  extienden el rango; la lista hace scroll para mantener visible la fila activa.
+- [ ] `Ctrl+A` selecciona todas las filas visibles y `Esc` vacía la selección.
+- [ ] El contador junto a los botones refleja el número de filas seleccionadas y los rótulos
+  `Stage selección (n)` / `Unstage selección (n)` indican a cuántas rutas afectarán.
+- [ ] Pulsar `Stage`, `Unstage` o `Descartar` de una fila ejecuta esa acción **sin** cambiar la
+  selección.
+- [ ] Un archivo staged y modificado de nuevo se selecciona por separado en cada grupo, y actuar
+  sobre uno no altera el otro.
+- [ ] Modificar archivos fuera de la aplicación quita de la selección las filas que desaparecen y
+  no marca otras por su posición; plegar un grupo libera sus filas.
+- [ ] Las filas de conflicto no se pueden seleccionar.
+- [ ] Con una selección que incluya una ruta que Git rechace, el error indica cuántas rutas se
+  aplicaron y el motivo de cada fallo, y la lista queda reconciliada con Git.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
 
 ## Commit y Cursor CLI

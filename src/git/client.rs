@@ -19,9 +19,10 @@ use crate::{
 };
 
 use super::{
-    BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, StagedContextData,
-    parse_branch_refs, parse_log, parse_status, resolve_upstream,
-    validate_existing_path_inside_repository, validate_relative_path,
+    BRANCH_FORMAT, DiscardMode, DiscardPlan, GitError, LOG_FORMAT, PathFailure, StagedContextData,
+    command_line_cost, parse_branch_refs, parse_log, parse_status, plan_pathspec_batches,
+    resolve_upstream, validate_existing_path_inside_repository, validate_pathspecs,
+    validate_relative_path,
 };
 
 const LOCAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -712,6 +713,62 @@ impl GitClient {
         )
     }
 
+    /// Añade al índice un conjunto concreto de rutas.
+    ///
+    /// Git no ofrece atomicidad entre rutas, así que el resultado se informa
+    /// tal cual: si alguna falla se devuelve [`GitError::PartialBatch`] con lo
+    /// que sí se aplicó y el motivo por ruta.
+    pub fn stage_paths(
+        &self,
+        repository_root: &Path,
+        paths: &[PathBuf],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        let paths = validate_pathspecs(paths)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.run_pathspec_batches(
+            "git-stage-batch",
+            repository_root,
+            &["add", "--"],
+            &paths,
+            cancellation,
+        )
+    }
+
+    /// Quita del índice un conjunto concreto de rutas sin tocar el working tree.
+    pub fn unstage_paths(
+        &self,
+        repository_root: &Path,
+        paths: &[PathBuf],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        // Validar antes de consultar HEAD: un pathspec inseguro debe abortar el
+        // lote sin ejecutar ningún proceso.
+        let paths = validate_pathspecs(paths)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if self.has_head(repository_root, cancellation)? {
+            self.run_pathspec_batches(
+                "git-unstage-batch",
+                repository_root,
+                &["restore", "--staged", "--"],
+                &paths,
+                cancellation,
+            )
+        } else {
+            self.run_pathspec_batches(
+                "git-unstage-batch-unborn",
+                repository_root,
+                &["rm", "--cached", "--"],
+                &paths,
+                cancellation,
+            )
+        }
+    }
+
     /// Añade al índice todos los cambios visibles para Git.
     pub fn stage_all(
         &self,
@@ -895,6 +952,98 @@ impl GitClient {
     ) -> Result<(), GitError> {
         let mut arguments: Vec<OsString> = prefix.into_iter().map(OsString::from).collect();
         arguments.push(path.as_os_str().to_os_string());
+        let output = self.run_git_os(
+            label,
+            repository_root,
+            arguments,
+            None,
+            LOCAL_OPERATION_TIMEOUT,
+            cancellation,
+        )?;
+        require_success(output).map(|_| ())
+    }
+
+    /// Ejecuta un comando de rutas repartido en tantas invocaciones como
+    /// exija el límite de línea de comandos de Windows.
+    ///
+    /// Recibe rutas ya validadas por [`validate_pathspecs`]. Cuando Git rechaza
+    /// un lote no dice qué ruta lo provocó, así que ese lote se repite ruta a
+    /// ruta para poder atribuir cada fallo.
+    fn run_pathspec_batches(
+        &self,
+        label: &'static str,
+        repository_root: &Path,
+        prefix: &[&str],
+        paths: &[PathBuf],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        let mut reserved = command_line_cost(self.executable.as_os_str())
+            + command_line_cost(OsStr::new("-C"))
+            + command_line_cost(repository_root.as_os_str());
+        for argument in prefix {
+            reserved += command_line_cost(OsStr::new(argument));
+        }
+
+        let mut applied = 0;
+        let mut failures = Vec::new();
+        for batch in plan_pathspec_batches(paths, reserved) {
+            match self.run_pathspec_batch(label, repository_root, prefix, &batch, cancellation) {
+                Ok(()) => applied += batch.len(),
+                // Solo un rechazo de Git puede atribuirse a una ruta concreta.
+                // Una cancelación, un timeout o un fallo al lanzar el proceso
+                // afectan al lote entero: repetirlo ruta a ruta multiplicaría la
+                // espera —y el bloqueo del repositorio— sin aportar información.
+                Err(error) if !matches!(error, GitError::CommandFailed { .. }) => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    for path in batch {
+                        match self.run_pathspec_batch(
+                            label,
+                            repository_root,
+                            prefix,
+                            std::slice::from_ref(&path),
+                            cancellation,
+                        ) {
+                            Ok(()) => applied += 1,
+                            Err(error) if !matches!(error, GitError::CommandFailed { .. }) => {
+                                return Err(error);
+                            }
+                            Err(error) => failures.push(PathFailure {
+                                reason: error.technical_details().trim().to_owned(),
+                                path,
+                            }),
+                        }
+                    }
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GitError::PartialBatch {
+                applied,
+                requested: paths.len(),
+                failures,
+            })
+        }
+    }
+
+    fn run_pathspec_batch(
+        &self,
+        label: &'static str,
+        repository_root: &Path,
+        prefix: &[&str],
+        paths: &[PathBuf],
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitError> {
+        let mut arguments: Vec<OsString> = prefix
+            .iter()
+            .copied()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        arguments.extend(paths.iter().map(|path| path.as_os_str().to_os_string()));
         let output = self.run_git_os(
             label,
             repository_root,
@@ -1169,7 +1318,11 @@ mod tests {
         ffi::OsStr,
         path::{Path, PathBuf},
         process::ExitStatus,
-        sync::{Arc, Mutex, PoisonError},
+        sync::{
+            Arc, Mutex, PoisonError,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use crate::process::{
@@ -1346,6 +1499,230 @@ mod tests {
         assert!(!has_environment(stage, "GIT_OPTIONAL_LOCKS", "0"));
     }
 
+    /// Reproduce un Git que rechaza exactamente una ruta del lote.
+    struct RejectingRunner {
+        rejected: &'static str,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl ProcessRunner for RejectingRunner {
+        fn run(
+            &self,
+            request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            let rejects = request
+                .arguments
+                .iter()
+                .any(|argument| argument == OsStr::new(self.rejected));
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request);
+            if rejects {
+                return Ok(ProcessOutput {
+                    status: failure_status(),
+                    stdout: Vec::new(),
+                    stderr: b"error: pathspec did not match any files\n".to_vec(),
+                });
+            }
+            Ok(ProcessOutput {
+                status: success_status(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn pathspecs(request: &ProcessRequest) -> Vec<String> {
+        let separator = request
+            .arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("--"))
+            .expect("todo comando de rutas separa los pathspecs con --");
+        request.arguments[separator + 1..]
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn batches_stay_within_the_windows_command_line_and_keep_every_path() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let paths: Vec<PathBuf> = (0..2_000)
+            .map(|index| PathBuf::from(format!("directorio con ñ/archivo-{index:04}.txt")))
+            .collect();
+
+        client
+            .stage_paths(Path::new("repo"), &paths, &CancellationToken::default())
+            .expect("un lote grande debe aplicarse por completo");
+
+        let requests = runner.requests();
+        assert!(
+            requests.len() > 1,
+            "2000 rutas no caben en una sola invocación"
+        );
+        let sent: Vec<String> = requests.iter().flat_map(pathspecs).collect();
+        let expected: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(sent, expected);
+        for request in &requests {
+            let width: usize = request
+                .arguments
+                .iter()
+                .map(|argument| super::command_line_cost(argument))
+                .sum();
+            assert!(width <= 30_000, "cada invocación cabe en CreateProcessW");
+        }
+    }
+
+    #[test]
+    fn a_rejected_path_is_reported_alone_and_the_rest_is_applied() {
+        let runner = Arc::new(RejectingRunner {
+            rejected: "falla.txt",
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let paths = vec![
+            PathBuf::from("ok-1.txt"),
+            PathBuf::from("falla.txt"),
+            PathBuf::from("ok-2.txt"),
+        ];
+
+        let error = client
+            .stage_paths(Path::new("repo"), &paths, &CancellationToken::default())
+            .expect_err("el lote debe informar del fallo parcial");
+
+        match error {
+            super::GitError::PartialBatch {
+                applied,
+                requested,
+                failures,
+            } => {
+                assert_eq!(applied, 2);
+                assert_eq!(requested, 3);
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].path, PathBuf::from("falla.txt"));
+                assert!(failures[0].reason.contains("pathspec did not match"));
+            }
+            other => panic!("se esperaba un resultado parcial, no {other:?}"),
+        }
+
+        // El lote falla una vez y después se reintenta ruta a ruta.
+        let requests = runner
+            .requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let sent: Vec<Vec<String>> = requests.iter().map(pathspecs).collect();
+        assert_eq!(
+            sent,
+            vec![
+                vec![
+                    "ok-1.txt".to_owned(),
+                    "falla.txt".to_owned(),
+                    "ok-2.txt".to_owned()
+                ],
+                vec!["ok-1.txt".to_owned()],
+                vec!["falla.txt".to_owned()],
+                vec!["ok-2.txt".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unsafe_pathspec_aborts_the_batch_without_touching_the_repository() {
+        let paths = vec![PathBuf::from("ok.txt"), PathBuf::from("../secreto.txt")];
+
+        // Incluido unstage, que además necesita consultar HEAD: la validación
+        // va primero y no puede llegar a lanzarse ningún proceso.
+        for unstage in [false, true] {
+            let runner = Arc::new(RecordingRunner::default());
+            let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+            let cancellation = CancellationToken::default();
+
+            let error = if unstage {
+                client.unstage_paths(Path::new("repo"), &paths, &cancellation)
+            } else {
+                client.stage_paths(Path::new("repo"), &paths, &cancellation)
+            }
+            .expect_err("una ruta insegura invalida el lote entero");
+
+            assert!(matches!(error, super::GitError::UnsafePath { .. }));
+            assert!(
+                runner.requests().is_empty(),
+                "unstage={unstage} no debe ejecutar ningún proceso"
+            );
+        }
+    }
+
+    /// Reproduce un Git cuyo proceso nunca llega a emitir un veredicto por ruta.
+    struct TimingOutRunner {
+        attempts: AtomicUsize,
+    }
+
+    impl ProcessRunner for TimingOutRunner {
+        fn run(
+            &self,
+            _request: ProcessRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProcessError::TimedOut(Duration::from_secs(30)))
+        }
+    }
+
+    #[test]
+    fn a_process_failure_aborts_the_batch_instead_of_retrying_every_path() {
+        let runner = Arc::new(TimingOutRunner {
+            attempts: AtomicUsize::new(0),
+        });
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let paths: Vec<PathBuf> = (0..200)
+            .map(|index| PathBuf::from(format!("archivo-{index}.txt")))
+            .collect();
+
+        let error = client
+            .stage_paths(Path::new("repo"), &paths, &CancellationToken::default())
+            .expect_err("un timeout debe propagarse");
+
+        assert!(matches!(
+            error,
+            super::GitError::Process(ProcessError::TimedOut(_))
+        ));
+        // Un timeout no es atribuible a una ruta: reintentar las 200 una a una
+        // multiplicaría la espera y mantendría el repositorio bloqueado.
+        assert_eq!(runner.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn duplicate_rows_of_the_same_path_are_sent_once() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+        let paths = vec![PathBuf::from("a.txt"), PathBuf::from("a.txt")];
+
+        client
+            .stage_paths(Path::new("repo"), &paths, &CancellationToken::default())
+            .expect("stage debe funcionar");
+
+        assert_eq!(pathspecs(&runner.requests()[0]), vec!["a.txt".to_owned()]);
+    }
+
+    #[test]
+    fn an_empty_selection_does_not_run_git() {
+        let runner = Arc::new(RecordingRunner::default());
+        let client = GitClient::with_runner(PathBuf::from("git"), runner.clone());
+
+        client
+            .stage_paths(Path::new("repo"), &[], &CancellationToken::default())
+            .expect("una selección vacía es un no-op");
+
+        assert!(runner.requests().is_empty());
+    }
+
     fn has_environment(request: &ProcessRequest, name: &str, value: &str) -> bool {
         request
             .environment
@@ -1365,5 +1742,19 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn failure_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        ExitStatus::from_raw(1)
+    }
+
+    #[cfg(unix)]
+    fn failure_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(256)
     }
 }

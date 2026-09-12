@@ -12,5 +12,20 @@ actions!(
         ShowChanges,
         CreateCommit,
         GenerateCommitMessage,
+        StageSelection,
+        UnstageSelection,
+    ]
+);
+
+actions!(
+    git_helper_change_list,
+    [
+        FocusNextChange,
+        FocusPreviousChange,
+        ExtendSelectionToNextChange,
+        ExtendSelectionToPreviousChange,
+        ToggleFocusedChange,
+        SelectAllChanges,
+        ClearChangeSelection,
     ]
 );

@@ -7,8 +7,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     actions::{
-        CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+        ClearChangeSelection, CloseActiveRepository, CreateCommit, ExtendSelectionToNextChange,
+        ExtendSelectionToPreviousChange, FocusNextChange, FocusPreviousChange,
+        GenerateCommitMessage, NextRepository, OpenRepository, PreviousRepository,
+        RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory, StageSelection,
+        ToggleFocusedChange, UnstageSelection,
     },
     ui::{CommitInput, MainWindow},
 };
@@ -31,6 +34,25 @@ pub fn run() {
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-s", StageSelection, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-u", UnstageSelection, Some("GitHelper")),
+            // Equivalentes de teclado de clic, Ctrl+clic y Mayús+clic. Viven en
+            // el contexto de la lista para no competir con el editor de commit.
+            KeyBinding::new("down", FocusNextChange, Some("ChangeList")),
+            KeyBinding::new("up", FocusPreviousChange, Some("ChangeList")),
+            KeyBinding::new(
+                "shift-down",
+                ExtendSelectionToNextChange,
+                Some("ChangeList"),
+            ),
+            KeyBinding::new(
+                "shift-up",
+                ExtendSelectionToPreviousChange,
+                Some("ChangeList"),
+            ),
+            KeyBinding::new("ctrl-space", ToggleFocusedChange, Some("ChangeList")),
+            KeyBinding::new("ctrl-a", SelectAllChanges, Some("ChangeList")),
+            KeyBinding::new("escape", ClearChangeSelection, Some("ChangeList")),
         ]);
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         let window_result = cx.open_window(

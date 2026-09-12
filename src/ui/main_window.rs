@@ -6,23 +6,28 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, PathPromptOptions, PromptButton, PromptLevel, Render,
-    Subscription, Window, div, prelude::*, px, uniform_list,
+    AnyElement, ClickEvent, Context, Entity, FocusHandle, IntoElement, PathPromptOptions,
+    PromptButton, PromptLevel, Render, ScrollStrategy, Subscription, UniformListScrollHandle,
+    Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
     actions::{
-        CloseActiveRepository, CreateCommit, GenerateCommitMessage, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ShowChanges, ShowHistory,
+        ClearChangeSelection, CloseActiveRepository, CreateCommit, ExtendSelectionToNextChange,
+        ExtendSelectionToPreviousChange, FocusNextChange, FocusPreviousChange,
+        GenerateCommitMessage, NextRepository, OpenRepository, PreviousRepository,
+        RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory, StageSelection,
+        ToggleFocusedChange, UnstageSelection,
     },
     cursor::{
         CommitMessageRequest, CursorClient, GenerationApplyDecision, build_cursor_context,
         resolve_cursor_executable, validate_generation_result,
     },
     domain::{
-        AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, CommitDetails,
-        FileChange, HeadState, MutationState, OperationKind, RefreshState, RepositoryId,
-        RepositorySession, RepositorySnapshot, RepositoryView,
+        AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, ChangeRepresentation,
+        ChangeSelection, ChangeSelectionState, CommitDetails, FileChange, HeadState, MutationState,
+        OperationKind, RefreshState, RepositoryId, RepositorySession, RepositorySnapshot,
+        RepositoryView,
     },
     git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
     persistence::{AppStateStore, PersistedAppState},
@@ -74,12 +79,40 @@ enum GroupAction {
     UnstageAll,
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum ChangeRepresentation {
-    Conflict,
-    Staged,
-    Worktree,
-    Untracked,
+/// Filas renderizables de la vista Cambios junto a su proyección
+/// seleccionable, que se calculan juntas y se invalidan juntas.
+#[derive(Clone, Default)]
+struct ChangeRowCache {
+    rows: Arc<Vec<ChangeListRow>>,
+    selectable: Arc<Vec<ChangeSelection>>,
+}
+
+/// Gesto de selección derivado de los modificadores del clic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionGesture {
+    Replace,
+    Toggle,
+    Range,
+    ExtendRange,
+}
+
+impl SelectionGesture {
+    fn from_click(event: &ClickEvent) -> Self {
+        let modifiers = event.modifiers();
+        // Ctrl+Mayús+clic añade el rango a lo ya seleccionado, como el
+        // Explorador de Windows; Ctrl gana sobre Mayús al clasificar.
+        if modifiers.control || modifiers.platform {
+            if modifiers.shift {
+                Self::ExtendRange
+            } else {
+                Self::Toggle
+            }
+        } else if modifiers.shift {
+            Self::Range
+        } else {
+            Self::Replace
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -136,7 +169,13 @@ pub struct MainWindow {
     pending_refreshes: HashSet<RepositoryId>,
     global_refresh_in_flight: Option<RepositoryId>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
-    change_rows: HashMap<RepositoryId, Arc<Vec<ChangeListRow>>>,
+    change_rows: HashMap<RepositoryId, ChangeRowCache>,
+    /// Se crea en el primer render porque las pruebas construyen la ventana
+    /// sin una aplicación GPUI viva.
+    change_list_focus: Option<FocusHandle>,
+    /// Un handle por pestaña: compartirlo arrastraría el desplazamiento de un
+    /// repositorio a la lista —de otra longitud— del siguiente.
+    change_list_scrolls: HashMap<RepositoryId, UniformListScrollHandle>,
     save_generation: u64,
     git_version: Option<String>,
     global_status_message: String,
@@ -173,6 +212,8 @@ impl MainWindow {
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
+            change_list_focus: None,
+            change_list_scrolls: HashMap::new(),
             save_generation: 0,
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
@@ -448,6 +489,7 @@ impl MainWindow {
         }
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
         self.change_rows.remove(&repository_id);
+        self.change_list_scrolls.remove(&repository_id);
         if was_active {
             self.state.active_repository_id = self
                 .state
@@ -1047,6 +1089,315 @@ impl MainWindow {
             false,
             cx,
         );
+    }
+
+    /// Devuelve las filas de la vista Cambios y descarta de la selección las
+    /// que hayan dejado de estar visibles.
+    ///
+    /// Es el único punto que reconstruye la lista, así que cualquier cambio
+    /// externo, filtro o grupo plegado poda la selección antes de que nadie
+    /// pueda actuar sobre ella.
+    fn ensure_change_rows(&mut self, repository_id: RepositoryId) -> ChangeRowCache {
+        if let Some(cache) = self.change_rows.get(&repository_id) {
+            return cache.clone();
+        }
+        let Some(index) = self
+            .state
+            .repositories
+            .iter()
+            .position(|repository| repository.id == repository_id)
+        else {
+            return ChangeRowCache::default();
+        };
+        let snapshot = Arc::clone(&self.state.repositories[index].snapshot);
+        let rows = build_change_rows(repository_id, &snapshot.changes, &self.collapsed_groups);
+        let selectable = selectable_rows(&rows);
+        self.state.repositories[index]
+            .change_selection
+            .retain_rows(&selectable);
+        let cache = ChangeRowCache {
+            rows: Arc::new(rows),
+            selectable: Arc::new(selectable),
+        };
+        self.change_rows.insert(repository_id, cache.clone());
+        cache
+    }
+
+    fn selectable_rows_for(&mut self, repository_id: RepositoryId) -> Arc<Vec<ChangeSelection>> {
+        self.ensure_change_rows(repository_id).selectable
+    }
+
+    fn update_change_selection<F>(
+        &mut self,
+        repository_id: RepositoryId,
+        update: F,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(&mut ChangeSelectionState, &[ChangeSelection]),
+    {
+        let rows = self.selectable_rows_for(repository_id);
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        update(&mut repository.change_selection, &rows);
+        let lead = repository.change_selection.lead().cloned();
+        if let Some(lead) = lead {
+            self.scroll_to_change(repository_id, &lead);
+        }
+        cx.notify();
+    }
+
+    fn scroll_to_change(&mut self, repository_id: RepositoryId, selection: &ChangeSelection) {
+        let rows = self.ensure_change_rows(repository_id).rows;
+        if let Some(index) = rows.iter().position(|row| match row {
+            ChangeListRow::File {
+                change,
+                representation,
+            } => change.path == selection.path && *representation == selection.representation,
+            ChangeListRow::Group { .. } => false,
+        }) {
+            self.change_list_scroll(repository_id)
+                .scroll_to_item(index, ScrollStrategy::Nearest);
+        }
+    }
+
+    fn change_list_scroll(&mut self, repository_id: RepositoryId) -> UniformListScrollHandle {
+        self.change_list_scrolls
+            .entry(repository_id)
+            .or_default()
+            .clone()
+    }
+
+    fn change_list_focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.change_list_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Devuelve el foco a la ventana cuando la lista deja de renderizarse.
+    ///
+    /// El contenedor enfocado desaparece al cambiar de vista o de pestaña y, si
+    /// conservara el foco, la ventana se quedaría sin destino para los atajos
+    /// globales: `Ctrl+2` ya no podría volver a Cambios.
+    fn release_change_list_focus_if_hidden(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repository_showing_changes().is_some() {
+            return;
+        }
+        if let Some(focus_handle) = self.change_list_focus.clone()
+            && focus_handle.is_focused(window)
+        {
+            window.blur(cx);
+        }
+    }
+
+    fn click_change_row(
+        &mut self,
+        repository_id: RepositoryId,
+        selection: ChangeSelection,
+        gesture: SelectionGesture,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = self.change_list_focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        self.update_change_selection(
+            repository_id,
+            |state, rows| match gesture {
+                SelectionGesture::Replace => state.select_only(selection),
+                SelectionGesture::Toggle => state.toggle(selection),
+                SelectionGesture::Range => state.extend_to(rows, &selection),
+                SelectionGesture::ExtendRange => state.add_range_to(rows, &selection),
+            },
+            cx,
+        );
+    }
+
+    fn move_change_lead(&mut self, forward: bool, extend: bool, cx: &mut Context<Self>) {
+        let Some(repository_id) = self.state.active_repository_id else {
+            return;
+        };
+        self.update_change_selection(
+            repository_id,
+            |state, rows| state.move_lead(rows, forward, extend),
+            cx,
+        );
+    }
+
+    fn focus_next_change(&mut self, _: &FocusNextChange, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_change_lead(true, false, cx);
+    }
+
+    fn focus_previous_change(
+        &mut self,
+        _: &FocusPreviousChange,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_change_lead(false, false, cx);
+    }
+
+    fn extend_selection_to_next_change(
+        &mut self,
+        _: &ExtendSelectionToNextChange,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_change_lead(true, true, cx);
+    }
+
+    fn extend_selection_to_previous_change(
+        &mut self,
+        _: &ExtendSelectionToPreviousChange,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_change_lead(false, true, cx);
+    }
+
+    fn toggle_focused_change(
+        &mut self,
+        _: &ToggleFocusedChange,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_id) = self.state.active_repository_id else {
+            return;
+        };
+        self.update_change_selection(
+            repository_id,
+            |state, _| {
+                if let Some(lead) = state.lead().cloned() {
+                    state.toggle(lead);
+                }
+            },
+            cx,
+        );
+    }
+
+    fn select_all_changes(&mut self, _: &SelectAllChanges, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository_id) = self.state.active_repository_id else {
+            return;
+        };
+        self.update_change_selection(repository_id, ChangeSelectionState::select_all, cx);
+    }
+
+    fn clear_change_selection(
+        &mut self,
+        _: &ClearChangeSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_id) = self.state.active_repository_id else {
+            return;
+        };
+        self.update_change_selection(repository_id, |state, _| state.clear(), cx);
+    }
+
+    /// Rutas seleccionadas de las representaciones indicadas, en orden visual.
+    fn selected_paths(
+        &mut self,
+        repository_id: RepositoryId,
+        representations: &[ChangeRepresentation],
+    ) -> Vec<PathBuf> {
+        let rows = self.selectable_rows_for(repository_id);
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| {
+                repository
+                    .change_selection
+                    .paths_for(&rows, representations)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Repositorio activo, solo si la vista Cambios está a la vista.
+    ///
+    /// Los atajos de selección no deben mutar el índice desde el Historial,
+    /// donde el usuario no ve sobre qué filas actuaría.
+    fn repository_showing_changes(&self) -> Option<RepositoryId> {
+        self.active_repository()
+            .filter(|repository| repository.selected_view == RepositoryView::Changes)
+            .map(|repository| repository.id)
+    }
+
+    fn stage_selection(&mut self, _: &StageSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository_id) = self.repository_showing_changes() {
+            self.stage_selected_paths(repository_id, cx);
+        }
+    }
+
+    fn unstage_selection(&mut self, _: &UnstageSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository_id) = self.repository_showing_changes() {
+            self.unstage_selected_paths(repository_id, cx);
+        }
+    }
+
+    fn stage_selected_paths(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(
+            repository_id,
+            &[
+                ChangeRepresentation::Worktree,
+                ChangeRepresentation::Untracked,
+            ],
+        );
+        if paths.is_empty() {
+            self.report_selection_error(
+                repository_id,
+                "La selección no contiene filas de cambios sin stage.",
+                cx,
+            );
+            return;
+        }
+        self.run_mutation(
+            repository_id,
+            OperationKind::Stage,
+            move |client, root, cancellation| client.stage_paths(&root, &paths, &cancellation),
+            false,
+            cx,
+        );
+    }
+
+    fn unstage_selected_paths(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(repository_id, &[ChangeRepresentation::Staged]);
+        if paths.is_empty() {
+            self.report_selection_error(
+                repository_id,
+                "La selección no contiene filas de cambios staged.",
+                cx,
+            );
+            return;
+        }
+        self.run_mutation(
+            repository_id,
+            OperationKind::Unstage,
+            move |client, root, cancellation| client.unstage_paths(&root, &paths, &cancellation),
+            false,
+            cx,
+        );
+    }
+
+    fn report_selection_error(
+        &mut self,
+        repository_id: RepositoryId,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.error = Some(message.to_owned());
+        }
+        cx.notify();
     }
 
     fn confirm_discard(
@@ -2249,23 +2600,14 @@ impl MainWindow {
     fn render_changes(
         &mut self,
         repository: &RepositorySession,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !self.change_rows.contains_key(&repository.id) {
-            let rows = Arc::new(build_change_rows(
-                repository.id,
-                &repository.snapshot.changes,
-                &self.collapsed_groups,
-            ));
-            self.change_rows.insert(repository.id, rows);
-        }
-        let rows = self
-            .change_rows
-            .get(&repository.id)
-            .cloned()
-            .unwrap_or_default();
-        let row_count = rows.len();
         let repository_id = repository.id;
+        let ChangeRowCache { rows, selectable } = self.ensure_change_rows(repository_id);
+        let row_count = rows.len();
+        let focus_handle = self.change_list_focus_handle(cx);
+        let scroll_handle = self.change_list_scroll(repository_id);
         let input = self.commit_inputs.get(&repository_id).cloned();
         let staged_count = repository
             .snapshot
@@ -2273,11 +2615,39 @@ impl MainWindow {
             .iter()
             .filter(|change| change.has_staged_change())
             .count();
+        // El estado de sesión que llega por parámetro es una copia previa al
+        // podado que acaba de hacer `ensure_change_rows`; se relee sin clonar.
+        let (selected_count, stageable_count, unstageable_count) = self
+            .state
+            .repositories
+            .iter()
+            .find(|candidate| candidate.id == repository_id)
+            .map_or((0, 0, 0), |candidate| {
+                let selection = &candidate.change_selection;
+                (
+                    selection.len(),
+                    selection.count_paths_for(
+                        &selectable,
+                        &[
+                            ChangeRepresentation::Worktree,
+                            ChangeRepresentation::Untracked,
+                        ],
+                    ),
+                    selection.count_paths_for(&selectable, &[ChangeRepresentation::Staged]),
+                )
+            });
         let can_mutate = repository.can_mutate();
         let message_is_empty = input
             .as_ref()
             .is_none_or(|input| input.read(cx).content().trim().is_empty());
         let commit_enabled = staged_count > 0 && !message_is_empty && can_mutate;
+
+        // Sin esto los atajos de la lista serían inertes hasta el primer clic
+        // sobre una fila, que es justo lo que el teclado debe evitar.
+        if window.focused(cx).is_none() {
+            window.focus(&focus_handle, cx);
+        }
+        let list_is_focused = focus_handle.is_focused(window);
 
         div()
             .flex()
@@ -2285,19 +2655,51 @@ impl MainWindow {
             .flex_1()
             .overflow_hidden()
             .child(
-                uniform_list(
-                    "change-list",
-                    row_count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                        rows[range]
-                            .iter()
-                            .cloned()
-                            .map(|row| this.render_change_row(repository_id, row, window, cx))
-                            .collect()
-                    }),
-                )
-                .w_full()
-                .flex_1(),
+                div()
+                    .id("change-list-container")
+                    .key_context("ChangeList")
+                    .track_focus(&focus_handle)
+                    .on_action(cx.listener(Self::focus_next_change))
+                    .on_action(cx.listener(Self::focus_previous_change))
+                    .on_action(cx.listener(Self::extend_selection_to_next_change))
+                    .on_action(cx.listener(Self::extend_selection_to_previous_change))
+                    .on_action(cx.listener(Self::toggle_focused_change))
+                    .on_action(cx.listener(Self::select_all_changes))
+                    .on_action(cx.listener(Self::clear_change_selection))
+                    // Un clic en cualquier parte de la lista —incluidos el
+                    // espacio vacío y las filas de conflicto— le da el foco.
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let focus_handle = this.change_list_focus_handle(cx);
+                        window.focus(&focus_handle, cx);
+                    }))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(if list_is_focused {
+                        ACCENT_COLOR
+                    } else {
+                        BACKGROUND_COLOR
+                    })
+                    .child(
+                        uniform_list(
+                            gpui::ElementId::from(format!("change-list-{repository_id:?}")),
+                            row_count,
+                            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                                rows[range]
+                                    .iter()
+                                    .cloned()
+                                    .map(|row| {
+                                        this.render_change_row(repository_id, row, window, cx)
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .track_scroll(&scroll_handle)
+                        .w_full()
+                        .flex_1(),
+                    ),
             )
             .child(
                 div()
@@ -2320,7 +2722,13 @@ impl MainWindow {
                                     .text_xs()
                                     .text_color(MUTED_TEXT_COLOR)
                                     .flex_shrink_0()
-                                    .child(format!("{staged_count} archivos staged")),
+                                    .child(if selected_count == 0 {
+                                        format!("{staged_count} archivos staged")
+                                    } else {
+                                        format!(
+                                            "{staged_count} archivos staged · {selected_count} filas seleccionadas"
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -2329,6 +2737,49 @@ impl MainWindow {
                                     .gap_2()
                                     .justify_end()
                                     .flex_shrink_0()
+                                    .when(selected_count > 0, |actions| {
+                                        let can_stage = stageable_count > 0 && can_mutate;
+                                        let can_unstage = unstageable_count > 0 && can_mutate;
+                                        actions
+                                            .child(
+                                                action_button(
+                                                    "stage-selection",
+                                                    format!("Stage selección ({stageable_count})"),
+                                                    can_stage,
+                                                )
+                                                // Un botón atenuado no debe
+                                                // seguir ejecutando su acción.
+                                                .when(can_stage, |button| {
+                                                    button.on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.stage_selected_paths(
+                                                                repository_id,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                }),
+                                            )
+                                            .child(
+                                                action_button(
+                                                    "unstage-selection",
+                                                    format!(
+                                                        "Unstage selección ({unstageable_count})"
+                                                    ),
+                                                    can_unstage,
+                                                )
+                                                .when(can_unstage, |button| {
+                                                    button.on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.unstage_selected_paths(
+                                                                repository_id,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                }),
+                                            )
+                                    })
                                     .child(
                                         action_button(
                                             "discard-all",
@@ -2463,7 +2914,22 @@ impl MainWindow {
                 let can_discard = !matches!(representation, ChangeRepresentation::Conflict);
                 let is_staged = matches!(representation, ChangeRepresentation::Staged);
                 let action_path = path.clone();
+                let selection = ChangeSelection::new(path.clone(), representation);
+                let is_selectable = representation.is_selectable();
+                let session = self
+                    .state
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.id == repository_id);
+                let is_selected = is_selectable
+                    && session
+                        .is_some_and(|repository| repository.change_selection.contains(&selection));
+                let is_lead = is_selectable
+                    && session.is_some_and(|repository| {
+                        repository.change_selection.lead() == Some(&selection)
+                    });
                 div()
+                    .id(change_row_action_id("row", &path, representation))
                     .flex()
                     .items_center()
                     .w_full()
@@ -2473,7 +2939,30 @@ impl MainWindow {
                     .py_1()
                     .border_b_1()
                     .border_color(BORDER_COLOR)
+                    .when(is_selected, |row| row.bg(SELECTED_BACKGROUND_COLOR))
                     .hover(|style| style.bg(HOVER_BACKGROUND_COLOR))
+                    .when(is_selectable, |row| {
+                        row.cursor_pointer().on_click(cx.listener(
+                            move |this, event: &ClickEvent, window, cx| {
+                                this.click_change_row(
+                                    repository_id,
+                                    selection.clone(),
+                                    SelectionGesture::from_click(event),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        ))
+                    })
+                    .child(
+                        // Marca de fila activa para la navegación por teclado.
+                        // Se reserva siempre para que todas las filas alineen.
+                        div()
+                            .w(px(3.0))
+                            .h_full()
+                            .flex_shrink_0()
+                            .when(is_lead, |marker| marker.bg(ACCENT_COLOR)),
+                    )
                     .child(
                         div()
                             .w(px(18.0))
@@ -2522,6 +3011,9 @@ impl MainWindow {
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, window, cx| {
+                                            // La acción de fila no debe además
+                                            // mover la selección.
+                                            cx.stop_propagation();
                                             this.confirm_discard(
                                                 repository_id,
                                                 &discard_change,
@@ -2541,6 +3033,7 @@ impl MainWindow {
                                     .flex_shrink_0()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
+                                            cx.stop_propagation();
                                             if is_staged {
                                                 this.unstage_path(
                                                     repository_id,
@@ -3062,7 +3555,8 @@ impl MainWindow {
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_change_list_focus_if_hidden(window, cx);
         let active_repository = self.active_repository().cloned();
         div()
             .key_context("GitHelper")
@@ -3075,6 +3569,8 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::show_changes))
             .on_action(cx.listener(Self::create_commit))
             .on_action(cx.listener(Self::generate_commit_message))
+            .on_action(cx.listener(Self::stage_selection))
+            .on_action(cx.listener(Self::unstage_selection))
             .flex()
             .flex_col()
             .size_full()
@@ -3085,7 +3581,7 @@ impl Render for MainWindow {
                 root.child(self.render_toolbar(&repository, cx))
                     .child(self.render_internal_tabs(&repository, cx))
                     .child(match repository.selected_view {
-                        RepositoryView::Changes => self.render_changes(&repository, cx),
+                        RepositoryView::Changes => self.render_changes(&repository, window, cx),
                         RepositoryView::History => self.render_history(&repository, cx),
                     })
             })
@@ -3240,6 +3736,22 @@ fn build_change_rows(
     rows
 }
 
+/// Identidad de las filas sobre las que puede actuar la selección múltiple,
+/// en el orden en que se ven.
+fn selectable_rows(rows: &[ChangeListRow]) -> Vec<ChangeSelection> {
+    rows.iter()
+        .filter_map(|row| match row {
+            ChangeListRow::File {
+                change,
+                representation,
+            } if representation.is_selectable() => {
+                Some(ChangeSelection::new(change.path.clone(), *representation))
+            }
+            ChangeListRow::File { .. } | ChangeListRow::Group { .. } => None,
+        })
+        .collect()
+}
+
 fn status_code(change: &FileChange, representation: ChangeRepresentation) -> &'static str {
     let kind = match representation {
         ChangeRepresentation::Conflict => ChangeKind::Unmerged,
@@ -3275,13 +3787,7 @@ fn normalized_path_key(path: &Path) -> String {
 }
 
 fn change_row_action_id(action: &str, path: &Path, representation: ChangeRepresentation) -> String {
-    let representation = match representation {
-        ChangeRepresentation::Conflict => "conflict",
-        ChangeRepresentation::Staged => "staged",
-        ChangeRepresentation::Worktree => "worktree",
-        ChangeRepresentation::Untracked => "untracked",
-    };
-    format!("{action}-{representation}-{}", path.display())
+    format!("{action}-{}-{}", representation.slug(), path.display())
 }
 
 fn operation_running_message(kind: OperationKind) -> &'static str {
@@ -3313,13 +3819,7 @@ fn operation_success_message(kind: OperationKind) -> &'static str {
 }
 
 fn is_cancelled_error(error: &GitError) -> bool {
-    matches!(
-        error,
-        GitError::Process(crate::process::ProcessError::Cancelled)
-            | GitError::NotInstalled {
-                source: crate::process::ProcessError::Cancelled
-            }
-    )
+    error.is_cancelled()
 }
 
 fn action_button(
@@ -3439,6 +3939,8 @@ mod tests {
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
             change_rows: HashMap::new(),
+            change_list_focus: None,
+            change_list_scrolls: HashMap::new(),
             save_generation: 0,
             git_version: None,
             global_status_message: String::new(),
@@ -3715,6 +4217,239 @@ mod tests {
                 "las filas staged y worktree no pueden compartir el id de {action}"
             );
         }
+    }
+
+    fn change(path: &str, index: ChangeKind, worktree: ChangeKind) -> FileChange {
+        FileChange {
+            path: PathBuf::from(path),
+            original_path: None,
+            index_status: index,
+            worktree_status: worktree,
+            is_conflicted: false,
+        }
+    }
+
+    fn conflicted(path: &str) -> FileChange {
+        FileChange {
+            path: PathBuf::from(path),
+            original_path: None,
+            index_status: ChangeKind::Unmerged,
+            worktree_status: ChangeKind::Unmerged,
+            is_conflicted: true,
+        }
+    }
+
+    fn window_with_changes(changes: Vec<FileChange>) -> (MainWindow, RepositoryId) {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.snapshot = Arc::new(RepositorySnapshot {
+            changes,
+            ..RepositorySnapshot::default()
+        });
+        let repository_id = repository.id;
+        let window = test_window(GitClient::default(), vec![repository]);
+        (window, repository_id)
+    }
+
+    fn set_changes(window: &mut MainWindow, repository_id: RepositoryId, changes: Vec<FileChange>) {
+        let repository = window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        repository.snapshot = Arc::new(RepositorySnapshot {
+            changes,
+            ..RepositorySnapshot::default()
+        });
+        window.change_rows.remove(&repository_id);
+    }
+
+    fn selection_of(window: &MainWindow, repository_id: RepositoryId) -> ChangeSelectionState {
+        window
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .unwrap()
+            .change_selection
+            .clone()
+    }
+
+    #[test]
+    fn acting_on_a_selection_splits_staged_and_worktree_rows_of_the_same_path() {
+        // tracked.txt está staged y vuelto a modificar: son dos filas.
+        let (mut window, repository_id) = window_with_changes(vec![
+            change("tracked.txt", ChangeKind::Modified, ChangeKind::Modified),
+            change("otro.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+        ]);
+        let rows = window.selectable_rows_for(repository_id);
+
+        let repository = window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        repository
+            .change_selection
+            .select_only(ChangeSelection::new(
+                PathBuf::from("tracked.txt"),
+                ChangeRepresentation::Staged,
+            ));
+        repository.change_selection.toggle(ChangeSelection::new(
+            PathBuf::from("otro.txt"),
+            ChangeRepresentation::Worktree,
+        ));
+
+        assert_eq!(
+            window.selected_paths(repository_id, &[ChangeRepresentation::Staged]),
+            vec![PathBuf::from("tracked.txt")],
+            "unstage solo afecta a la fila staged elegida"
+        );
+        assert_eq!(
+            window.selected_paths(
+                repository_id,
+                &[
+                    ChangeRepresentation::Worktree,
+                    ChangeRepresentation::Untracked
+                ]
+            ),
+            vec![PathBuf::from("otro.txt")],
+            "stage no arrastra la fila staged de tracked.txt"
+        );
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn an_external_change_drops_stale_rows_without_selecting_others_by_position() {
+        let (mut window, repository_id) = window_with_changes(vec![
+            change("a.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+            change("b.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+            change("c.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+        ]);
+        let rows = window.selectable_rows_for(repository_id);
+        window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap()
+            .change_selection
+            .select_all(&rows);
+
+        // Otra herramienta hace stage de a.txt y borra el cambio de b.txt.
+        set_changes(
+            &mut window,
+            repository_id,
+            vec![
+                change("a.txt", ChangeKind::Modified, ChangeKind::Unmodified),
+                change("c.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+            ],
+        );
+
+        assert_eq!(
+            window.selected_paths(
+                repository_id,
+                &[
+                    ChangeRepresentation::Worktree,
+                    ChangeRepresentation::Untracked
+                ]
+            ),
+            vec![PathBuf::from("c.txt")],
+            "solo sobrevive la fila cuya identidad sigue existiendo"
+        );
+        assert!(
+            window
+                .selected_paths(repository_id, &[ChangeRepresentation::Staged])
+                .is_empty(),
+            "la nueva fila staged de a.txt no hereda la selección de su fila worktree"
+        );
+        assert_eq!(selection_of(&window, repository_id).len(), 1);
+    }
+
+    #[test]
+    fn collapsing_a_group_releases_the_rows_it_hides() {
+        let (mut window, repository_id) = window_with_changes(vec![
+            change("a.txt", ChangeKind::Modified, ChangeKind::Unmodified),
+            change("b.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+        ]);
+        let rows = window.selectable_rows_for(repository_id);
+        window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap()
+            .change_selection
+            .select_all(&rows);
+
+        window
+            .collapsed_groups
+            .insert((repository_id, ChangeRepresentation::Staged));
+        window.change_rows.remove(&repository_id);
+
+        assert!(
+            window
+                .selected_paths(repository_id, &[ChangeRepresentation::Staged])
+                .is_empty(),
+            "una fila plegada no puede seguir dentro de la selección"
+        );
+        assert_eq!(
+            window.selected_paths(repository_id, &[ChangeRepresentation::Worktree]),
+            vec![PathBuf::from("b.txt")]
+        );
+    }
+
+    #[test]
+    fn selection_shortcuts_do_nothing_while_the_history_view_is_open() {
+        let (mut window, repository_id) = window_with_changes(vec![change(
+            "a.txt",
+            ChangeKind::Unmodified,
+            ChangeKind::Modified,
+        )]);
+        let rows = window.selectable_rows_for(repository_id);
+        let repository = window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        repository.change_selection.select_all(&rows);
+
+        assert_eq!(window.repository_showing_changes(), Some(repository_id));
+
+        window
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .unwrap()
+            .selected_view = RepositoryView::History;
+
+        assert_eq!(
+            window.repository_showing_changes(),
+            None,
+            "no se puede mutar el índice desde una vista que no muestra la selección"
+        );
+    }
+
+    #[test]
+    fn conflicted_rows_are_not_selectable() {
+        let (mut window, repository_id) = window_with_changes(vec![
+            conflicted("conflicto.txt"),
+            change("b.txt", ChangeKind::Unmodified, ChangeKind::Modified),
+        ]);
+
+        let rows = window.selectable_rows_for(repository_id);
+
+        assert_eq!(
+            *rows,
+            vec![ChangeSelection::new(
+                PathBuf::from("b.txt"),
+                ChangeRepresentation::Worktree
+            )],
+            "los conflictos se resuelven fuera de Git Helper"
+        );
     }
 
     #[cfg(windows)]

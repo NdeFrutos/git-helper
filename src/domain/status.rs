@@ -56,13 +56,58 @@ impl FileChange {
     }
 }
 
-/// Selección de una representación concreta de un cambio.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ChangeSelection {
-    Conflict(PathBuf),
-    Staged(PathBuf),
-    Worktree(PathBuf),
-    Untracked(PathBuf),
+/// Grupo de la vista Cambios en el que se representa una ruta.
+///
+/// Una misma ruta puede aparecer a la vez como `Staged` y como `Worktree`;
+/// cada representación controla únicamente su propio estado.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ChangeRepresentation {
+    Conflict,
+    Staged,
+    Worktree,
+    Untracked,
+}
+
+impl ChangeRepresentation {
+    /// Identificador estable para ids de elemento y mensajes.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Staged => "staged",
+            Self::Worktree => "worktree",
+            Self::Untracked => "untracked",
+        }
+    }
+
+    /// Los conflictos se resuelven fuera de Git Helper y no participan en
+    /// stage ni unstage por selección.
+    #[must_use]
+    pub const fn is_selectable(self) -> bool {
+        !matches!(self, Self::Conflict)
+    }
+}
+
+/// Identidad de una fila de la vista Cambios.
+///
+/// La fila se identifica por ruta y representación, nunca por posición: así
+/// un refresco que reordene o elimine filas no puede trasladar la selección a
+/// un archivo distinto.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ChangeSelection {
+    pub path: PathBuf,
+    pub representation: ChangeRepresentation,
+}
+
+impl ChangeSelection {
+    /// Crea la identidad de una fila concreta.
+    #[must_use]
+    pub const fn new(path: PathBuf, representation: ChangeRepresentation) -> Self {
+        Self {
+            path,
+            representation,
+        }
+    }
 }
 
 /// Estado de HEAD comunicado por `git status`.

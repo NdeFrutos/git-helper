@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, MutationState, RefreshCoordinator, RefreshState, RepositoryId,
-    RepositorySession, RepositorySnapshot, RepositoryView,
+    AppSettings, AppState, ChangeSelectionState, MutationState, RefreshCoordinator, RefreshState,
+    RepositoryId, RepositorySession, RepositorySnapshot, RepositoryView,
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -98,7 +98,7 @@ impl PersistedAppState {
                 root_path: repository.root_path,
                 snapshot: Arc::new(RepositorySnapshot::default()),
                 selected_view: repository.selected_view,
-                selected_change: None,
+                change_selection: ChangeSelectionState::default(),
                 selected_commit: None,
                 refresh_state: RefreshState::default(),
                 mutation_state: MutationState::default(),

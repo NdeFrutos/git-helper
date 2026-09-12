@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote, UpstreamState,
-    status::FileChange,
+    BranchReference, ChangeSelectionState, CommitId, CommitSummary, HeadState, Remote,
+    UpstreamState, status::FileChange,
 };
 
 /// Identificador estable de una sesión de repositorio.
@@ -160,7 +160,9 @@ pub struct RepositorySession {
     pub root_path: PathBuf,
     pub snapshot: Arc<RepositorySnapshot>,
     pub selected_view: RepositoryView,
-    pub selected_change: Option<ChangeSelection>,
+    /// Selección de la vista Cambios. Es efímera: no se persiste porque
+    /// depende del estado que Git reporte en cada momento.
+    pub change_selection: ChangeSelectionState,
     pub selected_commit: Option<CommitId>,
     pub refresh_state: RefreshState,
     pub mutation_state: MutationState,
@@ -183,7 +185,7 @@ impl RepositorySession {
             root_path,
             snapshot: Arc::new(RepositorySnapshot::default()),
             selected_view: RepositoryView::default(),
-            selected_change: None,
+            change_selection: ChangeSelectionState::default(),
             selected_commit: None,
             refresh_state: RefreshState::default(),
             mutation_state: MutationState::default(),

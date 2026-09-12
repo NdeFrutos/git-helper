@@ -1,12 +1,12 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use git_helper::{
     domain::ChangeKind,
-    git::{GitClient, plan_discard, plan_pull, plan_push},
+    git::{GitClient, GitError, plan_discard, plan_pull, plan_push},
     process::CancellationToken,
 };
 use tempfile::tempdir;
@@ -131,6 +131,207 @@ fn stages_commits_and_preserves_dual_index_worktree_state() {
         .history(temporary.path(), 200, 0, &cancellation)
         .expect("debe leer historial");
     assert_eq!(history[0].summary.subject, "test: crea commit inicial");
+}
+
+#[test]
+fn stages_only_the_selected_subset_including_renames_and_unicode() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    for name in ["original ñ.txt", "elegido.txt", "intacto.txt"] {
+        fs::write(temporary.path().join(name), "inicial\n").expect("debe crear el archivo");
+    }
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+
+    // Renombre fuera de la aplicación, más dos archivos modificados.
+    require_git(
+        temporary.path(),
+        &["mv", "original ñ.txt", "renombrado ñ.txt"],
+    );
+    require_git(temporary.path(), &["reset"]);
+    fs::write(temporary.path().join("elegido.txt"), "elegido\n").expect("debe modificar elegido");
+    fs::write(temporary.path().join("intacto.txt"), "intacto\n").expect("debe modificar intacto");
+
+    client
+        .stage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("elegido.txt"),
+                PathBuf::from("original ñ.txt"),
+                PathBuf::from("renombrado ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect("el subconjunto debe aplicarse");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let staged: Vec<_> = status
+        .changes
+        .iter()
+        .filter(|change| change.has_staged_change())
+        .map(|change| change.path.clone())
+        .collect();
+
+    assert!(staged.contains(&PathBuf::from("elegido.txt")));
+    assert!(staged.contains(&PathBuf::from("renombrado ñ.txt")));
+    assert!(
+        !staged.contains(&PathBuf::from("intacto.txt")),
+        "una ruta fuera de la selección no puede acabar staged"
+    );
+
+    // Unstage del mismo subconjunto deja intacto el working tree.
+    client
+        .unstage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("elegido.txt"),
+                PathBuf::from("renombrado ñ.txt"),
+                PathBuf::from("original ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect("unstage del subconjunto debe funcionar");
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe releer status");
+
+    assert!(
+        status
+            .changes
+            .iter()
+            .all(|change| !change.has_staged_change()),
+        "el índice debe quedar vacío tras el unstage de la selección"
+    );
+    assert!(temporary.path().join("renombrado ñ.txt").exists());
+    assert!(temporary.path().join("elegido.txt").exists());
+}
+
+#[test]
+fn unstages_a_subset_before_the_first_commit_without_deleting_files() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    for name in ["uno ñ.txt", "dos.txt"] {
+        fs::write(temporary.path().join(name), "contenido\n").expect("debe crear el archivo");
+    }
+
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage all debe funcionar");
+    client
+        .unstage_paths(
+            temporary.path(),
+            &[PathBuf::from("uno ñ.txt")],
+            &cancellation,
+        )
+        .expect("unstage unborn por lote debe funcionar");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let unstaged = status
+        .changes
+        .iter()
+        .find(|change| change.path == Path::new("uno ñ.txt"))
+        .expect("uno ñ.txt debe seguir reportándose");
+    let staged = status
+        .changes
+        .iter()
+        .find(|change| change.path == Path::new("dos.txt"))
+        .expect("dos.txt debe seguir reportándose");
+
+    assert_eq!(unstaged.worktree_status, ChangeKind::Untracked);
+    assert!(staged.has_staged_change());
+    assert!(temporary.path().join("uno ñ.txt").exists());
+}
+
+#[test]
+fn reports_a_partial_result_instead_of_pretending_the_batch_was_atomic() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    fs::write(temporary.path().join("existe.txt"), "contenido\n").expect("debe crear el archivo");
+
+    let error = client
+        .stage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("existe.txt"),
+                PathBuf::from("no existe ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect_err("una ruta inexistente debe producir un resultado parcial");
+
+    match error {
+        GitError::PartialBatch {
+            applied,
+            requested,
+            failures,
+        } => {
+            assert_eq!(applied, 1);
+            assert_eq!(requested, 2);
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].path, PathBuf::from("no existe ñ.txt"));
+        }
+        other => panic!("se esperaba un resultado parcial, no {other}"),
+    }
+
+    // Git ya aplicó la parte que sí era válida: la UI debe reconciliar con esto.
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    assert!(
+        status
+            .changes
+            .iter()
+            .any(|change| change.path == Path::new("existe.txt") && change.has_staged_change())
+    );
+}
+
+#[test]
+fn stages_a_batch_that_exceeds_the_windows_command_line_limit() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let directory = temporary.path().join("lote con ñ");
+    fs::create_dir(&directory).expect("debe crear el directorio");
+
+    // 600 rutas largas superan con holgura las 32 767 unidades de CreateProcessW.
+    let paths: Vec<PathBuf> = (0..600)
+        .map(|index| {
+            let name = format!("lote con ñ/archivo-{index:03}-{}.txt", "ñ".repeat(30));
+            fs::write(temporary.path().join(&name), "contenido\n").expect("debe crear el archivo");
+            PathBuf::from(name)
+        })
+        .collect();
+
+    client
+        .stage_paths(temporary.path(), &paths, &cancellation)
+        .expect("un lote mayor que el límite de argumentos debe aplicarse entero");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let staged = status
+        .changes
+        .iter()
+        .filter(|change| change.has_staged_change())
+        .count();
+
+    assert_eq!(staged, paths.len());
 }
 
 #[test]
