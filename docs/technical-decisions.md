@@ -209,6 +209,36 @@ el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión c
 de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
 un estado distinto de un fallo para que la UI no la presente como error.
 
+## Clasificación de errores y próximos pasos (UX-13)
+
+Todo fallo de un comando Git pasa por `classify_command_failure`, de modo que una lectura, una
+mutación y una operación remota obtienen el mismo error tipado. `classify_remote_failure` es un
+alias conservado para el clonado. La clasificación busca primero señales que Git no traduce
+—`index.lock`, `user.email`, nombres de hook, `--set-upstream`, `non-fast-forward`, `pull.rebase`—
+y solo después frases conocidas en inglés y español, para que una instalación localizada no
+degrade el diagnóstico.
+
+`GitError::user_message` da la explicación breve, `GitError::technical_details` el detalle
+depurado y `GitError::recommended_action` el siguiente paso seguro. `recommended_action` devuelve
+`None` cuando el error no está clasificado: la UI muestra entonces una recomendación genérica de
+revisar los detalles y reconciliar el estado, sin atribuir una causa. `CursorError` expone la
+misma terna para los fallos del proveedor de IA, que además distinguen sesión o permisos por
+códigos (`401`, `403`) en lugar de por el texto del mensaje.
+
+Las recomendaciones describen acciones que ejecuta la persona usuaria, nunca reparaciones
+implícitas de la aplicación: no se borra `index.lock`, no se toca la identidad de Git, no se hace
+merge, rebase ni stash automático y no se usa push forzado. `redact_credentials` oculta
+`usuario:secreto@host` en cualquier detalle antes de mostrarlo o copiarlo, y conserva un
+`git@host` de SSH porque no es un secreto y ayuda al diagnóstico.
+
+Git no marca de ninguna forma propia el fallo de un hook local: solo reenvía su salida. Un hook
+que no se identifica deja el error sin clasificar, con su salida completa, en lugar de recibir una
+causa que no consta.
+
+`RefreshState::Failed`, `MutationState::Failed` y el error de sesión llevan el siguiente paso
+junto al detalle; `RepositorySession::set_error` es el único punto de escritura para que una
+recomendación no sobreviva al fallo que la originó.
+
 ## Canal de instancia única
 
 `ghelper` y `git-helper.exe` se comunican por un socket TCP en `127.0.0.1` con puerto **efímero**:

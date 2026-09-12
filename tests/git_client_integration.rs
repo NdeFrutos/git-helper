@@ -321,7 +321,13 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
         .expect_err("pull divergente debe rechazarse");
     let head_after = run_git(&first, &["rev-parse", "HEAD"]).stdout;
 
-    assert!(pull_error.to_string().contains("Git rechazó"));
+    assert!(
+        matches!(
+            pull_error,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "un pull divergente debe clasificarse como divergencia: {pull_error:?}"
+    );
     assert_eq!(head_before, head_after);
 }
 
@@ -715,4 +721,171 @@ fn rejects_clone_arguments_that_git_would_read_as_options() {
         error,
         git_helper::git::GitError::InvalidSshUrl { .. }
     ));
+}
+
+#[test]
+fn a_locked_index_is_reported_without_being_deleted() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let lock_path = temporary.path().join(".git").join("index.lock");
+    fs::write(&lock_path, "").expect("debe simular el bloqueo");
+    let client = GitClient::default();
+
+    let error = client
+        .stage(
+            temporary.path(),
+            Path::new("a.txt"),
+            &CancellationToken::default(),
+        )
+        .expect_err("stage debe fallar con el índice bloqueado");
+
+    assert!(
+        matches!(error, git_helper::git::GitError::IndexLocked { .. }),
+        "un índice bloqueado debe clasificarse como tal: {error:?}"
+    );
+    assert!(
+        error
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("Git Helper no lo elimina")
+    );
+    assert!(
+        lock_path.exists(),
+        "Git Helper no debe borrar index.lock automáticamente"
+    );
+}
+
+#[test]
+fn a_rejected_hook_keeps_the_repository_intact_and_names_the_hook() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let hooks = temporary.path().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("debe crear la carpeta de hooks");
+    let hook_path = hooks.join("pre-commit");
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\necho 'pre-commit: la comprobación de formato falló' >&2\nexit 1\n",
+    )
+    .expect("debe escribir el hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
+            .expect("debe hacer ejecutable el hook");
+    }
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage debe funcionar");
+
+    let error = client
+        .commit(temporary.path(), "mensaje de prueba", &cancellation)
+        .expect_err("el hook debe rechazar el commit");
+
+    let git_helper::git::GitError::HookRejected { hook, .. } = &error else {
+        panic!("un hook que rechaza debe clasificarse como tal: {error:?}");
+    };
+    assert_eq!(hook.as_deref(), Some("pre-commit"));
+    assert!(
+        error
+            .technical_details()
+            .contains("la comprobación de formato falló")
+    );
+    assert!(
+        !run_git(temporary.path(), &["log", "--oneline"])
+            .status
+            .success(),
+        "el commit rechazado no debe crear historial"
+    );
+}
+
+#[test]
+fn rejected_push_and_divergent_pull_get_next_steps_without_forcing_anything() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    let origin = temporary.path().join("origin.git");
+    require_git(
+        temporary.path(),
+        &["init", "--bare", "-b", "main", "origin.git"],
+    );
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    for clone in [&first, &second] {
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(&origin)
+            .arg(clone)
+            .output()
+            .expect("Git debe poder clonar el repositorio local");
+        assert!(output.status.success(), "clonar debe funcionar");
+        require_git(clone, &["config", "user.name", "Git Helper Tests"]);
+        require_git(
+            clone,
+            &["config", "user.email", "git-helper-tests@example.invalid"],
+        );
+    }
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    commit_file(&client, &first, "a.txt", "uno", "primer commit");
+    require_git(&first, &["push", "-u", "origin", "main"]);
+    commit_file(&client, &second, "b.txt", "dos", "commit divergente");
+
+    let rejected = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::SetUpstreamAndPush {
+                remote_name: "origin".to_owned(),
+                branch_name: "main".to_owned(),
+            },
+            &cancellation,
+        )
+        .expect_err("el push sin integrar debe ser rechazado");
+
+    assert!(
+        matches!(rejected, git_helper::git::GitError::PushRejected { .. }),
+        "un push rechazado debe clasificarse como tal: {rejected:?}"
+    );
+    let action = rejected
+        .recommended_action()
+        .expect("debe recomendar una acción");
+    assert!(action.contains("Fetch"));
+    assert!(action.to_lowercase().contains("no uses push forzado"));
+
+    require_git(&second, &["fetch", "origin"]);
+    require_git(
+        &second,
+        &["branch", "--set-upstream-to", "origin/main", "main"],
+    );
+    let divergent = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::PullFastForward,
+            &cancellation,
+        )
+        .expect_err("un pull fast-forward sobre ramas divergentes debe fallar");
+
+    assert!(
+        matches!(
+            divergent,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "una divergencia debe clasificarse como tal: {divergent:?}"
+    );
+    assert!(
+        divergent
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("fuera de Git Helper")
+    );
+    let local_head = run_git(&second, &["rev-parse", "HEAD"]);
+    let commit_message = run_git(&second, &["log", "-1", "--pretty=%s"]);
+    assert!(local_head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&commit_message.stdout).trim(),
+        "commit divergente",
+        "ni el push rechazado ni el pull fallido deben mover la rama local"
+    );
 }
