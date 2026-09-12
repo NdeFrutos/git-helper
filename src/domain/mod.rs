@@ -3,6 +3,7 @@ mod history;
 mod remote;
 mod remote_freshness;
 mod repository;
+mod search;
 mod status;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
@@ -20,4 +21,5 @@ pub use repository::{
     RefreshCoordinator, RefreshState, RepositoryId, RepositorySession, RepositoryView,
     SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
 };
+pub use search::{SearchQuery, change_matches, commit_matches};
 pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};

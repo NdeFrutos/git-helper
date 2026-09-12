@@ -22,6 +22,7 @@ sincronizar con remotes y consultar el historial.
 - Ver la antigüedad de las referencias remotas y activar fetch automático (desactivado por defecto; Shift+clic alterna 5/15/30 min).
 - Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
+- Filtrar los cambios por ruta y buscar en el historial por mensaje, autor o hash (`Ctrl+F`).
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
 
@@ -98,6 +99,24 @@ Atajos disponibles:
 | `Ctrl+1` / `Ctrl+2` | Mostrar historial / cambios |
 | `Ctrl+Enter` | Crear el commit |
 | `Ctrl+Shift+G` | Generar un mensaje con Cursor |
+| `Ctrl+F` | Enfocar la búsqueda de la vista activa |
+| `Escape` | Limpiar la consulta mientras la búsqueda tiene el foco |
+
+### Buscar y filtrar
+
+Cada vista tiene su propia caja de búsqueda, independiente por repositorio: cambiar de pestaña no
+arrastra ni descarta la consulta de otra.
+
+- En `Cambios` el texto filtra por ruta o nombre de archivo. El archivo conserva sus filas staged y
+  sin preparar por separado, con sus acciones propias. Mientras el filtro está activo se ocultan
+  `Stage todo` y `Unstage todo`, porque actúan sobre el repositorio entero y no sobre lo visible.
+- En `Historial` el texto busca por asunto, autor, correo y prefijo de hash. La búsqueda recorre la
+  referencia seleccionada por páginas, no solo los commits ya cargados; `Buscar más` continúa el
+  recorrido cuando quedan commits por explorar.
+
+La consulta se trata siempre como texto literal: no se interpreta como expresión regular ni llega a
+Git como patrón. Buscar no modifica `HEAD`, el índice ni el directorio de trabajo. Cambiar la
+consulta o la rama descarta los resultados que estuvieran en vuelo.
 
 ## Privacidad y seguridad
 
