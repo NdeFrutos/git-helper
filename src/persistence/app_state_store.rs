@@ -134,6 +134,7 @@ impl PersistedAppState {
                     mutation_state: MutationState::default(),
                     status_message: "Preparando repositorio…".to_owned(),
                     error: None,
+                    error_next_step: None,
                     refresh_generation: 0,
                     history_generation: 0,
                     history_loaded: false,
