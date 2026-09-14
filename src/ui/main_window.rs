@@ -399,6 +399,8 @@ pub struct MainWindow {
     summary_view_active: bool,
     summary_focus_index: usize,
     summary_rows: Arc<Vec<RepositorySummaryRow>>,
+    summary_focus_handle: Option<FocusHandle>,
+    summary_rows_last_rebuild_secs: u64,
     /// Capa que editan los controles de preferencias; no se persiste.
     commit_preference_scope: PreferenceScope,
 }
@@ -466,6 +468,8 @@ impl MainWindow {
             summary_view_active: false,
             summary_focus_index: 0,
             summary_rows: Arc::new(Vec::new()),
+            summary_focus_handle: Some(cx.focus_handle()),
+            summary_rows_last_rebuild_secs: 0,
             commit_preference_scope: PreferenceScope::default(),
         }
     }
@@ -482,14 +486,17 @@ impl MainWindow {
         }
     }
 
-    fn enter_summary_view(&mut self, cx: &mut Context<Self>) {
-        if self.state.repositories.is_empty() {
+    fn enter_summary_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.repositories.len() <= 1 {
             return;
         }
         self.rebuild_summary_rows();
         self.summary_view_active = true;
         if self.summary_focus_index >= self.summary_rows.len() {
             self.summary_focus_index = 0;
+        }
+        if let Some(handle) = &self.summary_focus_handle {
+            window.focus(handle, cx);
         }
         self.global_status_message = format!(
             "Resumen de {} repositorios abiertos",
@@ -498,8 +505,8 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn show_summary(&mut self, _: &ShowSummary, _: &mut Window, cx: &mut Context<Self>) {
-        self.enter_summary_view(cx);
+    fn show_summary(&mut self, _: &ShowSummary, window: &mut Window, cx: &mut Context<Self>) {
+        self.enter_summary_view(window, cx);
     }
 
     fn summary_next_row(&mut self, _: &SummaryNextRow, _: &mut Window, cx: &mut Context<Self>) {
@@ -4076,8 +4083,8 @@ impl MainWindow {
                                 .aria_label("Resumen de todos los repositorios abiertos")
                                 .when(summary_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
                                 .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.enter_summary_view(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_summary_view(window, cx);
                                 }))
                                 .child(
                                     div()
@@ -6204,7 +6211,7 @@ impl MainWindow {
         let rows = Arc::clone(&self.summary_rows);
         let row_count = rows.len();
         let focus_index = self.summary_focus_index;
-        div()
+        let summary_view = div()
             .id("repository-summary-view")
             .key_context("Summary")
             .on_action(cx.listener(Self::summary_next_row))
@@ -6262,7 +6269,11 @@ impl MainWindow {
                 )
                 .w_full()
                 .flex_1(),
-            )
+            );
+        summary_view
+            .when_some(self.summary_focus_handle.as_ref(), |view, handle| {
+                view.track_focus(handle)
+            })
             .into_any_element()
     }
 
@@ -6844,7 +6855,11 @@ impl Render for MainWindow {
         self.release_change_list_focus_if_hidden(window, cx);
         self.process_pending_existing_clone_open(window, cx);
         if self.summary_view_active && self.state.repositories.len() > 1 {
-            self.rebuild_summary_rows();
+            let now = SystemClock.now_secs();
+            if now != self.summary_rows_last_rebuild_secs {
+                self.rebuild_summary_rows();
+                self.summary_rows_last_rebuild_secs = now;
+            }
         }
         let active_repository = self.active_repository().cloned();
         div()
@@ -7538,6 +7553,8 @@ mod tests {
             summary_view_active: false,
             summary_focus_index: 0,
             summary_rows: Arc::new(Vec::new()),
+            summary_focus_handle: None,
+            summary_rows_last_rebuild_secs: 0,
             commit_preference_scope: PreferenceScope::default(),
         }
     }
