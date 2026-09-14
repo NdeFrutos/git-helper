@@ -17,6 +17,8 @@ use tracing::{debug, warn};
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+#[cfg(target_os = "windows")]
 const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Señal cooperativa que permite cancelar un proceso hijo.
@@ -78,6 +80,98 @@ pub enum ProcessError {
     TimedOut(Duration),
     #[error("no se pudo consultar o finalizar el proceso: {0}")]
     Wait(#[source] std::io::Error),
+}
+
+/// Visibilidad de consola solicitada al abrir una aplicación externa.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsoleVisibility {
+    /// Aplicaciones gráficas: no deben mostrar ninguna consola.
+    Hidden,
+    /// Terminales pedidas por el usuario: necesitan su propia consola visible.
+    Visible,
+}
+
+/// Solicitud para abrir una aplicación externa sin esperar a que termine.
+///
+/// Los argumentos ya vienen resueltos como cadenas del sistema; nunca se
+/// construye una línea de comandos ni se delega en una shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchRequest {
+    pub label: &'static str,
+    pub program: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub current_directory: Option<PathBuf>,
+    pub console: ConsoleVisibility,
+}
+
+/// Abre una aplicación externa y devuelve el control de inmediato.
+///
+/// Solo interesa si el proceso pudo crearse: el hijo sobrevive a Git Helper y su
+/// salida no se captura, así que no hay pipes que vaciar ni espera que bloquee.
+pub fn launch_detached(request: &LaunchRequest) -> Result<(), ProcessError> {
+    let mut command = Command::new(&request.program);
+    command.args(&request.arguments);
+    if let Some(current_directory) = &request.current_directory {
+        command.current_dir(current_directory);
+    }
+    match request.console {
+        ConsoleVisibility::Hidden => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        // Una terminal necesita los descriptores estándar de la consola nueva. Git
+        // Helper es una aplicación gráfica sin consola propia, así que dejar la
+        // herencia por defecto entrega tres handles nulos y Windows aplica su
+        // comportamiento estándar: conectar el hijo a la consola que acaba de
+        // crear. Redirigir a NUL, en cambio, dejaría la ventana abierta con una
+        // shell que lee EOF y se cierra al instante.
+        ConsoleVisibility::Visible => {}
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.creation_flags(match request.console {
+            ConsoleVisibility::Hidden => CREATE_NO_WINDOW,
+            ConsoleVisibility::Visible => CREATE_NEW_CONSOLE,
+        });
+    }
+
+    let child = command.spawn().map_err(ProcessError::Spawn)?;
+    debug!(
+        operation = request.label,
+        program = %request.program.display(),
+        "Aplicación externa abierta"
+    );
+    release_child(child, request.label);
+    Ok(())
+}
+
+/// Windows libera el proceso al cerrar su handle; el hijo sigue vivo por su cuenta.
+#[cfg(target_os = "windows")]
+fn release_child(child: std::process::Child, _label: &'static str) {
+    drop(child);
+}
+
+/// En Unix el hijo quedaría en zombi hasta que termine Git Helper: un hilo
+/// bloqueado en `wait` lo recoge sin retrasar a quien pidió la acción.
+#[cfg(not(target_os = "windows"))]
+fn release_child(mut child: std::process::Child, label: &'static str) {
+    let supervisor = thread::Builder::new()
+        .name("external-launch-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+            debug!(operation = label, "Aplicación externa finalizada");
+        });
+    if let Err(error) = supervisor {
+        warn!(
+            operation = label,
+            error = %error,
+            "No se pudo supervisar la aplicación externa"
+        );
+    }
 }
 
 /// Abstracción inyectable usada por Git y Cursor CLI.

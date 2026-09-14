@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BranchReference, ChangeSelectionState, CommitId, CommitSummary, HeadState, Remote,
-    RemoteFreshnessTracker, UpstreamState,
+    BranchReference, ChangeSelectionState, CommitId, CommitSummary, ExternalCommand, HeadState,
+    Remote, RemoteFreshnessTracker, UpstreamState,
     commit_preferences::{CommitMessagePreferenceOverrides, CommitMessagePreferences},
     remote_freshness::{DEFAULT_PERIODIC_FETCH_INTERVAL_SECS, normalized_repo_key},
     status::FileChange,
@@ -451,6 +451,9 @@ fn default_periodic_fetch_interval_secs() -> u64 {
 pub struct AppSettings {
     pub theme: ThemePreference,
     pub cursor_cli_path: Option<PathBuf>,
+    /// Editor externo configurado; si falta, se detecta uno instalado.
+    #[serde(default)]
+    pub editor_command: Option<ExternalCommand>,
     pub cursor_context_consent: bool,
     #[serde(default)]
     pub default_clone_directory: Option<PathBuf>,
@@ -475,6 +478,7 @@ impl Default for AppSettings {
         Self {
             theme: ThemePreference::default(),
             cursor_cli_path: None,
+            editor_command: None,
             cursor_context_consent: false,
             default_clone_directory: None,
             periodic_fetch_enabled: false,

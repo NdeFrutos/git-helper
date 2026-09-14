@@ -1,6 +1,7 @@
 mod branch;
 mod change_selection;
 mod commit_preferences;
+mod external_tools;
 mod history;
 mod remote;
 mod remote_freshness;
@@ -20,6 +21,7 @@ pub use commit_preferences::{
     cycle_commit_preference, effective_commit_preferences, next_subject_max_length,
     normalize_subject_max_length, plan_commit_template, resolve_commit_preferences,
 };
+pub use external_tools::{ExternalCommand, ToolArgument};
 pub use history::{CommitDetails, CommitId, CommitSummary, HistoryPage, Reference};
 pub use remote::{Remote, RemoteOperationPlan, UpstreamState};
 pub use remote_freshness::{

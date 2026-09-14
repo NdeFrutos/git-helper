@@ -8,6 +8,7 @@ pub mod app;
 pub mod cli;
 pub mod cursor;
 pub mod domain;
+pub mod external;
 pub mod git;
 pub mod persistence;
 pub mod process;
