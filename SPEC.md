@@ -84,7 +84,7 @@ La reutilización se organizará así:
 
 ### 3.2 Fuera del MVP
 
-- Clonar o inicializar repositorios.
+- Inicializar repositorios vacíos desde cero.
 - Crear, eliminar, fusionar o hacer checkout de ramas.
 - Rebase, cherry-pick, revert, stash y reset.
 - Edición de archivos.
@@ -96,6 +96,27 @@ La reutilización se organizará así:
 - Integración con GitHub, GitLab, Bitbucket o Azure DevOps.
 
 Estas funciones no deben añadirse durante el MVP salvo que sean necesarias para su arquitectura interna.
+
+### 3.3 Clonado por SSH (SSH-01)
+
+Git Helper admite obtener repositorios remotos accesibles mediante SSH sin un clonado manual previo fuera de la aplicación.
+
+Flujo:
+
+1. El usuario elige **Clonar repositorio** (`Ctrl+Shift+O`) e introduce una URL SSH (`git@host:org/repo.git` o `ssh://user@host/path/repo.git`).
+2. La aplicación valida el formato antes de tocar la red y rechaza esquemas no SSH (`https://`, `file://`, etc.).
+3. Se propone un destino bajo `%LOCALAPPDATA%\GitHelper\repos\<nombre>`. Con el selector nativo se elige la carpeta contenedora y el clon se crea dentro, en `<carpeta>\<nombre>`.
+4. Si el destino ya contiene un repositorio Git —no un subdirectorio de otro— con el mismo `origin` canónico, se ofrece abrirlo sin sobrescribir. Un destino ocupado por otro contenido o por otro `origin` se rechaza con un mensaje explícito.
+5. En caso contrario se ejecuta `git clone <url> <destino>` con progreso, cancelación y errores SSH accionables.
+6. Tras un clonado correcto se abre el repositorio en una pestaña y se persiste el par `(ssh_url_normalizada, ruta_local)` en `state.json`.
+
+Requisitos y limitaciones:
+
+- Git Helper usa el stack SSH del sistema (`GIT_SSH`, `~/.ssh/config`, `ssh-agent`); no almacena claves ni contraseñas.
+- Los errores frecuentes (host desconocido, clave ausente, timeout, host key changed) se resumen en la UI con indicaciones prácticas.
+- La URL se normaliza a `ssh://host[:puerto]/ruta` para comparar remotes: el puerto no estándar y el caso de la ruta forman parte de la identidad del repositorio.
+- Un clonado cancelado o fallido borra el destino que haya creado, de modo que el siguiente intento parte de cero.
+- HTTPS, editor de `~/.ssh/config`, gestión visual de claves y trabajo remoto sin clon local quedan fuera de alcance.
 
 ## 4. Experiencia de usuario
 
@@ -135,7 +156,9 @@ Al iniciar sin repositorios abiertos se mostrará:
 
 - Título y explicación breve.
 - Botón `Abrir repositorio`.
+- Botón `Clonar repositorio` para URLs SSH.
 - Lista opcional de repositorios recientes que sigan existiendo.
+- Lista opcional de clones SSH recientes cuya ruta local siga existiendo.
 
 El selector de carpeta debe ser nativo de Windows. Una carpeta es válida si:
 
@@ -172,6 +195,8 @@ Un mismo archivo puede aparecer tanto en `Cambios staged` como en `Cambios` si t
 
 Seleccionar una fila solo la resalta y habilita sus acciones. El MVP no leerá ni mostrará el contenido ni el diff del archivo.
 
+La vista incluye una caja de filtro por ruta o nombre. El filtro se aplica antes de agrupar, así que un archivo filtrado conserva sus filas staged y de worktree por separado. Mientras hay consulta activa los grupos no ofrecen `Stage todo` ni `Unstage todo`: esas acciones operan sobre el repositorio completo y no sobre el subconjunto visible.
+
 #### Selección múltiple
 
 La vista admite seleccionar varias filas para hacer stage o unstage de un subconjunto:
@@ -191,6 +216,20 @@ Reglas de la selección:
 - La selección es efímera y no se persiste entre sesiones.
 
 La UI muestra el número de filas seleccionadas y dos acciones, `Stage selección` y `Unstage selección`, cuyo rótulo incluye el número exacto de rutas al que afectarán. `Stage selección` actúa sobre las filas de `Cambios` y `Sin seguimiento`; `Unstage selección` actúa sobre las de `Cambios staged`. El descarte múltiple queda fuera de esta funcionalidad.
+
+### 4.3.1 Búsqueda en Cambios e Historial
+
+Cada repositorio mantiene una consulta independiente por vista. La caja se enfoca con `Ctrl+F` y `Escape` la limpia sin salir de la vista.
+
+Reglas comunes:
+
+- La consulta es dato literal: no se interpreta como expresión regular ni se pasa a Git como patrón, y nunca se construye una línea de shell con ella.
+- La comparación ignora mayúsculas usando plegado Unicode. En rutas, `\` y `/` se consideran equivalentes; en texto de commit, no.
+- Buscar es solo lectura: no modifica `HEAD`, el índice ni el directorio de trabajo.
+- Se muestran la consulta activa, el número de resultados y un estado vacío explícito cuando no hay coincidencias.
+- Cambiar la consulta o la referencia sube una generación interna; cualquier resultado asíncrono anterior se descarta en lugar de mezclarse.
+
+En `Historial` la búsqueda cubre asunto, nombre y correo del autor y prefijo de hash. El prefijo de hash solo se compara cuando la consulta es hexadecimal, para que una palabra corriente no acierte contra un identificador. El recorrido no se limita a la página cargada: se leen páginas sucesivas de la referencia seleccionada, con el mismo OID fijado que usa la paginación normal, hasta acumular un número razonable de resultados o agotar la referencia. `Buscar más` continúa el recorrido desde la última posición leída.
 
 ### 4.4 Stage y unstage
 
@@ -367,11 +406,23 @@ se ejecuta con `git log` sobre el OID de la referencia, sin hacer checkout ni mo
 referencias simbólicas se excluyen del inventario. Las referencias remotas representan el último
 `fetch` disponible localmente.
 
+La selección se conservará al refrescar mientras el commit siga en la referencia consultada. Si ya
+no está disponible, el fallback será dejar la selección vacía y retirar sus detalles; en ese caso no
+se ofrecerá reintento, porque la acción que corresponde es elegir otra fila. El refresco respetará
+la referencia fijada solo mientras exista y tenga nombre: un HEAD desacoplado seguirá a HEAD para
+que los commits nuevos aparezcan, y si la referencia fijada desaparece el historial volverá a HEAD
+sin invalidar el resto del estado del repositorio. La selección
+visual se actualiza antes de leer los detalles; durante la lectura se indicará la carga y, si falla,
+se mostrará el error de esa sesión con una acción de reintento. Las respuestas de selecciones
+anteriores, pestañas cerradas o referencias que hayan cambiado se descartarán. La caché de detalles
+será LRU, acotada y se identificará por el hash del commit; los errores no se cachearán.
+
 ### 4.10 Atajos
 
 | Atajo | Acción |
 |---|---|
 | `Ctrl+O` | Abrir repositorio |
+| `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar pestaña activa |
 | `Ctrl+Tab` | Siguiente repositorio |
 | `Ctrl+Shift+Tab` | Repositorio anterior |
@@ -590,7 +641,7 @@ git rev-parse --abbrev-ref --symbolic-full-name @{upstream}
 
 Los datos que se puedan obtener desde `status --porcelain=v2 --branch` no se consultarán de nuevo innecesariamente. Los nombres de remote y branch se pasan como argumentos separados y nunca se aceptan como opciones: deben validarse y situarse después de `--` cuando el subcomando Git lo soporte.
 
-La cancelación termina el proceso hijo y sus pipes sin cerrar la aplicación. Se establecerá un timeout configurable y razonable para detectar procesos bloqueados, pero una operación remota activa no se considerará fallida solo por tardar varios segundos.
+La cancelación termina el proceso hijo y sus descendientes sin cerrar la aplicación. stdout, stderr y stdin se capturan mediante temporales anónimos para que un descendiente que herede handles no pueda bloquear la finalización del runner. En Windows se usa `taskkill.exe /PID <pid> /T /F`, sin shell y con `CREATE_NO_WINDOW`, con un límite de dos segundos para su propio cleanup. Si `taskkill.exe` no puede completar la operación se registra el fallo y se continúa con el hijo directo: solo se informa error de infraestructura cuando el proceso sigue vivo después de la espera acotada, para no convertir una cancelación normal en un fallo. Se establecerá un timeout configurable y razonable para detectar procesos bloqueados, pero una operación remota activa no se considerará fallida solo por tardar varios segundos.
 
 ### 6.5 Cliente de Cursor CLI
 
@@ -652,10 +703,12 @@ Se persistirá:
 - Tema seleccionado.
 - Ruta configurada de Cursor CLI, si la hubiera.
 - Consentimiento informado para enviar contexto staged a Cursor.
+- Pares `(ssh_url_normalizada, ruta_local)` de clones SSH recientes.
+- Carpeta de clonado por defecto configurable.
 
 No se persistirán:
 
-- Credenciales.
+- Credenciales ni claves SSH.
 - Salida de comandos.
 - Contenido de archivos o contexto enviado a Cursor.
 - Mensajes de commit después de un commit correcto.
@@ -698,6 +751,18 @@ Los errores se mostrarán cerca de la acción que falló y podrán expandirse pa
 - Pull no fast-forward.
 - Cursor CLI no instalado, no autenticado o bloqueado por política.
 - Respuesta inválida o cancelación de Cursor CLI.
+
+Cada error visible se presenta con tres elementos: una explicación breve de qué ocurrió, el
+siguiente paso seguro y el detalle técnico expandible y copiable. La clasificación se apoya en
+señales que Git no traduce (nombres de configuración como `user.email`, rutas como `index.lock`,
+nombres de hook y marcadores como `non-fast-forward`) antes que en frases concretas, para que una
+salida localizada siga reconociéndose. Un error sin clasificar conserva su salida íntegra y no
+recibe una causa atribuida: solo una recomendación genérica de revisar los detalles y reconciliar
+el estado.
+
+El siguiente paso nunca describe una reparación implícita: Git Helper no elimina `index.lock`, no
+modifica `user.name` ni `user.email`, no hace merge, rebase ni stash automático y no usa push
+forzado. Las credenciales embebidas en URLs se ocultan antes de mostrar o copiar los detalles.
 
 No se ocultará stderr ni se mostrará únicamente un mensaje genérico.
 

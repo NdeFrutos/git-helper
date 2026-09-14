@@ -39,10 +39,26 @@ los ejemplos de Zed. No se copió código GPL de Zed.
 ## Límites de procesos
 
 `src/process.rs` es la única abstracción de procesos. No usa una shell, conserva argumentos como
-`OsString`, lee stdout y stderr en paralelo, permite cancelación cooperativa y aplica timeouts. Git
-recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
-`CURSOR_API_TOKEN`. En Windows, todos los procesos hijos se crean con `CREATE_NO_WINDOW` para que
-las operaciones en segundo plano no abran consolas sobre la interfaz gráfica.
+`OsString` y aplica timeouts. stdout, stderr y stdin se redirigen a temporales anónimos: así se
+mantiene la captura independiente de ambos streams sin crear lectores bloqueables cuando un
+descendiente hereda los handles. En Windows, la cancelación y el timeout finalizan el árbol activo
+con `taskkill.exe /PID <pid> /T /F`; el comando auxiliar también se crea con `CREATE_NO_WINDOW`, no
+usa shell y tiene un límite de cleanup de dos segundos. Si `taskkill.exe` falla —lo hace también cuando el hijo
+acaba de terminar por su cuenta— se registra el aviso y se continúa con el hijo directo; el runner
+solo devuelve un error de infraestructura si el proceso sigue vivo tras la espera acotada, de modo
+que la clasificación de cancelación o timeout nunca se pierde por esa carrera. La salida normal del padre no espera a
+descendientes que se hayan desacoplado voluntariamente; los datos capturados se leen sin esperar al
+cierre de sus handles. Git recibe `GIT_TERMINAL_PROMPT=0`; Cursor CLI no hereda `CURSOR_API_KEY` ni
+`CURSOR_API_TOKEN`.
+
+Las pruebas de proceso cubren captura, timeout y cancelación con una jerarquía Windows que hereda
+los handles de salida, además de la salida normal de un padre cuyo descendiente sigue activo. El
+descendiente es el propio binario de pruebas —no un intérprete externo, cuyo arranque decidía en CI
+si la prueba llegaba a comprobar algo—, publica su PID y las pruebas verifican su desaparición con
+`tasklist.exe`; no se usa la ausencia de un archivo como prueba de terminación, porque sería cierta
+antes incluso de que el descendiente pudiera escribirlo. La
+comprobación funcional de Windows debe ejecutarse en build release porque el entorno de desarrollo
+puede no tener Cargo o Windows disponible.
 
 ## Lotes de rutas para stage y unstage
 
@@ -86,6 +102,32 @@ aunque no cambien sus nombres ni el número de archivos; los cambios exclusivame
 invalidan. Las respuestas obsoletas, canceladas o de pestañas cerradas se descartan sin tocar el
 texto actual. La generación solo propone texto: nunca hace stage ni commit.
 
+La solicitud también guarda las preferencias efectivas con las que se construyó el prompt. Si el
+usuario cambia idioma, convención, alcance o longitud mientras se genera, la respuesta se descarta
+con un aviso explícito en lugar de escribir en el borrador un texto que ya no corresponde a lo
+configurado.
+
+## Preferencias del mensaje de commit (AI-02)
+
+`src/domain/commit_preferences.rs` concentra el modelo: valores globales
+(`CommitMessagePreferences`), sobrescrituras por repositorio
+(`CommitMessagePreferenceOverrides`) y su resolución campo a campo
+(`resolve_commit_preferences`), que además devuelve el origen de cada valor para poder mostrar en
+la interfaz qué se hereda y qué es propio del repositorio. La clave de un repositorio es la misma
+`normalized_repo_key` que ya usan los remotes preferidos.
+
+La normalización es la frontera del módulo: una longitud de asunto fuera de `[20, 120]` —heredada
+de un estado antiguo o editada a mano— se acota antes de llegar al prompt, a la plantilla o a la
+comparación que invalida respuestas obsoletas. `commit_preferences_instructions` produce el bloque
+de instrucciones que se inserta en el prompt, de modo que Cursor y los proveedores previstos en
+AI-03 y AI-04 reciban exactamente el mismo texto normalizado sin duplicar reglas por proveedor.
+
+Las convenciones orientan la propuesta y no son una validación: `commit_message_guidance` solo
+devuelve un aviso informativo y la condición que habilita `Commit` depende únicamente del estado
+staged, del borrador y de que no haya otra operación en curso. La plantilla manual sigue la misma
+regla: `plan_commit_template` devuelve `ConfirmReplace` cuando el borrador tiene texto, y la
+interfaz pide confirmación antes de sustituirlo.
+
 ## Watcher y prioridad de refresco
 
 El watcher mantiene una cola acotada de 256 eventos. Una ráfaga se agrupa con un debounce trailing
@@ -106,11 +148,76 @@ filtro y el watcher se reconstruye con las rutas ignoradas actuales, sin ejecuta
 Si notify comunica un error, la UI conserva el estado visible, retira el watcher fallido y deja F5
 como recuperación explícita; un refresh correcto vuelve a instalar la vigilancia.
 
+## Coordinación de refrescos (UX-01)
+
+Cada `RepositorySession` incluye un `RefreshCoordinator` con dos banderas: `in_flight` indica si hay
+una lectura de estado en curso y `dirty` acumula invalidaciones recibidas mientras tanto. Una
+solicitud de refresh solo arranca un proceso Git cuando `request()` devuelve `true`; las peticiones
+concurrentes marcan `dirty` y se encolan sin crear una tarea por evento.
+
+Al terminar un refresh —con éxito, error o cancelación— `finish()` libera `in_flight` y devuelve si
+hace falta como máximo un refresh adicional que consuma lo pendiente. Si llegan eventos durante ese
+segundo refresh, vuelven a marcar `dirty` y el ciclo se repite una vez más. Las lecturas de status
+siguen usando `GIT_OPTIONAL_LOCKS=0` para no reactivar el watcher por cambios en `.git/index`.
+
+Las mutaciones Git (stage, unstage, descarte, commit, fetch, pull, push) y la generación de mensaje
+con Cursor se serializan por repositorio: mientras `mutation_state` está en `Running`, los refreshes
+solicitados marcan `dirty` y se guardan en `pending_refreshes`. Al finalizar la mutación —incluso si
+falla o se cancela— se llama a `refresh_repository` para reconciliar el snapshot con el working tree
+real.
+
+Al cerrar una pestaña se cancelan los tokens activos, se eliminan watchers y se descartan respuestas
+cuya generación ya no coincide con la sesión. Un watcher que termine de instalarse después del cierre
+no se registra ni procesa eventos.
+
+## Selección de detalles del historial
+
+La selección de un commit se trata como una petición versionada por sesión, generación de historial,
+referencia, OID y hash del commit. Al seleccionar otra fila se cancela la petición anterior y se
+notifica inmediatamente el nuevo estado; una respuesta solo puede actualizar la vista si todavía
+coincide con toda esa identidad. Cerrar la pestaña o cambiar de rama invalida y cancela las
+peticiones pendientes.
+
+Los detalles correctos se cachean por hash de commit en una caché LRU sencilla de 64 entradas. La
+caché se conserva al cambiar de rama para que volver a un commit conocido no lance otro proceso
+Git. Los errores no se cachean y permanecen asociados a la selección actual para permitir reintento.
+Al refrescar, la selección se conserva solo si el commit sigue en la referencia; en caso contrario
+el fallback es dejarla vacía y no se ofrece reintento, porque no hay nada que volver a pedir.
+
+El refresco lee el historial de la referencia fijada por la vista, pero esa fijación no puede dejar
+la sesión bloqueada: solo se respetan referencias con nombre —un OID suelto de HEAD desacoplado
+quedaría anclado al commit anterior— y, si la referencia ya no existe, el historial vuelve a HEAD en
+lugar de convertir el refresco completo en un error. El estado del repositorio no depende de que la
+rama que se estaba mirando siga viva.
+
 ## Persistencia
 
-El esquema actual es la versión 1. `state.json` se escribe mediante un archivo temporal sincronizado
-y reemplazo atómico. Un JSON corrupto se mueve a `state.corrupt-<timestamp>.json` y el arranque
-continúa con estado vacío.
+El esquema actual es la versión 5: v2 incorpora los mapeos de clones SSH, v3 los borradores y la
+geometría de ventana, v4 los ajustes de fetch periódico y v5 las preferencias del mensaje de commit
+(globales y por repositorio). Cada paso de `migrate` conoce solo su transición `n → n + 1` y las
+normalizaciones se repiten al final de la escalera, así que un estado ya marcado con la versión
+actual por otra rama también queda acotado. `state.json` se lee una sola vez en background después de crear la ventana,
+para que un almacenamiento lento no bloquee el primer frame. Se escribe mediante un archivo
+temporal sincronizado y reemplazo atómico. Un JSON corrupto se mueve a
+`state.corrupt-<timestamp>.json` y el arranque continúa con estado vacío.
+
+## Working tree e historial desacoplados (PERF-03)
+
+Cada `RepositorySession` separa `working_tree` (`Arc<WorkingTreeSnapshot>`) e `history`
+(`Arc<HistorySnapshot>`). Un refresh de lectura solo compara y sustituye el working tree; el
+historial paginado permanece intacto salvo invalidación explícita (cambio de `HEAD`/upstream,
+selección de otra rama o carga diferida). Los commits se almacenan en `Arc<Vec<CommitSummary>>`
+para que `render_history` y la paginación no clonen miles de filas en cada frame.
+
+Los contadores de la pestaña Cambios (`change_count`, `staged_count`) se derivan una vez al
+actualizar el working tree. Los detalles de commit se cachean por repositorio con un límite fijo
+(32 entradas, LRU) para evitar clonados profundos al alternar selección.
+
+La medición manual ignorada en la prueba unitaria
+(`finish_refresh_comparison_cost_is_bounded_with_large_history`) conserva el umbral de referencia:
+con 10 000 commits cargados, `finish_refresh` tras un cambio del working tree completa en menos de
+50 ms porque ya no recorre ni compara la lista de commits. La garantía de regresión que se ejecuta
+en CI es determinista y comprueba que los `Arc` del historial permanecen intactos.
 
 ## Estados de interacción por repositorio
 
@@ -121,3 +228,52 @@ el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión c
 último `status_message` y el error accionable; los errores globales quedan reservados para fallos
 de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
 un estado distinto de un fallo para que la UI no la presente como error.
+
+## Clasificación de errores y próximos pasos (UX-13)
+
+Todo fallo de un comando Git pasa por `classify_command_failure`, de modo que una lectura, una
+mutación y una operación remota obtienen el mismo error tipado. `classify_remote_failure` es un
+alias conservado para el clonado. La clasificación busca primero señales que Git no traduce
+—`index.lock`, `user.email`, nombres de hook, `--set-upstream`, `non-fast-forward`, `pull.rebase`—
+y solo después frases conocidas en inglés y español, para que una instalación localizada no
+degrade el diagnóstico.
+
+`GitError::user_message` da la explicación breve, `GitError::technical_details` el detalle
+depurado y `GitError::recommended_action` el siguiente paso seguro. `recommended_action` devuelve
+`None` cuando el error no está clasificado: la UI muestra entonces una recomendación genérica de
+revisar los detalles y reconciliar el estado, sin atribuir una causa. `CursorError` expone la
+misma terna para los fallos del proveedor de IA, que además distinguen sesión o permisos por
+códigos (`401`, `403`) en lugar de por el texto del mensaje.
+
+Las recomendaciones describen acciones que ejecuta la persona usuaria, nunca reparaciones
+implícitas de la aplicación: no se borra `index.lock`, no se toca la identidad de Git, no se hace
+merge, rebase ni stash automático y no se usa push forzado. `redact_credentials` oculta
+`usuario:secreto@host` en cualquier detalle antes de mostrarlo o copiarlo, y conserva un
+`git@host` de SSH porque no es un secreto y ayuda al diagnóstico.
+
+Git no marca de ninguna forma propia el fallo de un hook local: solo reenvía su salida. Un hook
+que no se identifica deja el error sin clasificar, con su salida completa, en lugar de recibir una
+causa que no consta.
+
+`RefreshState::Failed`, `MutationState::Failed` y el error de sesión llevan el siguiente paso
+junto al detalle; `RepositorySession::set_error` es el único punto de escritura para que una
+recomendación no sobreviva al fallo que la originó.
+
+## Canal de instancia única
+
+`ghelper` y `git-helper.exe` se comunican por un socket TCP en `127.0.0.1` con puerto **efímero**:
+el servidor enlaza el puerto 0 y publica `{version, port, token}` en
+`%LOCALAPPDATA%\GitHelper\instance-endpoint.json`, privado por usuario (en Unix se escribe con
+permisos `0600` fijados en la propia creación, para que el token nunca exista en disco con un
+modo más laxo). Así cada sesión de Windows tiene su propia instancia y ningún programa ajeno
+puede ocupar un puerto fijo y secuestrar el arranque.
+
+Cada solicitud viaja en una trama `GHLP` + versión + token + longitud (`u32`) + payload UTF-8. El
+servidor rechaza marcas o versiones desconocidas, compara el token en tiempo constante y limita el
+payload a 4 KiB antes de reservar memoria. Tras aceptar, revalida la ruta recibida con
+`git rev-parse --show-toplevel` —la validación del proceso `ghelper` no es suficiente, porque el
+receptor no controla quién escribe en el socket— y solo entonces entrega la solicitud a la UI.
+
+El cliente únicamente da el reenvío por bueno si recibe el ACK del protocolo; si no hay endpoint
+publicado, la conexión falla o la confirmación no llega, abre su propia ventana en lugar de
+terminar en silencio.

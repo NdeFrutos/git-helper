@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -6,48 +7,185 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, FocusHandle, IntoElement, PathPromptOptions,
-    PromptButton, PromptLevel, Render, ScrollStrategy, Subscription, UniformListScrollHandle,
-    Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, IntoElement,
+    MouseButton, MouseDownEvent, PathPromptOptions, PromptButton, PromptLevel, Render,
+    ScrollStrategy, Subscription, UniformListScrollHandle, Window, div, prelude::*, px, rgba, size,
+    uniform_list,
 };
 
 use crate::{
     actions::{
-        ClearChangeSelection, CloseActiveRepository, CreateCommit, ExtendSelectionToNextChange,
-        ExtendSelectionToPreviousChange, FocusNextChange, FocusPreviousChange,
-        GenerateCommitMessage, NextRepository, OpenRepository, PreviousRepository,
-        RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory, StageSelection,
-        ToggleFocusedChange, UnstageSelection,
+        ClearChangeSelection, CloneRepository, CloseActiveRepository, CreateCommit,
+        ExtendSelectionToNextChange, ExtendSelectionToPreviousChange, FindInView, FocusNextChange,
+        FocusPreviousChange, GenerateCommitMessage, NextRepository, OpenRepository,
+        PreviousRepository, RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory,
+        StageSelection, ToggleFocusedChange, UnstageSelection,
     },
+    app::AppStartup,
+    cli::{InstanceRequest, InstanceRequestReceiver},
     cursor::{
         CommitMessageRequest, CursorClient, GenerationApplyDecision, build_cursor_context,
         resolve_cursor_executable, validate_generation_result,
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, ChangeRepresentation,
-        ChangeSelection, ChangeSelectionState, CommitDetails, FileChange, HeadState, MutationState,
-        OperationKind, RefreshState, RepositoryId, RepositorySession, RepositorySnapshot,
-        RepositoryView,
+        ChangeSelection, ChangeSelectionState, Clock, CommitDetails, CommitMessagePreferences,
+        CommitPreferenceField, CommitSummary, EffectiveCommitPreferences, FetchOrigin, FileChange,
+        HeadState, HistoryPage, HistorySnapshot, MutationState, OperationKind, PreferenceScope,
+        RefreshState, RemoteOperationPlan, RepositoryId, RepositorySession, RepositoryView,
+        SearchQuery, SshCloneMapping, SystemClock, TemplateApplication, WorkingTreeSnapshot,
+        change_matches, commit_matches, commit_message_guidance, cycle_commit_preference,
+        effective_commit_preferences, format_periodic_fetch_interval_label,
+        next_periodic_fetch_interval, normalized_repo_key, periodic_fetch_poll_interval,
+        plan_commit_template, primary_remote_label, select_periodic_fetch,
     },
-    git::{DiscardPlan, GitClient, GitError, plan_discard, plan_fetch, plan_pull, plan_push},
-    persistence::{AppStateStore, PersistedAppState},
+    git::{
+        CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
+        default_clone_destination, default_clone_root, parse_ssh_url, plan_clone_destination,
+        plan_discard, plan_fetch, plan_pull, plan_push,
+    },
+    persistence::{
+        AppStateStore, DisplayBounds, PersistedAppState, StateWriter, WindowPlacement,
+        validate_window_placement,
+    },
     process::CancellationToken,
     watcher::RepositoryWatcher,
 };
 
 use super::{
-    commit_input::{CommitInput, CommitMessageChanged},
+    commit_input::{CommitInput, CommitInputDismissed, CommitMessageChanged, InputAppearance},
+    history_selection::{
+        BeginDetailsSelection, DetailsCompletion, HistoryDetailsController, HistoryDetailsKey,
+    },
     theme::{
         ACCENT_COLOR, BACKGROUND_COLOR, BORDER_COLOR, ELEVATED_BACKGROUND_COLOR, ERROR_COLOR,
-        HOVER_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR, SELECTED_BACKGROUND_COLOR,
-        SUCCESS_COLOR, WARNING_COLOR,
+        HOVER_BACKGROUND_COLOR, INPUT_BACKGROUND_COLOR, MUTED_TEXT_COLOR, PRIMARY_TEXT_COLOR,
+        SELECTED_BACKGROUND_COLOR, SUCCESS_COLOR, WARNING_COLOR,
     },
 };
 
 const INITIAL_HISTORY_LIMIT: usize = 200;
 const SAVE_DEBOUNCE_DURATION: Duration = Duration::from_secs(1);
-const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 40;
-const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 40;
+const CHANGE_GROUP_ROW_HEIGHT_PX: u16 = 56;
+const CHANGE_FILE_ROW_HEIGHT_PX: u16 = 56;
+/// Commits leídos de Git en cada página del recorrido de búsqueda.
+const HISTORY_SEARCH_PAGE: usize = 500;
+/// Resultados acumulados antes de parar y ofrecer «Buscar más».
+///
+/// Sin este tope una consulta muy común recorrería la referencia entera antes
+/// de enseñar nada; el usuario ya puede trabajar con los primeros resultados.
+const HISTORY_SEARCH_MATCH_TARGET: usize = 100;
+/// Espera tras teclear antes de lanzar Git, para no encadenar procesos.
+const HISTORY_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Vista sobre la que actúa una caja de búsqueda.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SearchScope {
+    Changes,
+    History,
+}
+
+/// Caja de búsqueda de una vista: campo de texto y consulta ya aplicada.
+struct SearchBox {
+    input: Entity<CommitInput>,
+    /// Consulta sin espacios sobrantes; vacía significa búsqueda inactiva.
+    query: String,
+    /// Mantiene vivas las suscripciones de texto y de Escape.
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Recorrido paginado de la referencia seleccionada para una consulta.
+///
+/// La coincidencia se evalúa en Rust sobre los commits ya leídos: la consulta
+/// nunca llega a Git como patrón, así que no hay expresiones regulares
+/// implícitas ni argumentos construidos con texto del usuario.
+#[derive(Default)]
+struct HistorySearch {
+    /// Consulta aplicada; vacía significa búsqueda inactiva.
+    query: String,
+    /// Se incrementa al cambiar la consulta o la referencia seleccionada.
+    generation: u64,
+    /// Referencia y OID sobre los que se pagina, fijados al iniciar.
+    reference: Option<String>,
+    oid: Option<String>,
+    matches: Vec<CommitSummary>,
+    /// Commits ya recorridos de la referencia.
+    scanned: usize,
+    /// La referencia se recorrió por completo.
+    exhausted: bool,
+    scanning: bool,
+    error: Option<String>,
+}
+
+/// Resultado de aplicar una página leída al recorrido de búsqueda.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistorySearchPage {
+    /// La página pertenece al recorrido vigente y se acumuló.
+    Applied,
+    /// Venía de otra consulta, otra referencia u otra posición: se descarta.
+    Stale,
+}
+
+impl HistorySearch {
+    /// Indica si el recorrido puede continuar sin intervención del usuario.
+    const fn can_continue(&self) -> bool {
+        !self.exhausted && self.error.is_none()
+    }
+
+    /// Acumula las coincidencias de una página si sigue siendo pertinente.
+    ///
+    /// Comprobar generación, referencia, OID y posición evita mezclar
+    /// resultados de una consulta o una rama que el usuario ya abandonó.
+    fn apply_page(
+        &mut self,
+        generation: u64,
+        offset: usize,
+        query: &SearchQuery,
+        page: HistoryPage,
+    ) -> HistorySearchPage {
+        if self.generation != generation
+            || self.reference.as_deref() != Some(page.reference.as_str())
+            || self.oid.as_deref() != Some(page.oid.as_str())
+            || self.scanned != offset
+        {
+            return HistorySearchPage::Stale;
+        }
+        let read = page.commits.len();
+        self.scanned = offset.saturating_add(read);
+        // Git devuelve menos commits de los pedidos solo al agotar la referencia.
+        self.exhausted = read < HISTORY_SEARCH_PAGE;
+        self.matches.extend(
+            page.commits
+                .into_iter()
+                .map(|commit| commit.summary)
+                .filter(|commit| commit_matches(commit, query)),
+        );
+        HistorySearchPage::Applied
+    }
+}
+
+/// Próximos pasos que no proceden de un error tipado de Git o del proveedor de
+/// IA, sino de una condición que la propia aplicación detecta.
+const PATH_UNAVAILABLE_NEXT_STEP: &str = "Comprueba que la unidad o la carpeta siguen disponibles y pulsa Actualizar; si el repositorio ya no existe, cierra la pestaña.";
+const BUSY_NEXT_STEP: &str = "Espera a que termine la operación en curso y repite la acción; no se ha tocado el repositorio.";
+const STALE_REFERENCE_NEXT_STEP: &str =
+    "Pulsa Actualizar para releer las ramas y vuelve a elegir la que quieras consultar.";
+/// Recomendaciones genéricas para fallos sin causa reconocida: solo describen
+/// lo que la aplicación puede garantizar, sin atribuir un motivo.
+const GENERIC_REFRESH_NEXT_STEP: &str = "Revisa los detalles técnicos y pulsa Actualizar para reintentar; el estado visible puede estar obsoleto.";
+const GENERIC_MUTATION_NEXT_STEP: &str =
+    "Revisa los detalles técnicos y pulsa Actualizar para ver el estado real antes de reintentar.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryContentState {
+    Loading,
+    Refreshing,
+    RefreshFailed,
+    Stale,
+    NoInitialCommit,
+    Clean,
+    Changes,
+}
 
 #[derive(Clone)]
 enum ChangeListRow {
@@ -133,32 +271,89 @@ enum RefreshContinuation {
 struct PreparedRefresh {
     generation: u64,
     include_history: bool,
+    history_target: Option<(String, String)>,
     root_path: PathBuf,
     cancellation: CancellationToken,
 }
 
+enum RefreshPayload {
+    WorkingTree(WorkingTreeSnapshot),
+    WithHistory {
+        working_tree: WorkingTreeSnapshot,
+        history: HistorySnapshot,
+    },
+}
+
 enum GenerationPreparationError {
     StagedChanged,
-    Message(String),
+    Message {
+        failure: GenerationFailure,
+        timed_out: bool,
+    },
+}
+
+/// Fallo de generación tal y como se mostrará: explicación breve y, cuando la
+/// causa está clasificada, la siguiente acción segura.
+#[derive(Clone, Debug)]
+struct GenerationFailure {
+    message: String,
+    next_step: Option<String>,
+}
+
+impl GenerationFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            next_step: None,
+        }
+    }
+
+    fn guided(message: impl Into<String>, next_step: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            next_step,
+        }
+    }
 }
 
 struct GenerationCompletion {
     request: CommitMessageRequest,
     expected_index_identity: Option<Vec<u8>>,
-    result: Result<String, String>,
-    current_index_identity: Option<Result<Vec<u8>, String>>,
+    result: Result<String, GenerationFailure>,
+    current_index_identity: Option<Result<Vec<u8>, GenerationFailure>>,
     was_cancelled: bool,
+    /// Clasificado desde el error tipado antes de convertirlo en texto.
+    timed_out: bool,
     staged_changed: bool,
+}
+
+/// Metadatos de un fetch en curso para actualizar frescura remota al terminar.
+#[derive(Clone, Debug)]
+struct FetchContext {
+    remote_name: String,
+    origin: FetchOrigin,
+    suppress_error_banner: bool,
+}
+
+/// Almacén localizado durante el arranque; su contenido se lee después en background.
+pub struct StartupState {
+    pub store: AppStateStore,
 }
 
 /// Modelo y presentación de la ventana principal.
 pub struct MainWindow {
+    /// Almacén que `initialize` leerá una sola vez en background.
+    startup_store: Option<AppStateStore>,
     state: AppState,
     git_client: GitClient,
     cursor_client: CursorClient,
-    state_store: Option<AppStateStore>,
+    state_writer: Option<StateWriter>,
+    window_placement: Option<WindowPlacement>,
     commit_inputs: HashMap<RepositoryId, Entity<CommitInput>>,
     selected_commit_details: HashMap<RepositoryId, CommitDetails>,
+    history_details: HistoryDetailsController,
+    history_detail_errors: HashMap<RepositoryId, String>,
+    history_detail_cancellations: HashMap<RepositoryId, (u64, CancellationToken)>,
     commit_input_subscriptions: HashMap<RepositoryId, Subscription>,
     window_subscriptions: Vec<Subscription>,
     active_refresh_cancellations: HashMap<RepositoryId, CancellationToken>,
@@ -169,6 +364,7 @@ pub struct MainWindow {
     pending_refreshes: HashSet<RepositoryId>,
     global_refresh_in_flight: Option<RepositoryId>,
     collapsed_groups: HashSet<(RepositoryId, ChangeRepresentation)>,
+    expanded_errors: HashSet<RepositoryId>,
     change_rows: HashMap<RepositoryId, ChangeRowCache>,
     /// Se crea en el primer render porque las pruebas construyen la ventana
     /// sin una aplicación GPUI viva.
@@ -177,9 +373,28 @@ pub struct MainWindow {
     /// repositorio a la lista —de otra longitud— del siguiente.
     change_list_scrolls: HashMap<RepositoryId, UniformListScrollHandle>,
     save_generation: u64,
+    /// Cajas de búsqueda por repositorio y vista; cada pestaña busca aparte.
+    search_boxes: HashMap<(RepositoryId, SearchScope), SearchBox>,
+    /// Estado del recorrido paginado del historial por repositorio.
+    history_searches: HashMap<RepositoryId, HistorySearch>,
+    /// Cancelación del recorrido de historial en vuelo.
+    history_search_cancellations: HashMap<RepositoryId, CancellationToken>,
     git_version: Option<String>,
     global_status_message: String,
     global_error: Option<String>,
+    clone_panel_visible: bool,
+    clone_url_input: Option<Entity<CommitInput>>,
+    clone_in_progress: bool,
+    active_clone_cancellation: Option<CancellationToken>,
+    pending_existing_clone_open: Option<(String, PathBuf)>,
+    pending_startup_repository: Option<PathBuf>,
+    instance_request_receiver: Option<InstanceRequestReceiver>,
+    periodic_fetch_generation: u64,
+    periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
+    active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
+    pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    /// Capa que editan los controles de preferencias; no se persiste.
+    commit_preference_scope: PreferenceScope,
 }
 
 #[allow(
@@ -189,18 +404,28 @@ pub struct MainWindow {
     reason = "La entidad GPUI conserva métodos listener y render cohesionados; los mensajes cortos priorizan legibilidad"
 )]
 impl MainWindow {
-    /// Restaura sesiones persistidas sin bloquear la creación de la ventana.
+    /// Crea la ventana sin leer estado persistido en el hilo de UI.
     #[must_use]
-    pub fn new(_cx: &mut Context<Self>) -> Self {
-        let state_store = AppStateStore::default_location().ok();
+    pub fn new(
+        persisted_startup: Option<StartupState>,
+        startup: AppStartup,
+        instance_request_receiver: InstanceRequestReceiver,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let startup_store = persisted_startup.map(|startup| startup.store);
         let state = AppState::default();
         Self {
+            startup_store,
             state,
             git_client: GitClient::default(),
             cursor_client: CursorClient::new(PathBuf::from("agent")),
-            state_store,
+            state_writer: None,
+            window_placement: None,
             commit_inputs: HashMap::new(),
             selected_commit_details: HashMap::new(),
+            history_details: HistoryDetailsController::default(),
+            history_detail_errors: HashMap::new(),
+            history_detail_cancellations: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -211,37 +436,116 @@ impl MainWindow {
             pending_refreshes: HashSet::new(),
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
+            expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
             change_list_focus: None,
             change_list_scrolls: HashMap::new(),
             save_generation: 0,
+            search_boxes: HashMap::new(),
+            history_searches: HashMap::new(),
+            history_search_cancellations: HashMap::new(),
             git_version: None,
             global_status_message: "Preparando Git Helper…".to_owned(),
             global_error: None,
+            clone_panel_visible: false,
+            clone_url_input: Some(cx.new(CommitInput::new)),
+            clone_in_progress: false,
+            active_clone_cancellation: None,
+            pending_existing_clone_open: None,
+            pending_startup_repository: startup.open_repository,
+            instance_request_receiver: Some(instance_request_receiver),
+            periodic_fetch_generation: 0,
+            periodic_fetch_in_flight: HashSet::new(),
+            active_fetch_contexts: HashMap::new(),
+            pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
     }
 
     /// Detecta Git y refresca todas las pestañas restauradas en background.
     pub fn initialize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_placement = Some(capture_window_placement(window));
+        if let Some(instance_request_receiver) = self.instance_request_receiver.clone() {
+            cx.spawn(async move |this, cx| {
+                while let Ok(request) = instance_request_receiver.recv().await {
+                    this.update(cx, |this, cx| {
+                        this.handle_instance_request(request, cx);
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() {
+            if window.is_window_active() {
+                let Some(repository_id) = this.state.active_repository_id else {
+                    return;
+                };
+                this.force_refresh_repository(repository_id, cx);
                 return;
             }
-            let Some(repository_id) = this.state.active_repository_id else {
-                return;
-            };
-            this.force_refresh_repository(repository_id, cx);
+            this.save_state(cx);
         });
         self.window_subscriptions.push(activation_subscription);
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_placement = Some(capture_window_placement(window));
+            this.save_state(cx);
+        });
+        self.window_subscriptions.push(bounds_subscription);
+        let entity = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            entity
+                .update(cx, |this, cx| {
+                    this.window_placement = Some(capture_window_placement(window));
+                    if let Err(error) = this.flush_state(cx) {
+                        this.global_error =
+                            Some(format!("No se pudo guardar el estado al cerrar: {error}"));
+                    }
+                })
+                .ok();
+            true
+        });
 
-        if let Some(state_store) = self.state_store.clone() {
+        if let Some(store) = self.startup_store.take() {
             cx.spawn(async move |this, cx| {
-                let loaded = cx
+                let (store, loaded) = cx
                     .background_spawn(async move {
-                        let mut state = state_store.load()?.state.into_app_state();
-                        state
-                            .repositories
-                            .retain(|repository| repository.root_path.is_dir());
+                        let loaded = store.load();
+                        (store, loaded)
+                    })
+                    .await;
+                let loaded = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            this.state_writer = Some(StateWriter::new(store));
+                            this.global_error =
+                                Some(format!("No se pudo restaurar el estado: {error}"));
+                            this.apply_pending_startup_repository(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+                let corruption_backup = loaded.corruption_backup;
+                let restored_placement = loaded.state.window_placement;
+                let persisted = loaded.state;
+                let (mut loaded_state, commit_drafts, cursor_executable) = cx
+                    .background_spawn(async move {
+                        let (mut state, commit_drafts) = persisted.into_app_state();
+                        for repository in &mut state.repositories {
+                            repository.path_accessible = repository.root_path.is_dir();
+                            if !repository.path_accessible {
+                                repository.status_message =
+                                    "Repositorio no disponible; comprueba la ruta o el disco"
+                                        .to_owned();
+                                repository.set_error(
+                                    "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                                    Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
+                                );
+                            }
+                        }
                         if state.active_repository_id.is_some_and(|active_id| {
                             !state
                                 .repositories
@@ -253,53 +557,82 @@ impl MainWindow {
                         }
                         let cursor_executable =
                             resolve_cursor_executable(state.settings.cursor_cli_path.clone());
-                        Ok::<_, crate::persistence::PersistenceError>((state, cursor_executable))
+                        (state, commit_drafts, cursor_executable)
                     })
                     .await;
-                this.update(cx, |this, cx| match loaded {
-                    Ok((mut loaded_state, cursor_executable)) => {
-                        let current_active = this.state.active_repository_id;
-                        loaded_state.repositories.retain(|loaded_repository| {
-                            !this.state.repositories.iter().any(|current_repository| {
-                                normalized_path_key(&current_repository.root_path)
-                                    == normalized_path_key(&loaded_repository.root_path)
-                            })
-                        });
-                        let restored_ids = loaded_state
-                            .repositories
+                this.update_in(cx, |this, window, cx| {
+                    this.state_writer = Some(StateWriter::new(store));
+                    if let Some(placement) = restored_placement {
+                        let displays = cx
+                            .displays()
                             .iter()
-                            .map(|repository| repository.id)
+                            .map(|display| {
+                                let bounds = display.visible_bounds();
+                                DisplayBounds {
+                                    x: f32::from(bounds.origin.x),
+                                    y: f32::from(bounds.origin.y),
+                                    width: f32::from(bounds.size.width),
+                                    height: f32::from(bounds.size.height),
+                                }
+                            })
                             .collect::<Vec<_>>();
-                        this.state
-                            .repositories
-                            .append(&mut loaded_state.repositories);
-                        if current_active.is_none() {
-                            this.state.active_repository_id = loaded_state.active_repository_id;
-                        }
-                        this.state.recent_repositories = loaded_state.recent_repositories;
-                        this.state.settings = loaded_state.settings;
-                        this.cursor_client = CursorClient::new(cursor_executable);
-                        for repository_id in restored_ids {
-                            this.create_commit_input(repository_id, cx);
+                        let placement = validate_window_placement(placement, &displays);
+                        window.resize(size(px(placement.width), px(placement.height)));
+                        this.window_placement = Some(placement);
+                    }
+                    let current_active = this.state.active_repository_id;
+                    loaded_state.repositories.retain(|loaded_repository| {
+                        !this.state.repositories.iter().any(|current_repository| {
+                            normalized_path_key(&current_repository.root_path)
+                                == normalized_path_key(&loaded_repository.root_path)
+                        })
+                    });
+                    let restored = loaded_state
+                        .repositories
+                        .iter()
+                        .map(|repository| (repository.id, repository.path_accessible))
+                        .collect::<Vec<_>>();
+                    this.state
+                        .repositories
+                        .append(&mut loaded_state.repositories);
+                    if current_active.is_none() {
+                        this.state.active_repository_id = loaded_state.active_repository_id;
+                    }
+                    this.state.recent_repositories = loaded_state.recent_repositories;
+                    this.state.ssh_clone_mappings = loaded_state
+                        .ssh_clone_mappings
+                        .into_iter()
+                        .filter(|mapping| mapping.local_path.is_dir())
+                        .collect();
+                    this.state.settings = loaded_state.settings;
+                    this.cursor_client = CursorClient::new(cursor_executable);
+                    for (repository_id, path_accessible) in restored {
+                        let draft = commit_drafts.get(&repository_id).cloned();
+                        this.create_commit_input(repository_id, draft, cx);
+                        if path_accessible {
                             if this.state.active_repository_id == Some(repository_id) {
                                 this.refresh_repository(repository_id, cx);
                             } else {
                                 this.pending_refreshes.insert(repository_id);
                             }
                         }
-                        this.save_state(cx);
-                        this.global_status_message = "Sesión restaurada".to_owned();
-                        cx.notify();
                     }
-                    Err(error) => {
-                        this.global_error =
-                            Some(format!("No se pudo restaurar el estado: {error}"));
-                        cx.notify();
+                    this.save_state(cx);
+                    this.apply_pending_startup_repository(cx);
+                    this.global_status_message = "Sesión restaurada".to_owned();
+                    if let Some(backup_path) = corruption_backup {
+                        this.global_error = Some(format!(
+                            "El estado guardado estaba dañado; se empezó de cero y se conservó una copia en {}",
+                            backup_path.display()
+                        ));
                     }
+                    cx.notify();
                 })
                 .ok();
             })
             .detach();
+        } else {
+            self.apply_pending_startup_repository(cx);
         }
 
         let git_client = self.git_client.clone();
@@ -327,7 +660,312 @@ impl MainWindow {
             .ok();
         })
         .detach();
+
+        self.open_perf_repository_hook(cx);
+        self.start_periodic_fetch_loop(cx);
     }
+
+    fn start_periodic_fetch_loop(&mut self, cx: &mut Context<Self>) {
+        self.periodic_fetch_generation = self.periodic_fetch_generation.saturating_add(1);
+        let generation = self.periodic_fetch_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let timer = cx
+                    .background_executor()
+                    .timer(periodic_fetch_poll_interval());
+                timer.await;
+                let should_continue = this
+                    .update(cx, |this, cx| {
+                        if this.periodic_fetch_generation != generation {
+                            return false;
+                        }
+                        this.tick_periodic_fetch(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tick_periodic_fetch(&mut self, cx: &mut Context<Self>) {
+        let now_secs = SystemClock.now_secs();
+        let Some(candidate) = select_periodic_fetch(
+            now_secs,
+            self.state.active_repository_id,
+            &self.state.repositories,
+            self.state.settings.periodic_fetch_enabled,
+            self.state.settings.periodic_fetch_interval_secs,
+            &self.state.settings.repository_preferred_remotes,
+            &self.periodic_fetch_in_flight,
+        ) else {
+            return;
+        };
+        self.execute_fetch(
+            candidate.repository_id,
+            candidate.remote_name,
+            FetchOrigin::Periodic,
+            true,
+            cx,
+        );
+    }
+
+    fn toggle_periodic_fetch(&mut self, cx: &mut Context<Self>) {
+        self.state.settings.periodic_fetch_enabled = !self.state.settings.periodic_fetch_enabled;
+        if self.state.settings.periodic_fetch_enabled {
+            let now_secs = SystemClock.now_secs();
+            for repository in &mut self.state.repositories {
+                repository.remote_freshness.schedule_immediately(now_secs);
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn cycle_periodic_fetch_interval(&mut self, cx: &mut Context<Self>) {
+        self.state.settings.periodic_fetch_interval_secs =
+            next_periodic_fetch_interval(self.state.settings.periodic_fetch_interval_secs);
+        if self.state.settings.periodic_fetch_enabled {
+            let now_secs = SystemClock.now_secs();
+            for repository in &mut self.state.repositories {
+                repository.remote_freshness.schedule_immediately(now_secs);
+            }
+        }
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Clave persistente de las sobrescrituras de un repositorio abierto.
+    fn commit_preference_key(&self, repository_id: RepositoryId) -> Option<String> {
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| normalized_repo_key(&repository.root_path))
+    }
+
+    /// Preferencias efectivas del repositorio: global salvo sobrescritura propia.
+    fn commit_preferences(&self, repository_id: RepositoryId) -> EffectiveCommitPreferences {
+        effective_commit_preferences(
+            self.state.settings.commit_message_preferences,
+            &self.state.settings.repository_commit_message_preferences,
+            self.commit_preference_key(repository_id)
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn set_repository_status(&mut self, repository_id: RepositoryId, message: impl Into<String>) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.into();
+        }
+    }
+
+    /// Alterna entre editar el valor global y el del repositorio activo.
+    fn toggle_commit_preference_scope(&mut self, cx: &mut Context<Self>) {
+        self.commit_preference_scope = self.commit_preference_scope.toggled();
+        cx.notify();
+    }
+
+    /// Avanza una preferencia en la capa seleccionada y persiste el resultado.
+    fn cycle_commit_preference_field(
+        &mut self,
+        repository_id: RepositoryId,
+        field: CommitPreferenceField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        let scope = self.commit_preference_scope;
+        let mut global = self.state.settings.commit_message_preferences;
+        let mut overrides = self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .get(&repository_key)
+            .copied()
+            .unwrap_or_default();
+        cycle_commit_preference(field, scope, &mut global, &mut overrides);
+        self.state.settings.commit_message_preferences = global;
+        if overrides.is_empty() {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        } else {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .insert(repository_key, overrides);
+        }
+        let message = match scope {
+            PreferenceScope::Global
+                if self
+                    .commit_preferences(repository_id)
+                    .has_repository_overrides() =>
+            {
+                "Preferencia global actualizada; este repositorio conserva sus propios ajustes"
+            }
+            PreferenceScope::Global => "Preferencias globales del mensaje actualizadas",
+            PreferenceScope::Repository => {
+                "Preferencias del mensaje guardadas para este repositorio"
+            }
+        };
+        self.set_repository_status(repository_id, message);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Devuelve el repositorio a la herencia de las preferencias globales.
+    fn clear_repository_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        if self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .remove(&repository_key)
+            .is_none()
+        {
+            return;
+        }
+        self.set_repository_status(
+            repository_id,
+            "Este repositorio vuelve a usar las preferencias globales",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Restaura los valores predeterminados globales y quita la sobrescritura activa.
+    fn restore_default_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.settings.commit_message_preferences = CommitMessagePreferences::default();
+        if let Some(repository_key) = self.commit_preference_key(repository_id) {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        }
+        self.set_repository_status(
+            repository_id,
+            "Preferencias del mensaje restauradas a los valores predeterminados",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Escribe la plantilla manual; un borrador con texto exige confirmación.
+    fn insert_commit_template(
+        &mut self,
+        repository_id: RepositoryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.commit_inputs.get(&repository_id).cloned() else {
+            return;
+        };
+        let preferences = self.commit_preferences(repository_id).values();
+        let draft = input.read(cx).content().to_owned();
+        match plan_commit_template(&draft, preferences) {
+            TemplateApplication::Apply(template) => {
+                input.update(cx, |input, cx| input.set_content(template, cx));
+                self.set_repository_status(
+                    repository_id,
+                    "Plantilla insertada; edítala antes del commit",
+                );
+                cx.notify();
+            }
+            TemplateApplication::ConfirmReplace(template) => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let confirmation = cx.prompt(
+                        PromptLevel::Warning,
+                        "Sustituir el borrador por la plantilla",
+                        Some("El mensaje escrito se perderá."),
+                        &["Sustituir", "Cancelar"],
+                    );
+                    if !matches!(confirmation.await, Ok(0)) {
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        let Some(input) = this.commit_inputs.get(&repository_id).cloned() else {
+                            return;
+                        };
+                        input.update(cx, |input, cx| input.set_content(template, cx));
+                        this.set_repository_status(
+                            repository_id,
+                            "Plantilla insertada; edítala antes del commit",
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn remember_preferred_remote(
+        &mut self,
+        repository_root: &Path,
+        remote_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.state
+            .settings
+            .repository_preferred_remotes
+            .insert(normalized_repo_key(repository_root), remote_name.to_owned());
+        self.save_state(cx);
+    }
+
+    /// Abre automáticamente el repositorio indicado en `GH_PERF_OPEN_REPO`.
+    ///
+    /// Solo existe en binarios construidos con la feature `perf-hooks`, para que
+    /// la variable de entorno no pueda alterar el arranque del binario publicado.
+    #[cfg(feature = "perf-hooks")]
+    fn open_perf_repository_hook(&mut self, cx: &mut Context<Self>) {
+        let Some(perf_repository) = std::env::var_os("GH_PERF_OPEN_REPO") else {
+            return;
+        };
+        let repository_path = PathBuf::from(perf_repository);
+        let git_client = self.git_client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.discover_repository(&repository_path, &CancellationToken::default())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Ok(root_path) = result {
+                    // El gancho abre siempre una ruta local del fixture: no hay URL SSH.
+                    this.finish_open_repository(root_path, None, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    #[cfg(not(feature = "perf-hooks"))]
+    fn open_perf_repository_hook(&mut self, _cx: &mut Context<Self>) {}
 
     fn active_repository(&self) -> Option<&RepositorySession> {
         let active_id = self.state.active_repository_id?;
@@ -345,9 +983,18 @@ impl MainWindow {
             .find(|repository| repository.id == active_id)
     }
 
-    fn create_commit_input(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+    fn create_commit_input(
+        &mut self,
+        repository_id: RepositoryId,
+        draft: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let input = cx.new(CommitInput::new);
-        let subscription = cx.subscribe(&input, |_this, _input, _: &CommitMessageChanged, cx| {
+        if let Some(draft) = draft {
+            input.update(cx, |input, cx| input.set_content(draft, cx));
+        }
+        let subscription = cx.subscribe(&input, |this, _input, _: &CommitMessageChanged, cx| {
+            this.save_state(cx);
             cx.notify();
         });
         self.commit_inputs.insert(repository_id, input);
@@ -355,30 +1002,115 @@ impl MainWindow {
             .insert(repository_id, subscription);
     }
 
+    fn commit_drafts(&self, cx: &App) -> HashMap<RepositoryId, String> {
+        self.commit_inputs
+            .iter()
+            .map(|(repository_id, input)| (*repository_id, input.read(cx).content().to_owned()))
+            .collect()
+    }
+
+    fn build_persisted_state(&self, cx: &App) -> PersistedAppState {
+        PersistedAppState::from_app_state(
+            &self.state,
+            &self.commit_drafts(cx),
+            self.window_placement,
+        )
+    }
+
     fn save_state(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.state_store.clone() else {
+        let Some(writer) = self.state_writer.clone() else {
             return;
         };
-        self.save_generation = self.save_generation.saturating_add(1);
-        let generation = self.save_generation;
-        let state = PersistedAppState::from_app_state(&self.state, None);
-        let timer = cx.background_executor().timer(SAVE_DEBOUNCE_DURATION);
+        let state = self.build_persisted_state(cx);
+        writer.schedule(state, SAVE_DEBOUNCE_DURATION);
+    }
+
+    fn flush_state(&self, cx: &App) -> Result<(), crate::persistence::PersistenceError> {
+        let Some(writer) = self.state_writer.clone() else {
+            return Ok(());
+        };
+        let state = self.build_persisted_state(cx);
+        writer.flush(state)
+    }
+
+    fn retry_repository_access(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(root_path) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+        else {
+            return;
+        };
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.clear_error();
+            repository.status_message = "Comprobando la ruta del repositorio…".to_owned();
+        }
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            timer.await;
-            let is_latest = this
-                .update(cx, |this, _| this.save_generation == generation)
-                .unwrap_or(false);
-            if !is_latest {
-                return;
-            }
-            let result = cx.background_spawn(async move { store.save(&state) }).await;
-            if let Err(error) = result {
-                this.update(cx, |this, cx| {
-                    this.global_error = Some(format!("No se pudo guardar el estado: {error}"));
-                    cx.notify();
+            let path_accessible = cx
+                .background_spawn(async move { root_path.is_dir() })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(repository) = this
+                    .state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                else {
+                    return;
+                };
+                repository.path_accessible = path_accessible;
+                if path_accessible {
+                    repository.clear_error();
+                    repository.status_message = "Preparando repositorio…".to_owned();
+                    this.pending_refreshes.insert(repository_id);
+                    this.refresh_repository(repository_id, cx);
+                } else {
+                    repository.set_error(
+                        "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                        Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
+                    );
+                    repository.status_message =
+                        "Repositorio no disponible; comprueba la ruta o el disco".to_owned();
+                }
+                this.save_state(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_recent_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+        let git_client = self.git_client.clone();
+        self.global_status_message = "Abriendo repositorio reciente…".to_owned();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.discover_repository(&root_path, &CancellationToken::default())
                 })
-                .ok();
-            }
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(discovered_path) => {
+                        this.finish_open_repository(discovered_path, None, cx);
+                    }
+                    Err(error) => {
+                        this.global_error = Some(guided_error_text(&error));
+                        this.global_status_message =
+                            "No se pudo abrir el repositorio reciente".to_owned();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -406,9 +1138,9 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(root_path) => this.finish_open_repository(root_path, cx),
+                    Ok(root_path) => this.finish_open_repository(root_path, None, cx),
                     Err(error) => {
-                        this.global_error = Some(error.to_string());
+                        this.global_error = Some(guided_error_text(&error));
                         this.global_status_message = "No se pudo abrir el repositorio".to_owned();
                     }
                 }
@@ -419,7 +1151,30 @@ impl MainWindow {
         .detach();
     }
 
-    fn finish_open_repository(&mut self, root_path: PathBuf, cx: &mut Context<Self>) {
+    fn apply_pending_startup_repository(&mut self, cx: &mut Context<Self>) {
+        if let Some(root_path) = self.pending_startup_repository.take() {
+            self.finish_open_repository(root_path, None, cx);
+        }
+    }
+
+    fn handle_instance_request(&mut self, request: InstanceRequest, cx: &mut Context<Self>) {
+        match request {
+            InstanceRequest::Activate => {
+                cx.activate(true);
+            }
+            InstanceRequest::OpenRepository(root_path) => {
+                self.finish_open_repository(root_path, None, cx);
+                cx.activate(true);
+            }
+        }
+    }
+
+    fn finish_open_repository(
+        &mut self,
+        root_path: PathBuf,
+        ssh_url_normalized: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let path_key = normalized_path_key(&root_path);
         if let Some(repository_id) = self
             .state
@@ -430,6 +1185,9 @@ impl MainWindow {
         {
             self.state.active_repository_id = Some(repository_id);
             self.global_status_message = "El repositorio ya estaba abierto".to_owned();
+            if let Some(url) = ssh_url_normalized {
+                self.record_ssh_clone_mapping(url, root_path);
+            }
             self.save_state(cx);
             return;
         }
@@ -440,13 +1198,363 @@ impl MainWindow {
         self.state
             .recent_repositories
             .retain(|recent| normalized_path_key(recent) != path_key);
-        self.state.recent_repositories.insert(0, root_path);
+        self.state.recent_repositories.insert(0, root_path.clone());
         self.state.recent_repositories.truncate(10);
-        self.create_commit_input(repository_id, cx);
+        if let Some(url) = ssh_url_normalized {
+            self.record_ssh_clone_mapping(url, root_path);
+        }
+        self.clone_panel_visible = false;
+        self.create_commit_input(repository_id, None, cx);
         self.global_status_message = "Repositorio abierto".to_owned();
         self.global_error = None;
         self.save_state(cx);
         self.refresh_repository(repository_id, cx);
+    }
+
+    fn record_ssh_clone_mapping(&mut self, ssh_url_normalized: String, local_path: PathBuf) {
+        let local_key = normalized_path_key(&local_path);
+        self.state.ssh_clone_mappings.retain(|mapping| {
+            mapping.ssh_url_normalized != ssh_url_normalized
+                && normalized_path_key(&mapping.local_path) != local_key
+        });
+        self.state.ssh_clone_mappings.insert(
+            0,
+            SshCloneMapping {
+                ssh_url_normalized,
+                local_path,
+            },
+        );
+        self.state.ssh_clone_mappings.truncate(10);
+    }
+
+    fn clone_root_directory(&self) -> PathBuf {
+        self.state
+            .settings
+            .default_clone_directory
+            .clone()
+            .or_else(|| default_clone_root().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn clone_repository(&mut self, _: &CloneRepository, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_clone_panel(cx);
+    }
+
+    fn show_clone_panel(&mut self, cx: &mut Context<Self>) {
+        if self.clone_in_progress {
+            return;
+        }
+        self.clone_panel_visible = true;
+        self.global_error = None;
+        if let Some(input) = &self.clone_url_input {
+            input.update(cx, CommitInput::clear);
+        }
+        cx.notify();
+    }
+
+    fn cancel_clone(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.active_clone_cancellation.take() {
+            cancellation.cancel();
+            self.global_status_message = "Cancelando clonado…".to_owned();
+            cx.notify();
+        }
+    }
+
+    fn submit_clone_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clone_in_progress {
+            return;
+        }
+        let Some(input) = &self.clone_url_input else {
+            return;
+        };
+        let url = input.read(cx).content().trim().to_owned();
+        let parsed = match parse_ssh_url(&url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.global_error = Some(guided_error_text(&error));
+                cx.notify();
+                return;
+            }
+        };
+        let clone_root = self.clone_root_directory();
+        let default_destination =
+            match default_clone_destination(&clone_root, &parsed.repository_name) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    self.global_error = Some(guided_error_text(&error));
+                    cx.notify();
+                    return;
+                }
+            };
+        let details = format!(
+            "Destino sugerido:\n{}\n\nGit Helper usa el SSH de Git for Windows (GIT_SSH, ~/.ssh/config y ssh-agent). No almacena claves privadas ni contraseñas.",
+            default_destination.display()
+        );
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "¿Dónde clonar el repositorio?",
+            Some(&details),
+            &["Usar ubicación sugerida", "Elegir carpeta…", "Cancelar"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            match choice {
+                0 => {
+                    this.update(cx, |this, cx| {
+                        this.continue_clone_with_destination(parsed, default_destination, cx);
+                    })
+                    .ok();
+                }
+                1 => {
+                    let parsed_for_destination = parsed.clone();
+                    this.update_in(cx, |_this, _window, cx| {
+                        let path_receiver = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Selecciona la carpeta que contendrá el clon".into()),
+                        });
+                        cx.spawn(async move |this, cx| {
+                            let Ok(Ok(Some(paths))) = path_receiver.await else {
+                                return;
+                            };
+                            let Some(parent) = paths.into_iter().next() else {
+                                return;
+                            };
+                            // El selector nativo devuelve la carpeta contenedora: el clon se
+                            // crea dentro, en su propio directorio, para no mezclarlo con
+                            // el contenido que ya hubiera allí.
+                            let destination = match default_clone_destination(
+                                &parent,
+                                &parsed_for_destination.repository_name,
+                            ) {
+                                Ok(destination) => destination,
+                                Err(error) => {
+                                    this.update(cx, |this, cx| {
+                                        this.global_error = Some(guided_error_text(&error));
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                    return;
+                                }
+                            };
+                            this.update(cx, |this, cx| {
+                                this.continue_clone_with_destination(
+                                    parsed_for_destination,
+                                    destination,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    })
+                    .ok();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    fn continue_clone_with_destination(
+        &mut self,
+        parsed: ParsedSshUrl,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let git_client = self.git_client.clone();
+        let cancellation = CancellationToken::default();
+        let parsed_for_execute = parsed.clone();
+        let normalized = parsed.normalized.clone();
+        self.global_status_message = "Comprobando destino…".to_owned();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let plan = cx
+                .background_spawn(async move {
+                    plan_clone_destination(&git_client, &parsed, &destination, &cancellation)
+                })
+                .await;
+            this.update(cx, |this, cx| match plan {
+                Ok(CloneDestinationPlan::CloneInto(path)) => {
+                    this.execute_clone(&parsed_for_execute, path, cx);
+                }
+                Ok(CloneDestinationPlan::OpenExisting(root_path)) => {
+                    this.pending_existing_clone_open = Some((normalized, root_path));
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.global_error = Some(guided_error_text(&error));
+                    this.global_status_message =
+                        "No se pudo preparar el clonado del repositorio".to_owned();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_open_existing_clone(
+        &mut self,
+        ssh_url_normalized: String,
+        root_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let details = format!(
+            "Ya existe un clon compatible en:\n{}\n\nSe abrirá sin sobrescribir datos.",
+            root_path.display()
+        );
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "Reutilizar clon existente",
+            Some(&details),
+            &["Abrir", "Cancelar"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(prompt.await, Ok(0)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.finish_open_repository(root_path, Some(ssh_url_normalized), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn process_pending_existing_clone_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((ssh_url_normalized, root_path)) = self.pending_existing_clone_open.take() {
+            self.confirm_open_existing_clone(ssh_url_normalized, root_path, window, cx);
+        }
+    }
+
+    fn execute_clone(
+        &mut self,
+        parsed: &ParsedSshUrl,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.clone_in_progress = true;
+        self.clone_panel_visible = false;
+        self.global_status_message = "Clonando repositorio…".to_owned();
+        self.global_error = None;
+        let cancellation = CancellationToken::default();
+        self.active_clone_cancellation = Some(cancellation.clone());
+        let url = parsed.original.clone();
+        let normalized = parsed.normalized.clone();
+        let git_client = self.git_client.clone();
+        let discover_client = self.git_client.clone();
+        let discover_destination = destination.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    git_client.clone_repository(&url, &destination, &cancellation)
+                })
+                .await;
+            // Localizar la raíz del clon vuelve a lanzar git: se resuelve en segundo plano
+            // para no bloquear el hilo de la interfaz al terminar el clonado.
+            let outcome = match result {
+                Ok(()) => Ok(cx
+                    .background_spawn(async move {
+                        discover_client.discover_repository(
+                            &discover_destination,
+                            &CancellationToken::default(),
+                        )
+                    })
+                    .await),
+                Err(error) => Err(error),
+            };
+            this.update(cx, |this, cx| {
+                this.active_clone_cancellation = None;
+                this.clone_in_progress = false;
+                match outcome {
+                    Ok(Ok(root_path)) => {
+                        this.finish_open_repository(root_path, Some(normalized), cx);
+                    }
+                    Ok(Err(error)) => {
+                        this.global_error = Some(guided_error_text(&error));
+                        this.global_status_message =
+                            "El clon terminó pero no se pudo abrir el repositorio".to_owned();
+                    }
+                    Err(error) => {
+                        let cancelled = matches!(
+                            classify_git_process_failure(&error),
+                            ProcessFailure::Cancelled
+                        );
+                        this.global_error = if cancelled {
+                            None
+                        } else {
+                            Some(guided_error_text(&error))
+                        };
+                        this.global_status_message = if cancelled {
+                            "Clonado cancelado".to_owned()
+                        } else {
+                            "No se pudo clonar el repositorio".to_owned()
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_ssh_clone_mapping(&mut self, mapping: &SshCloneMapping, cx: &mut Context<Self>) {
+        let ssh_url_normalized = mapping.ssh_url_normalized.clone();
+        let local_path = mapping.local_path.clone();
+        let discover_path = local_path.clone();
+        let git_client = self.git_client.clone();
+        self.global_status_message = "Abriendo clon reciente…".to_owned();
+        cx.notify();
+        // Comprobar la ruta y localizar la raíz lanza git y toca disco: ambas cosas
+        // ocurren fuera del hilo de la interfaz.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if !discover_path.is_dir() {
+                        return Ok(None);
+                    }
+                    git_client
+                        .discover_repository(&discover_path, &CancellationToken::default())
+                        .map(Some)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(root_path)) => {
+                        this.finish_open_repository(root_path, Some(ssh_url_normalized), cx);
+                    }
+                    Ok(None) => {
+                        this.global_error =
+                            Some(format!("El clon ya no existe en {}", local_path.display()));
+                        this.global_status_message = "Clon SSH no disponible".to_owned();
+                        this.forget_ssh_clone_mapping(&ssh_url_normalized);
+                        this.save_state(cx);
+                    }
+                    Err(error) => {
+                        this.global_error = Some(guided_error_text(&error));
+                        this.global_status_message = "No se pudo abrir el clon".to_owned();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn forget_ssh_clone_mapping(&mut self, ssh_url_normalized: &str) {
+        self.state
+            .ssh_clone_mappings
+            .retain(|candidate| candidate.ssh_url_normalized != ssh_url_normalized);
     }
 
     fn close_active_repository(
@@ -463,6 +1571,7 @@ impl MainWindow {
 
     fn close_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
         let was_active = self.state.active_repository_id == Some(repository_id);
+        self.invalidate_history_details(repository_id);
         if let Some(cancellation) = self.active_refresh_cancellations.remove(&repository_id) {
             cancellation.cancel();
         }
@@ -481,15 +1590,24 @@ impl MainWindow {
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
-        self.selected_commit_details.remove(&repository_id);
         self.repository_watchers.remove(&repository_id);
         self.pending_refreshes.remove(&repository_id);
         if self.global_refresh_in_flight == Some(repository_id) {
             self.global_refresh_in_flight = None;
         }
         self.collapsed_groups.retain(|(id, _)| *id != repository_id);
+        self.expanded_errors.remove(&repository_id);
         self.change_rows.remove(&repository_id);
         self.change_list_scrolls.remove(&repository_id);
+        self.search_boxes.retain(|(id, _), _| *id != repository_id);
+        self.history_searches.remove(&repository_id);
+        if let Some(cancellation) = self.history_search_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
+        self.active_fetch_contexts.remove(&repository_id);
+        self.pending_fetch_refresh.remove(&repository_id);
+        self.periodic_fetch_in_flight
+            .retain(|(id, _)| *id != repository_id);
         if was_active {
             self.state.active_repository_id = self
                 .state
@@ -509,6 +1627,38 @@ impl MainWindow {
         self.global_status_message = "Pestaña cerrada".to_owned();
         self.save_state(cx);
         cx.notify();
+    }
+
+    fn invalidate_history_details(&mut self, repository_id: RepositoryId) {
+        if let Some((_, cancellation)) = self.history_detail_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
+        self.history_details.cancel(repository_id);
+        self.selected_commit_details.remove(&repository_id);
+        self.history_detail_errors.remove(&repository_id);
+    }
+
+    /// El estado de la carga de detalles pertenece a la sesión: la barra solo
+    /// muestra `global_status_message` cuando no hay ningún repositorio activo.
+    fn set_session_status(&mut self, repository_id: RepositoryId, message: &str) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.to_owned();
+        }
+    }
+
+    fn clear_history_details_cancellation(&mut self, repository_id: RepositoryId, request_id: u64) {
+        if self
+            .history_detail_cancellations
+            .get(&repository_id)
+            .is_some_and(|(active_request_id, _)| *active_request_id == request_id)
+        {
+            self.history_detail_cancellations.remove(&repository_id);
+        }
     }
 
     fn next_repository(&mut self, _: &NextRepository, _: &mut Window, cx: &mut Context<Self>) {
@@ -591,6 +1741,7 @@ impl MainWindow {
         let PreparedRefresh {
             generation,
             include_history,
+            history_target,
             root_path,
             cancellation,
         } = refresh;
@@ -598,22 +1749,39 @@ impl MainWindow {
         // La transición a carga debe ser visible aunque el snapshot aún no cambie.
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, path_accessible) = cx
                 .background_spawn(async move {
-                    if include_history {
-                        git_client.snapshot_with_history(
+                    let result = if include_history {
+                        snapshot_with_history_target(
+                            &git_client,
                             &root_path,
+                            history_target,
                             INITIAL_HISTORY_LIMIT,
                             &cancellation,
                         )
                     } else {
-                        git_client.snapshot(&root_path, &cancellation)
-                    }
+                        git_client
+                            .snapshot(&root_path, &cancellation)
+                            .map(RefreshPayload::WorkingTree)
+                    };
+                    (result, root_path.is_dir())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let outcome =
-                    this.finish_refresh(repository_id, generation, include_history, result);
+                let outcome = this.finish_refresh(
+                    repository_id,
+                    generation,
+                    include_history,
+                    path_accessible,
+                    result,
+                );
+                let needs_history_reload =
+                    outcome.reload_history && outcome.continuation == RefreshContinuation::Complete;
+                let selected_commit_to_reload = (outcome.succeeded
+                    && outcome.continuation == RefreshContinuation::Complete
+                    && !needs_history_reload)
+                    .then(|| this.reconcile_selected_commit(repository_id))
+                    .flatten();
                 if outcome.succeeded {
                     this.ensure_watcher(repository_id, cx);
                 }
@@ -626,10 +1794,11 @@ impl MainWindow {
                     .filter(|active_id| this.pending_refreshes.contains(active_id));
                 if let Some(next_refresh) = next_refresh {
                     this.refresh_repository(next_refresh, cx);
-                } else if outcome.reload_history
-                    && outcome.continuation == RefreshContinuation::Complete
-                {
+                } else if needs_history_reload {
                     this.ensure_history_loaded(repository_id, cx);
+                }
+                if let Some(commit_id) = selected_commit_to_reload {
+                    this.select_commit(repository_id, commit_id, cx);
                 }
                 if outcome.should_notify {
                     cx.notify();
@@ -653,6 +1822,9 @@ impl MainWindow {
             .repositories
             .iter_mut()
             .find(|repository| repository.id == repository_id)?;
+        if !repository.path_accessible {
+            return None;
+        }
         if repository.is_refreshing() || repository.is_mutating() {
             repository.refresh_coordinator.mark_dirty();
             self.pending_refreshes.insert(repository_id);
@@ -668,9 +1840,16 @@ impl MainWindow {
         let generation = repository.refresh_generation;
         repository.refresh_state = RefreshState::Running { generation };
         repository.status_message = "Actualizando estado…".to_owned();
-        repository.error = None;
+        repository.clear_error();
         let include_history =
             repository.selected_view == RepositoryView::History && !repository.history_loaded;
+        let history_target = include_history.then(|| {
+            repository
+                .history
+                .history_reference
+                .clone()
+                .zip(repository.history.history_oid.clone())
+        });
         if include_history {
             repository.history_generation = repository.history_generation.saturating_add(1);
             repository.history_loading = true;
@@ -682,6 +1861,7 @@ impl MainWindow {
         Some(PreparedRefresh {
             generation,
             include_history,
+            history_target: history_target.flatten(),
             root_path,
             cancellation,
         })
@@ -781,9 +1961,12 @@ impl MainWindow {
                             {
                                 repository.status_message =
                                     "Watcher detenido; pulsa F5 para reconciliar".to_owned();
-                                repository.error = Some(
-                                    "La vigilancia falló; el estado visible se conserva y se intentará recuperar tras el próximo refresh."
-                                        .to_owned(),
+                                repository.set_error(
+                                    "La vigilancia falló; el estado visible se conserva y se intentará recuperar tras el próximo refresh.",
+                                    Some(
+                                        "Pulsa Actualizar (F5) para reconciliar el estado con Git cuando vuelvas a este repositorio."
+                                            .to_owned(),
+                                    ),
                                 );
                             }
                         } else if change.refresh_ignored_paths() {
@@ -817,7 +2000,8 @@ impl MainWindow {
         repository_id: RepositoryId,
         generation: u64,
         history_included: bool,
-        result: Result<RepositorySnapshot, GitError>,
+        path_accessible: bool,
+        result: Result<RefreshPayload, GitError>,
     ) -> RefreshOutcome {
         if self.global_refresh_in_flight == Some(repository_id) {
             self.global_refresh_in_flight = None;
@@ -841,79 +2025,224 @@ impl MainWindow {
         };
         let history_invalidated_during_refresh = repository.history_invalidated_during_refresh;
         repository.history_invalidated_during_refresh = false;
-        match result {
-            Ok(mut snapshot) => {
-                let history_changed = repository.snapshot.head != snapshot.head
-                    || repository.snapshot.upstream != snapshot.upstream;
-                if history_included {
+        if !path_accessible {
+            if history_included {
+                repository.history_loading = false;
+            }
+            repository.path_accessible = false;
+            repository.refresh_state = RefreshState::Failed {
+                message: "Repositorio no disponible".to_owned(),
+                details: "La ruta del repositorio no responde".to_owned(),
+                next_step: Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
+            };
+            repository.status_message = "Repositorio no disponible".to_owned();
+            repository.set_error(
+                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
+            );
+            return RefreshOutcome {
+                should_notify: true,
+                continuation,
+                ..RefreshOutcome::default()
+            };
+        }
+        let (outcome, invalidate_details) = match result {
+            Ok(payload) => {
+                let (working_tree, incoming_history) = match payload {
+                    RefreshPayload::WorkingTree(working_tree) => (working_tree, None),
+                    RefreshPayload::WithHistory {
+                        working_tree,
+                        history,
+                    } => (working_tree, Some(history)),
+                };
+                let history_changed = repository.working_tree.head != working_tree.head
+                    || repository.working_tree.upstream != working_tree.upstream;
+                let working_tree_changed = repository.working_tree.as_ref() != &working_tree;
+                if working_tree_changed {
+                    repository.working_tree = Arc::new(working_tree);
+                    repository.change_counters = repository.working_tree.change_counters();
+                    self.change_rows.remove(&repository_id);
+                }
+                if let Some(history) = incoming_history {
+                    repository.history = Arc::new(history);
                     repository.history_loaded = !history_invalidated_during_refresh;
                     repository.history_loading = false;
                 } else if history_changed || history_invalidated_during_refresh {
                     repository.history_generation = repository.history_generation.saturating_add(1);
                     repository.history_loaded = false;
                     repository.history_loading = false;
-                } else {
-                    snapshot.commits.clone_from(&repository.snapshot.commits);
-                    snapshot.has_more_commits = repository.snapshot.has_more_commits;
-                    snapshot
-                        .history_reference
-                        .clone_from(&repository.snapshot.history_reference);
-                    snapshot
-                        .history_oid
-                        .clone_from(&repository.snapshot.history_oid);
                 }
-                let snapshot_changed = *repository.snapshot != snapshot;
-                if snapshot_changed {
-                    repository.snapshot = Arc::new(snapshot);
-                    self.change_rows.remove(&repository_id);
+                repository.has_loaded_snapshot = true;
+                let remotes = repository
+                    .working_tree
+                    .remotes
+                    .iter()
+                    .map(|remote| remote.name.clone())
+                    .collect::<Vec<_>>();
+                let branches = repository.working_tree.branches.clone();
+                let now_secs = SystemClock.now_secs();
+                if let Some((remote_name, origin)) =
+                    self.pending_fetch_refresh.remove(&repository_id)
+                {
+                    repository.remote_freshness.mark_fetch_succeeded(
+                        &remote_name,
+                        origin,
+                        now_secs,
+                        &branches,
+                        self.state.settings.periodic_fetch_interval_secs,
+                    );
+                    self.periodic_fetch_in_flight
+                        .remove(&(repository_id, remote_name));
+                } else {
+                    repository
+                        .remote_freshness
+                        .detect_external_updates(&remotes, &branches, now_secs);
                 }
                 repository.refresh_state = RefreshState::Succeeded {
                     message: "Estado actualizado".to_owned(),
                 };
                 repository.status_message = "Estado actualizado".to_owned();
-                repository.error = None;
-                if history_changed {
-                    self.selected_commit_details.remove(&repository_id);
-                }
-                RefreshOutcome {
-                    succeeded: true,
-                    // El fin de la operación también es una transición visible si
-                    // Git devolvió exactamente el mismo snapshot.
-                    should_notify: true,
-                    reload_history: !repository.history_loaded
-                        && repository.selected_view == RepositoryView::History,
-                    continuation,
-                }
+                repository.clear_error();
+                (
+                    RefreshOutcome {
+                        succeeded: true,
+                        // El fin de la operación también es una transición visible si
+                        // Git devolvió exactamente el mismo snapshot.
+                        should_notify: true,
+                        reload_history: !repository.history_loaded
+                            && repository.selected_view == RepositoryView::History,
+                        continuation,
+                    },
+                    history_changed || history_invalidated_during_refresh,
+                )
             }
             Err(error) => {
                 let details = error.technical_details();
+                let next_step = error.recommended_action();
                 if history_included {
                     repository.history_loading = false;
                 }
                 let is_cancelled = is_cancelled_error(&error);
-                repository.refresh_state = if is_cancelled {
-                    RefreshState::Cancelled {
-                        message: "Actualización cancelada".to_owned(),
+                if let Some((remote_name, _origin)) =
+                    self.pending_fetch_refresh.remove(&repository_id)
+                {
+                    self.periodic_fetch_in_flight
+                        .remove(&(repository_id, remote_name.clone()));
+                    if is_cancelled {
+                        repository
+                            .remote_freshness
+                            .record_mut(&remote_name)
+                            .fetch_in_progress = false;
+                    } else {
+                        repository.remote_freshness.mark_fetch_failed(
+                            &remote_name,
+                            SystemClock.now_secs(),
+                            error.to_string(),
+                            self.state.settings.periodic_fetch_interval_secs,
+                        );
                     }
-                } else {
-                    RefreshState::Failed {
-                        message: error.to_string(),
-                        details: details.clone(),
-                    }
-                };
-                repository.status_message = if is_cancelled {
-                    "Actualización cancelada".to_owned()
-                } else {
-                    "Error al actualizar".to_owned()
-                };
-                repository.error = (!is_cancelled).then_some(details);
-                RefreshOutcome {
-                    should_notify: true,
-                    continuation,
-                    ..RefreshOutcome::default()
                 }
+                match classify_git_process_failure(&error) {
+                    ProcessFailure::Cancelled => {
+                        repository.refresh_state = RefreshState::Cancelled {
+                            message: "Actualización cancelada".to_owned(),
+                        };
+                        repository.status_message = "Actualización cancelada".to_owned();
+                        repository.clear_error();
+                    }
+                    ProcessFailure::TimedOut(timeout) => {
+                        repository.refresh_state = RefreshState::Failed {
+                            message: format!(
+                                "La actualización agotó el tiempo máximo de {}",
+                                format_timeout(timeout)
+                            ),
+                            details: details.clone(),
+                            next_step: next_step.clone(),
+                        };
+                        repository.status_message = "Tiempo agotado al actualizar".to_owned();
+                        repository.set_error(details, next_step);
+                    }
+                    ProcessFailure::Other => {
+                        repository.refresh_state = RefreshState::Failed {
+                            message: error.user_message(),
+                            details: details.clone(),
+                            next_step: next_step.clone(),
+                        };
+                        repository.status_message = "Error al actualizar".to_owned();
+                        repository.set_error(details, next_step);
+                    }
+                }
+                (
+                    RefreshOutcome {
+                        should_notify: true,
+                        continuation,
+                        ..RefreshOutcome::default()
+                    },
+                    false,
+                )
             }
+        };
+        if invalidate_details {
+            self.invalidate_history_details(repository_id);
         }
+        outcome
+    }
+
+    /// Indica si un commit figura entre los resultados de búsqueda vigentes.
+    fn commit_is_in_history_search(&self, repository_id: RepositoryId, commit_id: &str) -> bool {
+        self.history_searches
+            .get(&repository_id)
+            .is_some_and(|search| {
+                search
+                    .matches
+                    .iter()
+                    .any(|commit| commit.id.as_str() == commit_id)
+            })
+    }
+
+    fn reconcile_selected_commit(&mut self, repository_id: RepositoryId) -> Option<String> {
+        let found_by_search = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .and_then(|repository| repository.selected_commit.as_deref())
+            .is_some_and(|selected| self.commit_is_in_history_search(repository_id, selected));
+        let repository = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)?;
+        let selected_commit = repository.selected_commit.clone();
+        let is_visible = found_by_search
+            || selected_commit.as_ref().is_some_and(|selected| {
+                repository
+                    .history
+                    .commits
+                    .iter()
+                    .any(|commit| &commit.id == selected)
+            });
+        if !is_visible {
+            // Si la referencia ya no contiene el commit, el fallback explícito es
+            // dejar la selección vacía; nunca se muestra un detalle ajeno al historial.
+            repository.selected_commit = None;
+            self.selected_commit_details.remove(&repository_id);
+            if repository.history.has_more_commits {
+                self.history_detail_errors.insert(
+                    repository_id,
+                    "La selección quedó fuera de la primera página tras actualizar el historial; elige de nuevo el commit."
+                        .to_owned(),
+                );
+            } else {
+                self.history_detail_errors.remove(&repository_id);
+            }
+            return None;
+        }
+        selected_commit.filter(|_| {
+            repository.selected_view == RepositoryView::History
+                && !self.selected_commit_details.contains_key(&repository_id)
+                && !self.history_details.is_loading(repository_id)
+        })
     }
 
     fn select_view(&mut self, view: RepositoryView, cx: &mut Context<Self>) {
@@ -925,11 +2254,16 @@ impl MainWindow {
         self.save_state(cx);
         if view == RepositoryView::History {
             self.ensure_history_loaded(repository_id, cx);
+        } else {
+            // Al salir de Historial los errores de detalle ya no son accionables
+            // ni fiables: evita mostrar mensajes obsoletos al volver.
+            self.history_detail_errors.remove(&repository_id);
         }
         cx.notify();
     }
 
     fn invalidate_history(&mut self, repository_id: RepositoryId) {
+        self.invalidate_history_details(repository_id);
         let Some(repository) = self
             .state
             .repositories
@@ -944,12 +2278,6 @@ impl MainWindow {
         if repository.refresh_coordinator.in_flight() {
             repository.history_invalidated_during_refresh = true;
         }
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.commits.clear();
-        snapshot.has_more_commits = false;
-        snapshot.history_reference = None;
-        snapshot.history_oid = None;
-        self.selected_commit_details.remove(&repository_id);
     }
 
     fn ensure_history_loaded(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -967,8 +2295,7 @@ impl MainWindow {
         {
             return;
         }
-        let Some((reference, expected_oid)) = history_target_for_head(&repository.snapshot.head)
-        else {
+        let Some((reference, expected_oid)) = history_reload_target(repository) else {
             repository.history_loaded = true;
             return;
         };
@@ -976,22 +2303,21 @@ impl MainWindow {
         let generation = repository.history_generation;
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
-        repository.error = None;
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.history_reference = Some(reference.clone());
-        snapshot.history_oid = Some(expected_oid.clone());
+        repository.clear_error();
+        let head = repository.working_tree.head.clone();
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.history_for_oid(
+                    load_history_page(
+                        &git_client,
                         &root_path,
+                        &head,
                         &reference,
                         &expected_oid,
-                        INITIAL_HISTORY_LIMIT + 1,
-                        0,
+                        INITIAL_HISTORY_LIMIT,
                         &CancellationToken::default(),
                     )
                 })
@@ -1013,19 +2339,14 @@ impl MainWindow {
                     Ok(page)
                         if history_target_is_current(repository, &page.reference, &page.oid) =>
                     {
-                        let snapshot = Arc::make_mut(&mut repository.snapshot);
-                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
-                        snapshot.commits = page
-                            .commits
-                            .into_iter()
-                            .take(INITIAL_HISTORY_LIMIT)
-                            .map(|commit| commit.summary)
-                            .collect();
-                        snapshot.history_reference = Some(page.reference);
-                        snapshot.history_oid = Some(page.oid);
+                        repository.history =
+                            Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
-                        repository.error = None;
+                        repository.clear_error();
+                        if let Some(commit_id) = this.reconcile_selected_commit(repository_id) {
+                            this.select_commit(repository_id, commit_id, cx);
+                        }
                     }
                     Ok(_) => {
                         repository.history_loaded = false;
@@ -1033,7 +2354,7 @@ impl MainWindow {
                     }
                     Err(error) => {
                         repository.status_message = "No se pudo cargar el historial".to_owned();
-                        repository.error = Some(error.technical_details());
+                        repository.set_error(error.technical_details(), error.recommended_action());
                     }
                 }
                 cx.notify();
@@ -1109,8 +2430,14 @@ impl MainWindow {
         else {
             return ChangeRowCache::default();
         };
-        let snapshot = Arc::clone(&self.state.repositories[index].snapshot);
-        let rows = build_change_rows(repository_id, &snapshot.changes, &self.collapsed_groups);
+        let query = self.search_query(repository_id, SearchScope::Changes);
+        let working_tree = Arc::clone(&self.state.repositories[index].working_tree);
+        let rows = build_change_rows(
+            repository_id,
+            &working_tree.changes,
+            &self.collapsed_groups,
+            query.as_ref(),
+        );
         let selectable = selectable_rows(&rows);
         self.state.repositories[index]
             .change_selection
@@ -1416,7 +2743,7 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.working_tree.head);
         let is_directory = repository.root_path.join(&change.path).is_dir();
         let plan = match plan_discard(change, discard_staged, has_head, is_directory) {
             Ok(plan) => plan,
@@ -1427,7 +2754,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
                 return;
@@ -1487,10 +2814,10 @@ impl MainWindow {
         else {
             return;
         };
-        let has_head = !matches!(repository.snapshot.head, HeadState::Unborn);
+        let has_head = repository_has_commits(&repository.working_tree.head);
         let mut planned_paths = HashSet::new();
         let mut plans = Vec::new();
-        for change in &repository.snapshot.changes {
+        for change in &repository.working_tree.changes {
             if change.is_conflicted || !planned_paths.insert(change.path.clone()) {
                 continue;
             }
@@ -1507,9 +2834,9 @@ impl MainWindow {
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some(
-                    "No hay cambios descartables. Los conflictos y cambios staged sin HEAD deben resolverse o quitarse del stage manualmente."
-                        .to_owned(),
+                repository.set_error(
+                    "No hay cambios descartables. Los conflictos y cambios staged sin HEAD deben resolverse o quitarse del stage manualmente.",
+                    None,
                 );
             }
             cx.notify();
@@ -1612,19 +2939,20 @@ impl MainWindow {
         };
         let repository_id = repository.id;
         let root_path = repository.root_path.clone();
-        if !repository
-            .snapshot
-            .changes
-            .iter()
-            .any(FileChange::has_staged_change)
-        {
+        if repository.change_counters.staged_count == 0 {
             if let Some(repository) = self
                 .state
                 .repositories
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some("No hay cambios staged para generar un mensaje".to_owned());
+                repository.set_error(
+                    "No hay cambios staged para generar un mensaje",
+                    Some(
+                        "Prepara al menos un cambio en el stage y vuelve a generar el mensaje."
+                            .to_owned(),
+                    ),
+                );
             }
             cx.notify();
             return;
@@ -1641,7 +2969,7 @@ impl MainWindow {
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some(message.to_owned());
+                repository.set_error(message, Some(BUSY_NEXT_STEP.to_owned()));
             }
             cx.notify();
             return;
@@ -1651,11 +2979,13 @@ impl MainWindow {
             .get(&repository_id)
             .map(|input| input.read(cx).content_version())
             .unwrap_or_default();
+        let preferences = self.commit_preferences(repository_id).values();
         self.next_generation_request_id = self.next_generation_request_id.saturating_add(1);
         let request = CommitMessageRequest {
             session_id: repository_id,
             request_id: self.next_generation_request_id,
             draft_version,
+            preferences,
         };
         self.generation_requests
             .insert(repository_id, request.clone());
@@ -1670,7 +3000,7 @@ impl MainWindow {
                 generation: repository.refresh_generation,
             };
             repository.status_message = "Preparando contexto staged…".to_owned();
-            repository.error = None;
+            repository.clear_error();
         }
         let git_client = self.git_client.clone();
         let cursor_client = self.cursor_client.clone();
@@ -1695,10 +3025,25 @@ impl MainWindow {
                                 GitError::StagedStateChanged => {
                                     GenerationPreparationError::StagedChanged
                                 }
-                                error => GenerationPreparationError::Message(error.to_string()),
+                                error => GenerationPreparationError::Message {
+                                    timed_out: matches!(
+                                        classify_git_process_failure(&error),
+                                        ProcessFailure::TimedOut(_)
+                                    ),
+                                    failure: GenerationFailure::guided(
+                                        error.user_message(),
+                                        error.recommended_action(),
+                                    ),
+                                },
                             })?;
-                        build_cursor_context(&data)
-                            .map_err(|error| GenerationPreparationError::Message(error.to_string()))
+                        build_cursor_context(&data, preferences)
+                            .map_err(|error| GenerationPreparationError::Message {
+                                failure: GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                ),
+                                timed_out: false,
+                            })
                             .map(|context| (context, data.index_identity))
                     }
                 })
@@ -1711,12 +3056,12 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: None,
-                                result: Err(
-                                    "El staging area cambió mientras se preparaba el contexto"
-                                        .to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "El staging area cambió mientras se preparaba el contexto",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: false,
+                                timed_out: false,
                                 staged_changed: true,
                             },
                             cx,
@@ -1725,15 +3070,16 @@ impl MainWindow {
                     .ok();
                     return;
                 }
-                Err(GenerationPreparationError::Message(error)) => {
+                Err(GenerationPreparationError::Message { failure, timed_out }) => {
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: None,
-                                result: Err(error),
+                                result: Err(failure),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
+                                timed_out,
                                 staged_changed: false,
                             },
                             cx,
@@ -1759,12 +3105,12 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(
-                                    "La propuesta quedó obsoleta porque cambió el staging area"
-                                        .to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "La propuesta quedó obsoleta porque cambió el staging area",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: false,
+                                timed_out: false,
                                 staged_changed: true,
                             },
                             cx,
@@ -1774,14 +3120,22 @@ impl MainWindow {
                     return;
                 }
                 Err(error) => {
+                    let timed_out = matches!(
+                        classify_git_process_failure(&error),
+                        ProcessFailure::TimedOut(_)
+                    );
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(error.to_string()),
+                                result: Err(GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
+                                timed_out,
                                 staged_changed: false,
                             },
                             cx,
@@ -1820,11 +3174,12 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(
-                                    "Generación cancelada antes de enviar el contexto".to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "Generación cancelada antes de enviar el contexto",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: true,
+                                timed_out: false,
                                 staged_changed: false,
                             },
                             cx,
@@ -1844,9 +3199,22 @@ impl MainWindow {
                             context.prompt,
                             &cursor_cancellation,
                         )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| {
+                            (
+                                GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                ),
+                                classify_cursor_failure(&error),
+                            )
+                        })
                 })
                 .await;
+            let timed_out = matches!(
+                result.as_ref().err(),
+                Some((_, ProcessFailure::TimedOut(_)))
+            );
+            let result = result.map_err(|(failure, _)| failure);
             let was_cancelled = context_cancellation.is_cancelled();
             let current_index_identity = if result.is_ok() && !was_cancelled {
                 Some(
@@ -1855,9 +3223,14 @@ impl MainWindow {
                         let root_path = root_path.clone();
                         let cancellation = context_cancellation.clone();
                         async move {
-                            git_client
-                                .staged_identity(&root_path, &cancellation)
-                                .map_err(|error| error.to_string())
+                            git_client.staged_identity(&root_path, &cancellation).map_err(
+                                |error| {
+                                    GenerationFailure::guided(
+                                        error.user_message(),
+                                        error.recommended_action(),
+                                    )
+                                },
+                            )
                         }
                     })
                     .await,
@@ -1873,6 +3246,7 @@ impl MainWindow {
                         result,
                         current_index_identity,
                         was_cancelled,
+                        timed_out,
                         staged_changed: false,
                     },
                     cx,
@@ -1892,13 +3266,14 @@ impl MainWindow {
         if self.generation_requests.get(&repository_id) != Some(&completion.request) {
             return;
         }
+        let current_preferences = self.commit_preferences(repository_id).values();
         self.active_mutation_cancellations.remove(&repository_id);
         let input = self.commit_inputs.get(&repository_id).cloned();
         if let Some(input) = &input {
             input.update(cx, |input, cx| input.set_generating(false, cx));
         }
         let mut status_message = String::new();
-        let mut error_message = None;
+        let mut failure: Option<GenerationFailure> = None;
         let mut mutation_state = MutationState::Cancelled {
             kind: OperationKind::GenerateCommitMessage,
             message: "Generación cancelada".to_owned(),
@@ -1914,11 +3289,12 @@ impl MainWindow {
                         &completion.request,
                         self.generation_requests.get(&repository_id),
                         input.read(cx).content_version(),
+                        current_preferences,
                         expected,
                         current,
                     ),
                     (_, Some(Err(error)), _) => {
-                        error_message = Some(error.clone());
+                        failure = Some(error.clone());
                         GenerationApplyDecision::IndexChanged
                     }
                     _ => GenerationApplyDecision::IndexChanged,
@@ -1936,13 +3312,32 @@ impl MainWindow {
                     }
                     GenerationApplyDecision::DraftChanged => {
                         status_message = "Propuesta no aplicada; el borrador cambió".to_owned();
-                        error_message = Some(
-                            "Se conserva tu borrador actual. Pulsa «Generar con Cursor» para reintentar."
-                                .to_owned(),
-                        );
+                        failure = Some(GenerationFailure::guided(
+                            "Se conserva tu borrador actual: la propuesta llegó después de editarlo.",
+                            Some(
+                                "Pulsa «Generar con Cursor» cuando el borrador esté como quieres; el repositorio no ha cambiado."
+                                    .to_owned(),
+                            ),
+                        ));
                         mutation_state = MutationState::Cancelled {
                             kind: OperationKind::GenerateCommitMessage,
                             message: "El borrador cambió durante la generación".to_owned(),
+                        };
+                    }
+                    GenerationApplyDecision::PreferencesChanged => {
+                        status_message =
+                            "Propuesta no aplicada; cambiaron las preferencias del mensaje"
+                                .to_owned();
+                        failure = Some(GenerationFailure::guided(
+                            "La respuesta se generó con las preferencias anteriores.",
+                            Some(
+                                "Pulsa «Generar con Cursor» para repetirla con las preferencias actuales."
+                                    .to_owned(),
+                            ),
+                        ));
+                        mutation_state = MutationState::Cancelled {
+                            kind: OperationKind::GenerateCommitMessage,
+                            message: "Las preferencias cambiaron durante la generación".to_owned(),
                         };
                     }
                     GenerationApplyDecision::IndexChanged => completion.staged_changed = true,
@@ -1950,17 +3345,35 @@ impl MainWindow {
                 }
             }
             Err(error) => {
+                let timed_out = completion.timed_out;
                 let cancelled = completion.was_cancelled
                     || completion.staged_changed
-                    || error.to_lowercase().contains("cancel");
+                    || (!timed_out && error.message.to_lowercase().contains("cancel"));
                 status_message = if cancelled {
                     "Generación cancelada; se conserva el borrador".to_owned()
+                } else if timed_out {
+                    "Tiempo agotado al generar el mensaje".to_owned()
                 } else {
                     "No se pudo generar el mensaje".to_owned()
                 };
-                error_message = Some(if completion.staged_changed {
-                    "El staging area cambió; la propuesta quedó obsoleta. Revisa los cambios y pulsa «Generar con Cursor» para reintentar."
-                        .to_owned()
+                failure = Some(if completion.staged_changed {
+                    GenerationFailure::guided(
+                        "El staging area cambió; la propuesta quedó obsoleta.",
+                        Some(
+                            "Revisa los cambios staged y pulsa «Generar con Cursor» para reintentar; tu borrador se conserva."
+                                .to_owned(),
+                        ),
+                    )
+                } else if timed_out {
+                    GenerationFailure::guided(
+                        error.message.clone(),
+                        error.next_step.clone().or_else(|| {
+                            Some(
+                                "Revisa el estado del repositorio antes de reintentar; el borrador se conserva."
+                                    .to_owned(),
+                            )
+                        }),
+                    )
                 } else {
                     error
                 });
@@ -1972,8 +3385,18 @@ impl MainWindow {
                 } else {
                     MutationState::Failed {
                         kind: OperationKind::GenerateCommitMessage,
-                        message: "No se pudo generar el mensaje".to_owned(),
-                        details: error_message.clone().unwrap_or_default(),
+                        message: if timed_out {
+                            "Tiempo agotado al generar el mensaje".to_owned()
+                        } else {
+                            "No se pudo generar el mensaje".to_owned()
+                        },
+                        details: failure
+                            .as_ref()
+                            .map(|failure| failure.message.clone())
+                            .unwrap_or_default(),
+                        next_step: failure
+                            .as_ref()
+                            .and_then(|failure| failure.next_step.clone()),
                     }
                 };
             }
@@ -1981,10 +3404,13 @@ impl MainWindow {
         self.generation_requests.remove(&repository_id);
         if completion.staged_changed {
             status_message = "Propuesta obsoleta; revisa el staging area".to_owned();
-            error_message = Some(
-                "El staging area cambió durante la generación. La propuesta no se aplicó; pulsa «Generar con Cursor» para reintentar."
-                    .to_owned(),
-            );
+            failure = Some(GenerationFailure::guided(
+                "El staging area cambió durante la generación y la propuesta no se aplicó.",
+                Some(
+                    "Revisa los cambios staged y pulsa «Generar con Cursor» para reintentar; tu borrador se conserva."
+                        .to_owned(),
+                ),
+            ));
             mutation_state = MutationState::Cancelled {
                 kind: OperationKind::GenerateCommitMessage,
                 message: "El staging area cambió durante la generación".to_owned(),
@@ -1997,7 +3423,10 @@ impl MainWindow {
             .find(|repository| repository.id == repository_id)
         {
             repository.status_message = status_message;
-            repository.error = error_message;
+            match failure {
+                Some(failure) => repository.set_error(failure.message, failure.next_step),
+                None => repository.clear_error(),
+            }
             repository.mutation_state = mutation_state;
         }
         self.refresh_repository(repository_id, cx);
@@ -2016,17 +3445,69 @@ impl MainWindow {
         if !repository.can_mutate() {
             return;
         }
+        let preferred = self
+            .state
+            .settings
+            .repository_preferred_remotes
+            .get(&normalized_repo_key(&repository.root_path))
+            .map(String::as_str);
         let plan = plan_fetch(
-            repository.snapshot.upstream.as_ref(),
-            &repository.snapshot.remotes,
-            None,
+            repository.working_tree.upstream.as_ref(),
+            &repository.working_tree.remotes,
+            preferred,
         );
         match plan {
             Err(GitError::RemoteSelectionRequired { remotes }) => {
                 self.prompt_for_remote(repository_id, OperationKind::Fetch, remotes, window, cx);
             }
+            Ok(RemoteOperationPlan::Fetch { remote_name }) => {
+                self.execute_fetch(repository_id, remote_name, FetchOrigin::Manual, false, cx);
+            }
             plan => self.run_remote_plan(repository_id, OperationKind::Fetch, plan, cx),
         }
+    }
+
+    fn execute_fetch(
+        &mut self,
+        repository_id: RepositoryId,
+        remote_name: String,
+        origin: FetchOrigin,
+        suppress_error_banner: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        if !repository.can_mutate() {
+            return;
+        }
+        let now_secs = SystemClock.now_secs();
+        let interval_secs = self.state.settings.periodic_fetch_interval_secs;
+        if origin == FetchOrigin::Manual {
+            repository
+                .remote_freshness
+                .reset_schedule_after_manual_fetch(now_secs, interval_secs);
+        }
+        repository
+            .remote_freshness
+            .mark_fetch_started(&remote_name, now_secs);
+        self.periodic_fetch_in_flight
+            .insert((repository_id, remote_name.clone()));
+        self.active_fetch_contexts.insert(
+            repository_id,
+            FetchContext {
+                remote_name: remote_name.clone(),
+                origin,
+                suppress_error_banner,
+            },
+        );
+        let plan = Ok(RemoteOperationPlan::Fetch { remote_name });
+        self.run_remote_plan(repository_id, OperationKind::Fetch, plan, cx);
     }
 
     fn pull(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -2041,7 +3522,7 @@ impl MainWindow {
         if !repository.can_mutate() {
             return;
         }
-        let plan = plan_pull(repository.snapshot.upstream.as_ref());
+        let plan = plan_pull(repository.working_tree.upstream.as_ref());
         self.run_remote_plan(repository_id, OperationKind::Pull, plan, cx);
     }
 
@@ -2058,9 +3539,9 @@ impl MainWindow {
             return;
         }
         let plan = plan_push(
-            &repository.snapshot.head,
-            repository.snapshot.upstream.as_ref(),
-            &repository.snapshot.remotes,
+            &repository.working_tree.head,
+            repository.working_tree.upstream.as_ref(),
+            &repository.working_tree.remotes,
             None,
         );
         match plan {
@@ -2075,7 +3556,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
             }
@@ -2116,22 +3597,32 @@ impl MainWindow {
                 else {
                     return;
                 };
+                let root_path = repository.root_path.clone();
+                let upstream = repository.working_tree.upstream.clone();
+                let remotes = repository.working_tree.remotes.clone();
+                let head = repository.working_tree.head.clone();
+                this.remember_preferred_remote(&root_path, &remote_name, cx);
                 let plan = match kind {
-                    OperationKind::Fetch => plan_fetch(
-                        repository.snapshot.upstream.as_ref(),
-                        &repository.snapshot.remotes,
-                        Some(&remote_name),
-                    ),
-                    OperationKind::Push => plan_push(
-                        &repository.snapshot.head,
-                        repository.snapshot.upstream.as_ref(),
-                        &repository.snapshot.remotes,
-                        Some(&remote_name),
-                    ),
+                    OperationKind::Fetch => {
+                        plan_fetch(upstream.as_ref(), &remotes, Some(&remote_name))
+                    }
+                    OperationKind::Push => {
+                        plan_push(&head, upstream.as_ref(), &remotes, Some(&remote_name))
+                    }
                     _ => return,
                 };
                 if kind == OperationKind::Fetch {
-                    this.run_remote_plan(repository_id, kind, plan, cx);
+                    if let Ok(RemoteOperationPlan::Fetch { remote_name }) = plan {
+                        this.execute_fetch(
+                            repository_id,
+                            remote_name,
+                            FetchOrigin::Manual,
+                            false,
+                            cx,
+                        );
+                    } else {
+                        this.run_remote_plan(repository_id, kind, plan, cx);
+                    }
                 } else {
                     match plan {
                         Ok(plan) => {
@@ -2144,7 +3635,8 @@ impl MainWindow {
                                 .iter_mut()
                                 .find(|repository| repository.id == repository_id)
                             {
-                                repository.error = Some(error.to_string());
+                                repository
+                                    .set_error(error.user_message(), error.recommended_action());
                             }
                             cx.notify();
                         }
@@ -2208,7 +3700,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
                 return;
@@ -2265,11 +3757,12 @@ impl MainWindow {
             return;
         };
         if !repository.can_mutate() {
-            repository.error = Some(if repository.is_refreshing() {
-                "Espera a que termine la actualización del repositorio".to_owned()
+            let message = if repository.is_refreshing() {
+                "Espera a que termine la actualización del repositorio"
             } else {
-                "Ya hay otra mutación activa en este repositorio".to_owned()
-            });
+                "Ya hay otra mutación activa en este repositorio"
+            };
+            repository.set_error(message, Some(BUSY_NEXT_STEP.to_owned()));
             cx.notify();
             return;
         }
@@ -2279,7 +3772,7 @@ impl MainWindow {
             generation: repository.refresh_generation,
         };
         repository.status_message = operation_running_message(kind).to_owned();
-        repository.error = None;
+        repository.clear_error();
         let git_client = self.git_client.clone();
         let cancellation = CancellationToken::default();
         self.active_mutation_cancellations
@@ -2292,6 +3785,7 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 this.active_mutation_cancellations.remove(&repository_id);
+                let fetch_context = this.active_fetch_contexts.remove(&repository_id);
                 let mut refresh_immediately = false;
                 match result {
                     Ok(()) => {
@@ -2299,6 +3793,14 @@ impl MainWindow {
                             && let Some(input) = this.commit_inputs.get(&repository_id)
                         {
                             input.update(cx, CommitInput::clear);
+                        }
+                        if let Some(fetch_context) = &fetch_context
+                            && kind == OperationKind::Fetch
+                        {
+                            this.pending_fetch_refresh.insert(
+                                repository_id,
+                                (fetch_context.remote_name.clone(), fetch_context.origin),
+                            );
                         }
                         if let Some(repository) = this
                             .state
@@ -2311,15 +3813,9 @@ impl MainWindow {
                                 message: operation_success_message(kind).to_owned(),
                             };
                             repository.status_message = operation_success_message(kind).to_owned();
-                            repository.error = None;
+                            repository.clear_error();
                         }
-                        if matches!(
-                            kind,
-                            OperationKind::Commit
-                                | OperationKind::Fetch
-                                | OperationKind::Pull
-                                | OperationKind::Push
-                        ) {
+                        if kind_can_move_references(kind) {
                             this.invalidate_history(repository_id);
                         }
                         let feedback_timer =
@@ -2335,31 +3831,100 @@ impl MainWindow {
                     }
                     Err(error) => {
                         refresh_immediately = true;
+                        let suppress_error = fetch_context
+                            .as_ref()
+                            .is_some_and(|context| context.suppress_error_banner);
+                        if let Some(context) = &fetch_context
+                            && kind == OperationKind::Fetch
+                        {
+                            let interval_secs = this.state.settings.periodic_fetch_interval_secs;
+                            if let Some(repository) = this
+                                .state
+                                .repositories
+                                .iter_mut()
+                                .find(|repository| repository.id == repository_id)
+                            {
+                                let is_cancelled = is_cancelled_error(&error);
+                                if is_cancelled {
+                                    repository
+                                        .remote_freshness
+                                        .record_mut(&context.remote_name)
+                                        .fetch_in_progress = false;
+                                } else {
+                                    repository.remote_freshness.mark_fetch_failed(
+                                        &context.remote_name,
+                                        SystemClock.now_secs(),
+                                        error.to_string(),
+                                        interval_secs,
+                                    );
+                                }
+                            }
+                            this.periodic_fetch_in_flight
+                                .remove(&(repository_id, context.remote_name.clone()));
+                            this.pending_fetch_refresh.remove(&repository_id);
+                        }
                         if let Some(repository) = this
                             .state
                             .repositories
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
-                            let is_cancelled = is_cancelled_error(&error);
-                            repository.mutation_state = if is_cancelled {
-                                MutationState::Cancelled {
-                                    kind,
-                                    message: "Operación cancelada".to_owned(),
+                            let next_step = error.recommended_action();
+                            match classify_git_process_failure(&error) {
+                                ProcessFailure::Cancelled => {
+                                    repository.mutation_state = MutationState::Cancelled {
+                                        kind,
+                                        message: "Operación cancelada".to_owned(),
+                                    };
+                                    repository.status_message = "Operación cancelada".to_owned();
+                                    repository.clear_error();
                                 }
-                            } else {
-                                MutationState::Failed {
-                                    kind,
-                                    message: error.to_string(),
-                                    details: error.technical_details(),
+                                ProcessFailure::TimedOut(timeout) => {
+                                    repository.mutation_state = MutationState::Failed {
+                                        kind,
+                                        message: format!(
+                                            "La operación agotó el tiempo máximo de {}",
+                                            format_timeout(timeout)
+                                        ),
+                                        details: error.technical_details(),
+                                        next_step: next_step.clone(),
+                                    };
+                                    repository.status_message =
+                                        "Tiempo agotado en la operación".to_owned();
+                                    repository.set_error(error.technical_details(), next_step);
                                 }
-                            };
-                            repository.status_message = if is_cancelled {
-                                "Operación cancelada".to_owned()
-                            } else {
-                                "La operación falló".to_owned()
-                            };
-                            repository.error = (!is_cancelled).then(|| error.technical_details());
+                                ProcessFailure::Other => {
+                                    repository.mutation_state = MutationState::Failed {
+                                        kind,
+                                        message: error.user_message(),
+                                        details: error.technical_details(),
+                                        next_step: next_step.clone(),
+                                    };
+                                    repository.status_message = if kind == OperationKind::Fetch
+                                        && suppress_error
+                                    {
+                                        repository.remote_freshness.label_for_remote(
+                                            fetch_context.as_ref().map_or("remote", |context| {
+                                                context.remote_name.as_str()
+                                            }),
+                                            SystemClock.now_secs(),
+                                        )
+                                    } else {
+                                        "La operación falló".to_owned()
+                                    };
+                                    if kind == OperationKind::Fetch && suppress_error {
+                                        repository.clear_error();
+                                    } else {
+                                        repository.set_error(error.technical_details(), next_step);
+                                    }
+                                }
+                            }
+                        }
+                        // Una operación remota interrumpida puede haber movido
+                        // referencias antes de terminar, así que el historial
+                        // cacheado es tan sospechoso como en el caso correcto.
+                        if kind_can_move_references(kind) {
+                            this.invalidate_history(repository_id);
                         }
                     }
                 }
@@ -2388,66 +3953,107 @@ impl MainWindow {
         let active_id = self.state.active_repository_id;
         div()
             .flex()
+            .min_w(px(0.0))
             .items_center()
             .h(px(38.0))
             .border_b_1()
             .border_color(BORDER_COLOR)
             .bg(ELEVATED_BACKGROUND_COLOR)
-            .children(self.state.repositories.iter().map(|repository| {
-                let repository_id = repository.id;
-                let is_active = active_id == Some(repository_id);
-                let name = repository
-                    .root_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Repositorio")
-                    .to_owned();
-                let full_path = repository.root_path.display().to_string();
-                let change_count = repository.snapshot.changes.len();
+            .child(
                 div()
-                    .id(format!("repository-tab-{repository_id:?}"))
+                    .id("repository-tabs-scroll")
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .h_full()
-                    .px_3()
-                    .border_r_1()
-                    .border_color(BORDER_COLOR)
-                    .aria_label(full_path)
-                    .when(is_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
-                    .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_repository(repository_id, cx);
-                    }))
-                    .child(name)
-                    .when(change_count > 0, |tab| {
-                        tab.child(
-                            div()
-                                .text_xs()
-                                .text_color(WARNING_COLOR)
-                                .child(change_count.to_string()),
-                        )
-                    })
-                    .when(
-                        matches!(repository.refresh_state, RefreshState::Running { .. }),
-                        |tab| tab.child(div().text_xs().text_color(ACCENT_COLOR).child("⟳")),
-                    )
-                    .when(repository.error.is_some(), |tab| {
-                        tab.child(div().text_xs().text_color(ERROR_COLOR).child("!"))
-                    })
-                    .child(
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .children(self.state.repositories.iter().map(|repository| {
+                        let repository_id = repository.id;
+                        let is_active = active_id == Some(repository_id);
+                        let name = repository
+                            .root_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Repositorio")
+                            .to_owned();
+                        let full_path = repository.root_path.display().to_string();
+                        let change_count = repository.working_tree.changes.len();
                         div()
-                            .id(format!("close-repository-tab-{repository_id:?}"))
-                            .px_1()
-                            .text_color(MUTED_TEXT_COLOR)
+                            .id(format!("repository-tab-{repository_id:?}"))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h_full()
+                            .min_w(px(110.0))
+                            .max_w(px(220.0))
+                            .px_3()
+                            .border_r_1()
+                            .border_color(BORDER_COLOR)
+                            .aria_label(full_path)
+                            .when(is_active, |tab| tab.bg(SELECTED_BACKGROUND_COLOR))
                             .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_repository(repository_id, cx);
+                                this.select_repository(repository_id, cx);
                             }))
-                            .child("×"),
-                    )
-            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .when(change_count > 0, |tab| {
+                                tab.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(WARNING_COLOR)
+                                        .child(change_count.to_string()),
+                                )
+                            })
+                            .when(
+                                matches!(repository.refresh_state, RefreshState::Running { .. }),
+                                |tab| {
+                                    tab.child(div().text_xs().text_color(ACCENT_COLOR).child("⟳"))
+                                },
+                            )
+                            .when(!repository.path_accessible, |tab| {
+                                tab.child(div().text_xs().text_color(WARNING_COLOR).child("⛔"))
+                            })
+                            .when(repository.error.is_some(), |tab| {
+                                tab.child(div().text_xs().text_color(ERROR_COLOR).child("!"))
+                            })
+                            .child(
+                                div()
+                                    .id(format!("close-repository-tab-{repository_id:?}"))
+                                    .px_1()
+                                    .text_color(MUTED_TEXT_COLOR)
+                                    .hover(|style| {
+                                        style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_repository(repository_id, cx);
+                                    }))
+                                    .child("×"),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .id("clone-repository-tab")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(38.0))
+                    .h_full()
+                    .text_sm()
+                    .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_clone_panel(cx);
+                    }))
+                    .child("⇩"),
+            )
             .child(
                 div()
                     .id("open-repository-tab")
@@ -2468,17 +4074,22 @@ impl MainWindow {
 
     fn render_toolbar(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
         let repository_id = repository.id;
-        let branch = match &repository.snapshot.head {
-            HeadState::Branch { name, .. } => name.clone(),
-            HeadState::Detached { .. } => "HEAD separado".to_owned(),
-            HeadState::Unborn => "Sin commit inicial".to_owned(),
-        };
-        let upstream = repository.snapshot.upstream.as_ref().map(|upstream| {
+        let branch = head_label(&repository.working_tree.head);
+        let upstream = repository.working_tree.upstream.as_ref().map(|upstream| {
             format!(
                 "{}  ↑{} ↓{}",
                 upstream.full_name, upstream.ahead, upstream.behind
             )
         });
+        let remote_freshness = primary_remote_label(
+            repository,
+            &self.state.settings.repository_preferred_remotes,
+            SystemClock.now_secs(),
+        );
+        let periodic_fetch_label = format_periodic_fetch_interval_label(
+            self.state.settings.periodic_fetch_enabled,
+            self.state.settings.periodic_fetch_interval_secs,
+        );
         let can_mutate = repository.can_mutate();
         let is_refreshing = repository.is_refreshing();
         div()
@@ -2495,6 +4106,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .flex_1()
@@ -2516,6 +4128,16 @@ impl MainWindow {
                                 .text_ellipsis()
                                 .child(upstream),
                         )
+                    })
+                    .when_some(remote_freshness, |row, label| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(WARNING_COLOR)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        )
                     }),
             )
             .child(
@@ -2525,6 +4147,18 @@ impl MainWindow {
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
+                    .child(
+                        action_button("auto-fetch", periodic_fetch_label, true).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                if event.modifiers.shift {
+                                    this.cycle_periodic_fetch_interval(cx);
+                                } else {
+                                    this.toggle_periodic_fetch(cx);
+                                }
+                            }),
+                        ),
+                    )
                     .child(
                         action_button("fetch", "Fetch", can_mutate).on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -2568,7 +4202,7 @@ impl MainWindow {
         repository: &RepositorySession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let count = repository.snapshot.changes.len();
+        let count = repository.change_counters.change_count;
         div()
             .flex()
             .h(px(36.0))
@@ -2597,24 +4231,385 @@ impl MainWindow {
             .into_any_element()
     }
 
+    /// Crea, si falta, la caja de búsqueda de una vista del repositorio.
+    ///
+    /// Cada pestaña tiene su propia caja: cambiar de repositorio no arrastra
+    /// la consulta de otro ni descarta la que se estaba usando.
+    fn ensure_search_box(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_boxes.contains_key(&(repository_id, scope)) {
+            return;
+        }
+        let appearance = match scope {
+            SearchScope::Changes => {
+                InputAppearance::single_line("change-search-input", "Filtra por ruta o nombre…")
+            }
+            SearchScope::History => InputAppearance::single_line(
+                "history-search-input",
+                "Busca por mensaje, autor o hash…",
+            ),
+        };
+        let input = cx.new(|cx| CommitInput::with_appearance(appearance, cx));
+        let changed = cx.subscribe(&input, move |this, input, _: &CommitMessageChanged, cx| {
+            let query = input.read(cx).content().trim().to_owned();
+            this.apply_search_query(repository_id, scope, query, cx);
+        });
+        let dismissed = cx.subscribe(&input, move |this, _, _: &CommitInputDismissed, cx| {
+            this.clear_search(repository_id, scope, cx);
+        });
+        self.search_boxes.insert(
+            (repository_id, scope),
+            SearchBox {
+                input,
+                query: String::new(),
+                _subscriptions: vec![changed, dismissed],
+            },
+        );
+    }
+
+    /// Consulta activa de una vista, ya normalizada.
+    fn search_query(&self, repository_id: RepositoryId, scope: SearchScope) -> Option<SearchQuery> {
+        self.search_boxes
+            .get(&(repository_id, scope))
+            .and_then(|search| SearchQuery::parse(&search.query))
+    }
+
+    fn apply_search_query(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.search_boxes.get_mut(&(repository_id, scope)) else {
+            return;
+        };
+        if search.query == query {
+            return;
+        }
+        search.query = query;
+        match scope {
+            // El filtro forma parte de las filas ya calculadas.
+            SearchScope::Changes => {
+                self.change_rows.remove(&repository_id);
+            }
+            SearchScope::History => self.restart_history_search(repository_id, cx),
+        }
+        cx.notify();
+    }
+
+    /// Vacía la consulta de una vista; la invoca Escape dentro del campo.
+    fn clear_search(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return;
+        };
+        if search.input.read(cx).content().is_empty() {
+            return;
+        }
+        let input = search.input.clone();
+        input.update(cx, CommitInput::clear);
+        cx.notify();
+    }
+
+    fn focus_search(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_search_box(repository_id, scope, cx);
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return;
+        };
+        let input = search.input.clone();
+        input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn find_in_view(&mut self, _: &FindInView, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((repository_id, view)) = self
+            .active_repository()
+            .map(|repository| (repository.id, repository.selected_view))
+        else {
+            return;
+        };
+        self.focus_search(repository_id, search_scope_for(view), window, cx);
+    }
+
+    /// Reinicia el recorrido del historial tras cambiar consulta o referencia.
+    ///
+    /// Subir la generación deja obsoleta cualquier página en vuelo: su
+    /// resultado se descarta en lugar de mezclarse con la búsqueda nueva.
+    fn restart_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        if let Some(cancellation) = self.history_search_cancellations.remove(&repository_id) {
+            cancellation.cancel();
+        }
+        let generation = self
+            .history_searches
+            .get(&repository_id)
+            .map_or(0, |search| search.generation)
+            .saturating_add(1);
+        let query = self
+            .search_boxes
+            .get(&(repository_id, SearchScope::History))
+            .map(|search| search.query.clone())
+            .unwrap_or_default();
+        if query.is_empty() {
+            self.history_searches.remove(&repository_id);
+            cx.notify();
+            return;
+        }
+        let (reference, oid) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map_or((None, None), |repository| {
+                (
+                    repository.history.history_reference.clone(),
+                    repository.history.history_oid.clone(),
+                )
+            });
+        self.history_searches.insert(
+            repository_id,
+            HistorySearch {
+                query,
+                generation,
+                reference,
+                oid,
+                ..HistorySearch::default()
+            },
+        );
+        self.scan_history_search(repository_id, generation, true, cx);
+        cx.notify();
+    }
+
+    /// Descarta los resultados si la referencia mostrada dejó de ser la buscada.
+    fn synchronize_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(search) = self.history_searches.get(&repository_id) else {
+            return;
+        };
+        let Some(repository) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+        else {
+            return;
+        };
+        if search.reference == repository.history.history_reference
+            && search.oid == repository.history.history_oid
+        {
+            return;
+        }
+        self.restart_history_search(repository_id, cx);
+    }
+
+    /// Lee una página de la referencia y acumula las coincidencias.
+    ///
+    /// `debounce` espera a que el tecleo cese para no encadenar un proceso de
+    /// Git por cada pulsación.
+    fn scan_history_search(
+        &mut self,
+        repository_id: RepositoryId,
+        generation: u64,
+        debounce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root_path) = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| repository.root_path.clone())
+        else {
+            return;
+        };
+        let Some(search) = self.history_searches.get_mut(&repository_id) else {
+            return;
+        };
+        if search.generation != generation || search.scanning || search.exhausted {
+            return;
+        }
+        let Some(query) = SearchQuery::parse(&search.query) else {
+            return;
+        };
+        let (Some(reference), Some(oid)) = (search.reference.clone(), search.oid.clone()) else {
+            search.error =
+                Some("No hay una referencia de historial seleccionada para buscar.".to_owned());
+            cx.notify();
+            return;
+        };
+        let offset = search.scanned;
+        search.scanning = true;
+        search.error = None;
+        let git_client = self.git_client.clone();
+        let cancellation = CancellationToken::default();
+        self.history_search_cancellations
+            .insert(repository_id, cancellation.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor()
+                    .timer(HISTORY_SEARCH_DEBOUNCE)
+                    .await;
+                if cancellation.is_cancelled() {
+                    return;
+                }
+            }
+            let request_cancellation = cancellation.clone();
+            let result = cx
+                .background_spawn(async move {
+                    git_client.history_for_oid(
+                        &root_path,
+                        &reference,
+                        &oid,
+                        HISTORY_SEARCH_PAGE,
+                        offset,
+                        &request_cancellation,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.finish_history_search_page(
+                    repository_id,
+                    generation,
+                    offset,
+                    &query,
+                    result,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_history_search_page(
+        &mut self,
+        repository_id: RepositoryId,
+        generation: u64,
+        offset: usize,
+        query: &SearchQuery,
+        result: Result<HistoryPage, GitError>,
+        cx: &mut Context<Self>,
+    ) {
+        // La consulta o la rama cambiaron mientras Git respondía: el resultado
+        // ya no describe lo que la vista está mostrando.
+        if self
+            .history_searches
+            .get(&repository_id)
+            .is_none_or(|search| search.generation != generation)
+        {
+            return;
+        }
+        self.history_search_cancellations.remove(&repository_id);
+        let Some(search) = self.history_searches.get_mut(&repository_id) else {
+            return;
+        };
+        search.scanning = false;
+        match result {
+            Ok(page) => {
+                if search.apply_page(generation, offset, query, page) == HistorySearchPage::Stale {
+                    cx.notify();
+                    return;
+                }
+            }
+            Err(error) => search.error = Some(error.technical_details()),
+        }
+        let should_continue =
+            search.can_continue() && search.matches.len() < HISTORY_SEARCH_MATCH_TARGET;
+        cx.notify();
+        if should_continue {
+            self.scan_history_search(repository_id, generation, false, cx);
+        }
+    }
+
+    /// Continúa el recorrido a petición del usuario, sin esperar al tecleo.
+    fn continue_history_search(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let Some(generation) = self
+            .history_searches
+            .get(&repository_id)
+            .map(|search| search.generation)
+        else {
+            return;
+        };
+        self.scan_history_search(repository_id, generation, false, cx);
+    }
+
+    fn render_search_bar(
+        &mut self,
+        repository_id: RepositoryId,
+        scope: SearchScope,
+        summary: String,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_search_box(repository_id, scope, cx);
+        let Some(search) = self.search_boxes.get(&(repository_id, scope)) else {
+            return div().into_any_element();
+        };
+        let input = search.input.clone();
+        let has_query = !search.query.is_empty();
+        let clear_id = match scope {
+            SearchScope::Changes => "clear-change-search",
+            SearchScope::History => "clear-history-search",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(BORDER_COLOR)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(input))
+                    .child(
+                        action_button(clear_id, "Limpiar", has_query).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.clear_search(repository_id, scope, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(div().text_xs().text_color(MUTED_TEXT_COLOR).child(summary))
+            .when_some(error, |bar, error| {
+                bar.child(div().text_xs().text_color(ERROR_COLOR).child(error))
+            })
+            .into_any_element()
+    }
+
     fn render_changes(
         &mut self,
         repository: &RepositorySession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let content_state = repository_content_state(repository);
+        self.ensure_search_box(repository.id, SearchScope::Changes, cx);
+        let query = self.search_query(repository.id, SearchScope::Changes);
         let repository_id = repository.id;
         let ChangeRowCache { rows, selectable } = self.ensure_change_rows(repository_id);
         let row_count = rows.len();
         let focus_handle = self.change_list_focus_handle(cx);
         let scroll_handle = self.change_list_scroll(repository_id);
         let input = self.commit_inputs.get(&repository_id).cloned();
-        let staged_count = repository
-            .snapshot
-            .changes
-            .iter()
-            .filter(|change| change.has_staged_change())
-            .count();
+        let staged_count = repository.change_counters.staged_count;
         // El estado de sesión que llega por parámetro es una copia previa al
         // podado que acaba de hacer `ensure_change_rows`; se relee sin clonar.
         let (selected_count, stageable_count, unstageable_count) = self
@@ -2640,7 +4635,46 @@ impl MainWindow {
         let message_is_empty = input
             .as_ref()
             .is_none_or(|input| input.read(cx).content().trim().is_empty());
-        let commit_enabled = staged_count > 0 && !message_is_empty && can_mutate;
+        // Las convenciones orientan la propuesta: el aviso no participa en esta condición.
+        let commit_enabled = can_create_commit(staged_count, message_is_empty, can_mutate);
+        let preferences = self.commit_preferences(repository_id).values();
+        let guidance = input
+            .as_ref()
+            .and_then(|input| commit_message_guidance(input.read(cx).content(), preferences));
+        let preferences_row = self.render_commit_preferences(repository_id, cx);
+        let total_changes = repository.working_tree.changes.len();
+        let matching_changes = query.as_ref().map_or(total_changes, |query| {
+            repository
+                .working_tree
+                .changes
+                .iter()
+                .filter(|change| change_matches(change, query))
+                .count()
+        });
+        let filtered_empty = query.is_some() && matching_changes == 0;
+        let search_summary = query.as_ref().map_or_else(
+            || "Filtra por ruta o nombre con Ctrl+F. Escape limpia la consulta.".to_owned(),
+            |query| {
+                if matching_changes == 0 {
+                    format!(
+                        "Consulta «{}» · sin coincidencias entre {total_changes} archivos",
+                        query.raw()
+                    )
+                } else {
+                    format!(
+                        "Consulta «{}» · {matching_changes} de {total_changes} archivos",
+                        query.raw()
+                    )
+                }
+            },
+        );
+        let search_bar = self.render_search_bar(
+            repository_id,
+            SearchScope::Changes,
+            search_summary,
+            None,
+            cx,
+        );
 
         // Sin esto los atajos de la lista serían inertes hasta el primer clic
         // sobre una fila, que es justo lo que el teclado debe evitar.
@@ -2648,12 +4682,85 @@ impl MainWindow {
             window.focus(&focus_handle, cx);
         }
         let list_is_focused = focus_handle.is_focused(window);
+        let change_list = match content_state {
+            RepositoryContentState::Loading => state_card(
+                "change-state-loading",
+                "Cargando repositorio…",
+                "El estado de Git todavía no está disponible.",
+                ACCENT_COLOR,
+            ),
+            RepositoryContentState::RefreshFailed => state_card(
+                "change-state-failed",
+                "No se pudo cargar el repositorio",
+                "Pulsa Actualizar para reintentar. No se han interpretado cambios como si fueran reales.",
+                ERROR_COLOR,
+            ),
+            RepositoryContentState::Clean => state_card(
+                "change-state-clean",
+                "Árbol limpio",
+                "No hay cambios pendientes en el directorio de trabajo.",
+                SUCCESS_COLOR,
+            ),
+            RepositoryContentState::NoInitialCommit => state_card(
+                "change-state-unborn",
+                "Sin commit inicial",
+                "Prepara los archivos y crea el primer commit. Descartar staged requiere hacer unstage antes.",
+                WARNING_COLOR,
+            ),
+            RepositoryContentState::Changes => change_list_or_empty(
+                rows.clone(),
+                row_count,
+                repository_id,
+                filtered_empty,
+                &scroll_handle,
+                cx,
+            ),
+            RepositoryContentState::Refreshing => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .overflow_hidden()
+                .child(state_banner(
+                    "Actualizando…",
+                    "Mostrando el último estado correcto mientras Git responde.",
+                    ACCENT_COLOR,
+                ))
+                .child(change_list_or_empty(
+                    rows.clone(),
+                    row_count,
+                    repository_id,
+                    filtered_empty,
+                    &scroll_handle,
+                    cx,
+                ))
+                .into_any_element(),
+            RepositoryContentState::Stale => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .overflow_hidden()
+                .child(state_banner(
+                    "Estado anterior conservado",
+                    "La actualización falló; los cambios visibles pueden estar desactualizados. Pulsa Actualizar.",
+                    ERROR_COLOR,
+                ))
+                .child(change_list_or_empty(
+                    rows,
+                    row_count,
+                    repository_id,
+                    filtered_empty,
+                    &scroll_handle,
+                    cx,
+                ))
+                .into_any_element(),
+        };
 
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .child(search_bar)
             .child(
                 div()
                     .id("change-list-container")
@@ -2682,26 +4789,15 @@ impl MainWindow {
                     } else {
                         BACKGROUND_COLOR
                     })
-                    .child(
-                        uniform_list(
-                            gpui::ElementId::from(format!("change-list-{repository_id:?}")),
-                            row_count,
-                            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                                rows[range]
-                                    .iter()
-                                    .cloned()
-                                    .map(|row| {
-                                        this.render_change_row(repository_id, row, window, cx)
-                                    })
-                                    .collect()
-                            }),
-                        )
-                        .track_scroll(&scroll_handle)
-                        .w_full()
-                        .flex_1(),
-                    ),
+                    .child(change_list),
             )
-            .child(
+            .when(
+                !matches!(
+                    content_state,
+                    RepositoryContentState::Loading | RepositoryContentState::RefreshFailed
+                ),
+                |changes| {
+                    changes.child(
                 div()
                     .flex()
                     .flex_col()
@@ -2710,6 +4806,10 @@ impl MainWindow {
                     .border_t_1()
                     .border_color(BORDER_COLOR)
                     .when_some(input, gpui::ParentElement::child)
+                    .when_some(guidance, |footer, note| {
+                        footer.child(div().text_xs().text_color(WARNING_COLOR).child(note))
+                    })
+                    .child(preferences_row)
                     .child(
                         div()
                             .flex()
@@ -2784,13 +4884,25 @@ impl MainWindow {
                                         action_button(
                                             "discard-all",
                                             "Descartar todo",
-                                            !repository.snapshot.changes.is_empty() && can_mutate,
+                                            !repository.working_tree.changes.is_empty()
+                                                && can_mutate,
                                         )
+                                        .text_color(MUTED_TEXT_COLOR)
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 this.confirm_discard_all(repository_id, window, cx);
                                             }),
                                         ),
+                                    )
+                                    .child(
+                                        action_button("commit-template", "Plantilla", true)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.insert_commit_template(
+                                                    repository_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                     )
                                     .child(
                                         action_button(
@@ -2808,16 +4920,130 @@ impl MainWindow {
                                             }),
                                         ),
                                     )
-                                    .child(action_button("commit", "Commit", commit_enabled).when(
-                                        commit_enabled,
-                                        |button| {
-                                            button.on_click(cx.listener(|this, _, window, cx| {
-                                                this.create_commit(&CreateCommit, window, cx);
-                                            }))
-                                        },
-                                    )),
+                                    .child(
+                                        action_button("commit", "Commit", commit_enabled).when(
+                                            commit_enabled,
+                                            |button| {
+                                                button
+                                                    .bg(ACCENT_COLOR)
+                                                    .text_color(BACKGROUND_COLOR)
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.create_commit(
+                                                            &CreateCommit,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }))
+                                            },
+                                        ),
+                                    ),
                             ),
                     ),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    /// Controles compactos de las preferencias aplicadas a la propuesta.
+    ///
+    /// Cada botón avanza el valor de la capa seleccionada; el sufijo `·repo`
+    /// señala los campos que este repositorio no hereda del ajuste global.
+    fn render_commit_preferences(
+        &self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let effective = self.commit_preferences(repository_id);
+        let values = effective.values();
+        let scope = self.commit_preference_scope;
+        let has_repository_overrides = effective.has_repository_overrides();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(
+                div()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .flex_shrink_0()
+                    .child("Mensaje:"),
+            )
+            .child(
+                action_button(
+                    "commit-preference-scope",
+                    format!("Editando: {}", scope.label()),
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_commit_preference_scope(cx);
+                })),
+            )
+            .child(commit_preference_button(
+                "commit-preference-language",
+                format!(
+                    "Idioma: {}{}",
+                    effective.language.value.label(),
+                    effective.language.source.suffix()
+                ),
+                CommitPreferenceField::Language,
+                repository_id,
+                cx,
+            ))
+            .child(commit_preference_button(
+                "commit-preference-convention",
+                format!(
+                    "Formato: {}{}",
+                    effective.convention.value.label(),
+                    effective.convention.source.suffix()
+                ),
+                CommitPreferenceField::Convention,
+                repository_id,
+                cx,
+            ))
+            .when(values.scope_applies(), |row| {
+                row.child(commit_preference_button(
+                    "commit-preference-scope-usage",
+                    format!(
+                        "{}{}",
+                        effective.scope.value.label(),
+                        effective.scope.source.suffix()
+                    ),
+                    CommitPreferenceField::Scope,
+                    repository_id,
+                    cx,
+                ))
+            })
+            .child(commit_preference_button(
+                "commit-preference-length",
+                format!(
+                    "Asunto ≤{}{}",
+                    effective.subject_max_length.value,
+                    effective.subject_max_length.source.suffix()
+                ),
+                CommitPreferenceField::SubjectMaxLength,
+                repository_id,
+                cx,
+            ))
+            .child(
+                action_button(
+                    "commit-preference-inherit",
+                    "Usar global",
+                    has_repository_overrides,
+                )
+                .when(has_repository_overrides, |button| {
+                    button.on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_repository_commit_preferences(repository_id, cx);
+                    }))
+                }),
+            )
+            .child(
+                action_button("commit-preference-defaults", "Predeterminados", true).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.restore_default_commit_preferences(repository_id, cx);
+                    }),
+                ),
             )
             .into_any_element()
     }
@@ -2931,10 +5157,12 @@ impl MainWindow {
                 div()
                     .id(change_row_action_id("row", &path, representation))
                     .flex()
+                    .flex_nowrap()
                     .items_center()
                     .w_full()
                     .gap_x_2()
                     .h(row_height)
+                    .overflow_hidden()
                     .px_3()
                     .py_1()
                     .border_b_1()
@@ -3063,6 +5291,7 @@ impl MainWindow {
         branch: BranchReference,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_history_details(repository_id);
         let Some(repository) = self
             .state
             .repositories
@@ -3072,17 +5301,23 @@ impl MainWindow {
             return;
         };
         let Some(current_branch) = repository
-            .snapshot
+            .working_tree
             .branches
             .iter()
             .find(|current| current.full_name == branch.full_name)
         else {
-            repository.error = Some("La rama ya no existe; actualiza el repositorio.".to_owned());
+            repository.set_error(
+                "La rama ya no existe; actualiza el repositorio.",
+                Some(STALE_REFERENCE_NEXT_STEP.to_owned()),
+            );
             cx.notify();
             return;
         };
         if current_branch.oid != branch.oid {
-            repository.error = Some("La rama cambió; actualiza el repositorio.".to_owned());
+            repository.set_error(
+                "La rama cambió; actualiza el repositorio.",
+                Some(STALE_REFERENCE_NEXT_STEP.to_owned()),
+            );
             cx.notify();
             return;
         }
@@ -3092,15 +5327,15 @@ impl MainWindow {
         repository.history_loaded = branch.oid.is_none();
         repository.history_loading = branch.oid.is_some();
         repository.selected_commit = None;
-        let snapshot = Arc::make_mut(&mut repository.snapshot);
-        snapshot.commits.clear();
-        snapshot.has_more_commits = false;
-        snapshot.history_reference = Some(branch.full_name.clone());
-        snapshot.history_oid.clone_from(&branch.oid);
-        self.selected_commit_details.remove(&repository_id);
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(Vec::new()),
+            has_more_commits: false,
+            history_reference: Some(branch.full_name.clone()),
+            history_oid: branch.oid.clone(),
+        });
         let Some(expected_oid) = branch.oid else {
             repository.status_message = "La rama no tiene commits".to_owned();
-            repository.error = None;
+            repository.clear_error();
             cx.notify();
             return;
         };
@@ -3109,7 +5344,7 @@ impl MainWindow {
         let branch_name = branch.name;
         let git_client = self.git_client.clone();
         repository.status_message = format!("Cargando historial de {branch_name}…");
-        repository.error = None;
+        repository.clear_error();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -3145,32 +5380,24 @@ impl MainWindow {
                                 &page.oid,
                             ) =>
                     {
-                        let snapshot = Arc::make_mut(&mut repository.snapshot);
-                        snapshot.has_more_commits = page.commits.len() > INITIAL_HISTORY_LIMIT;
-                        snapshot.commits = page
-                            .commits
-                            .into_iter()
-                            .take(INITIAL_HISTORY_LIMIT)
-                            .map(|commit| commit.summary)
-                            .collect();
-                        snapshot.history_reference = Some(page.reference);
-                        snapshot.history_oid = Some(page.oid);
+                        repository.history =
+                            Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
-                        repository.error = None;
+                        repository.clear_error();
                     }
                     Ok(_) => {
                         repository.history_loaded = false;
                         repository.status_message = "La rama cambió durante la carga".to_owned();
-                        repository.error = Some(
-                            "Se descartó el resultado obsoleto; vuelve a seleccionar la rama."
-                                .to_owned(),
+                        repository.set_error(
+                            "Se descartó el resultado obsoleto; vuelve a seleccionar la rama.",
+                            None,
                         );
                     }
                     Err(error) => {
                         repository.history_loaded = false;
                         repository.status_message = "No se pudo cargar la rama".to_owned();
-                        repository.error = Some(error.technical_details());
+                        repository.set_error(error.technical_details(), error.recommended_action());
                     }
                 }
                 cx.notify();
@@ -3186,6 +5413,10 @@ impl MainWindow {
         commit_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_history_details(repository_id);
+        // Un resultado de búsqueda puede venir de una página que el historial
+        // visible aún no ha cargado, pero pertenece a la misma referencia.
+        let found_by_search = self.commit_is_in_history_search(repository_id, &commit_id);
         let Some(repository) = self
             .state
             .repositories
@@ -3194,37 +5425,102 @@ impl MainWindow {
         else {
             return;
         };
+        if !found_by_search
+            && !repository
+                .history
+                .commits
+                .iter()
+                .any(|commit| commit.id == commit_id)
+        {
+            repository.selected_commit = None;
+            self.history_detail_errors.insert(
+                repository_id,
+                "El commit ya no está en el historial visible; actualiza el repositorio."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         repository.selected_commit = Some(commit_id.clone());
+        let Some(history_key) = history_details_key(repository) else {
+            repository.selected_commit = None;
+            self.history_detail_errors.insert(
+                repository_id,
+                "No hay una referencia de historial válida para este repositorio.".to_owned(),
+            );
+            cx.notify();
+            return;
+        };
         let root_path = repository.root_path.clone();
+        let history_generation = repository.history_generation;
         let git_client = self.git_client.clone();
+        let selection = self
+            .history_details
+            .begin(repository_id, history_generation, history_key);
+        let request = match selection {
+            BeginDetailsSelection::Cached(details) => {
+                self.selected_commit_details.insert(repository_id, details);
+                self.history_detail_errors.remove(&repository_id);
+                self.set_session_status(repository_id, "Detalles del commit cargados");
+                cx.notify();
+                return;
+            }
+            BeginDetailsSelection::Loading(request) => request,
+        };
+        let cancellation = CancellationToken::default();
+        self.history_detail_cancellations
+            .insert(repository_id, (request.request_id, cancellation.clone()));
+        self.set_session_status(repository_id, "Cargando detalles del commit…");
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    git_client.commit_details(&root_path, &commit_id, &CancellationToken::default())
+                    git_client
+                        .commit_details(&root_path, &commit_id, &cancellation)
+                        .map_err(|error| error.technical_details())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match result {
-                    Ok(details) => {
-                        this.selected_commit_details.insert(repository_id, details);
-                        if let Some(repository) = this
-                            .state
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.id == repository_id)
-                        {
-                            repository.error = None;
-                        }
+                let current = this
+                    .state
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.id == request.repository_id)
+                    .map(|repository| {
+                        (
+                            repository.history_generation,
+                            history_details_key(repository),
+                            repository.selected_commit.clone(),
+                        )
+                    });
+                let Some((current_generation, current_key, selected_commit)) = current else {
+                    return;
+                };
+                match this.history_details.complete(
+                    &request,
+                    result,
+                    current_generation,
+                    current_key.as_ref(),
+                    selected_commit.as_deref(),
+                ) {
+                    DetailsCompletion::Applied(details) => {
+                        this.selected_commit_details.insert(repository_id, *details);
+                        this.history_detail_errors.remove(&repository_id);
+                        this.set_session_status(repository_id, "Detalles del commit cargados");
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
                     }
-                    Err(error) => {
-                        if let Some(repository) = this
-                            .state
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.id == repository_id)
-                        {
-                            repository.error = Some(error.to_string());
-                        }
+                    DetailsCompletion::Failed(error) => {
+                        this.selected_commit_details.remove(&repository_id);
+                        this.history_detail_errors.insert(repository_id, error);
+                        this.set_session_status(
+                            repository_id,
+                            "No se pudieron cargar los detalles",
+                        );
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
+                    }
+                    DetailsCompletion::Stale => {
+                        this.clear_history_details_cancellation(repository_id, request.request_id);
+                        return;
                     }
                 }
                 cx.notify();
@@ -3232,6 +5528,18 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    fn retry_selected_commit(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let commit_id = self
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .and_then(|repository| repository.selected_commit.clone());
+        if let Some(commit_id) = commit_id {
+            self.select_commit(repository_id, commit_id, cx);
+        }
     }
 
     fn load_more_history(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -3247,20 +5555,20 @@ impl MainWindow {
             return;
         }
         let (Some(reference), Some(oid)) = (
-            repository.snapshot.history_reference.clone(),
-            repository.snapshot.history_oid.clone(),
+            repository.history.history_reference.clone(),
+            repository.history.history_oid.clone(),
         ) else {
-            repository.error = Some("No hay una referencia de historial seleccionada".to_owned());
+            repository.set_error("No hay una referencia de historial seleccionada", None);
             cx.notify();
             return;
         };
         repository.history_loading = true;
         let generation = repository.history_generation;
         let root_path = repository.root_path.clone();
-        let offset = repository.snapshot.commits.len();
+        let offset = repository.history.commits.len();
         let git_client = self.git_client.clone();
         repository.status_message = "Cargando más commits…".to_owned();
-        repository.error = None;
+        repository.clear_error();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -3285,26 +5593,37 @@ impl MainWindow {
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
-                            if repository.history_generation != generation
-                                || !history_target_is_current(
-                                    repository,
-                                    &page.reference,
-                                    &page.oid,
-                                )
-                            {
+                            if repository.history_generation != generation {
                                 return;
                             }
-                            Arc::make_mut(&mut repository.snapshot).commits.extend(
+                            if !history_target_is_current(
+                                repository,
+                                &page.reference,
+                                &page.oid,
+                            ) {
+                                repository.history_loading = false;
+                                repository.history_loaded = false;
+                                repository.status_message =
+                                    "La selección de historial cambió".to_owned();
+                                repository.set_error(
+                                    "Se descartó el resultado obsoleto; vuelve a seleccionar la rama.",
+                                    None,
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            let history = Arc::make_mut(&mut repository.history);
+                            Arc::make_mut(&mut history.commits).extend(
                                 page.commits
                                     .into_iter()
                                     .take(INITIAL_HISTORY_LIMIT)
                                     .map(|commit| commit.summary),
                             );
-                            Arc::make_mut(&mut repository.snapshot).has_more_commits = has_more;
+                            history.has_more_commits = has_more;
                             repository.history_loaded = true;
                             repository.history_loading = false;
                             repository.status_message = "Historial actualizado".to_owned();
-                            repository.error = None;
+                            repository.clear_error();
                         }
                     }
                     Err(error) => {
@@ -3317,7 +5636,7 @@ impl MainWindow {
                         {
                             repository.history_loading = false;
                             repository.status_message = "No se pudo cargar el historial".to_owned();
-                            repository.error = Some(error.to_string());
+                            repository.set_error(error.user_message(), error.recommended_action());
                         }
                     }
                 }
@@ -3328,20 +5647,73 @@ impl MainWindow {
         .detach();
     }
 
-    fn render_history(&self, repository: &RepositorySession, cx: &mut Context<Self>) -> AnyElement {
-        let snapshot = Arc::clone(&repository.snapshot);
-        let count = snapshot.commits.len();
+    fn render_history(
+        &mut self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let repository_id = repository.id;
+        self.ensure_search_box(repository_id, SearchScope::History, cx);
+        self.synchronize_history_search(repository_id, cx);
+        let query = self.search_query(repository_id, SearchScope::History);
+        let search = self.history_searches.get(&repository_id);
+        let searching = query.is_some();
+        let scanning = search.is_some_and(|search| search.scanning);
+        // Tras un error el botón sigue disponible: reintentar retoma el
+        // recorrido desde la misma posición en lugar de empezar de cero.
+        let can_search_more = search.is_some_and(|search| !search.exhausted && !search.scanning);
+        let search_error = search.and_then(|search| search.error.clone());
+        let search_summary = history_search_summary(query.as_ref(), search);
+        let commits = match (searching, search) {
+            (true, Some(search)) => Arc::new(search.matches.clone()),
+            (true, None) => Arc::new(Vec::new()),
+            (false, _) => Arc::clone(&repository.history.commits),
+        };
+        let search_empty = searching && commits.is_empty() && !scanning;
+        let search_bar = self.render_search_bar(
+            repository_id,
+            SearchScope::History,
+            search_summary,
+            search_error,
+            cx,
+        );
+        let count = commits.len();
         let selected_commit = repository.selected_commit.clone();
-        let has_more = repository.snapshot.has_more_commits;
-        let selected_reference = repository.snapshot.history_reference.clone();
-        let branches = repository.snapshot.branches.clone();
+        let has_more = repository.history.has_more_commits && !searching;
+        let selected_reference = repository.history.history_reference.clone();
+        let branches = repository.working_tree.branches.clone();
         let details = self.selected_commit_details.get(&repository_id).cloned();
+        let details_loading = self.history_details.is_loading(repository_id);
+        let detail_error = self.history_detail_errors.get(&repository_id).cloned();
+        // Los errores que dejan la selección vacía (el commit salió del
+        // historial visible) no se pueden reintentar: el usuario tiene que
+        // elegir otra fila, así que no se ofrece un botón que no haría nada.
+        let can_retry_details = detail_error.is_some() && selected_commit.is_some();
+        let has_details_panel = details_loading || detail_error.is_some() || details.is_some();
+        let remote_freshness_notice = primary_remote_label(
+            repository,
+            &self.state.settings.repository_preferred_remotes,
+            SystemClock.now_secs(),
+        );
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .when_some(remote_freshness_notice, |history, notice| {
+                history.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(BORDER_COLOR)
+                        .text_xs()
+                        .text_color(MUTED_TEXT_COLOR)
+                        .child(format!(
+                            "Las referencias remotas reflejan el último fetch local. {notice}. Actualizar estado solo relee refs locales; usa Fetch para consultar el servidor."
+                        )),
+                )
+            })
             .child(
                 div()
                     .id("branch-inventory")
@@ -3377,6 +5749,7 @@ impl MainWindow {
                             }))
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(if branch.is_active {
                                         SUCCESS_COLOR
@@ -3385,22 +5758,43 @@ impl MainWindow {
                                     })
                                     .child(branch_kind_label(branch.kind)),
                             )
-                            .child(div().text_sm().child(branch.name.clone()))
                             .child(
                                 div()
-                                    .ml_auto()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .child(branch.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(MUTED_TEXT_COLOR)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .max_w(px(150.0))
                                     .child(branch_upstream_label(&branch.upstream)),
                             )
                     })),
             )
-            .child(
+            .child(search_bar)
+            .child(if search_empty {
+                state_card(
+                    "history-state-no-matches",
+                    "Sin coincidencias",
+                    "Ningún commit explorado de esta referencia coincide con la consulta. Pulsa Escape en la búsqueda o usa Limpiar para volver al historial completo.",
+                    MUTED_TEXT_COLOR,
+                )
+            } else {
                 uniform_list(
                     "history-list",
                     count,
                     cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
-                        snapshot.commits[range]
+                        commits[range]
                             .iter()
                             .map(|commit| {
                                 let commit_id = commit.id.clone();
@@ -3433,10 +5827,21 @@ impl MainWindow {
                                             .flex()
                                             .flex_col()
                                             .flex_1()
+                                            .min_w(px(0.0))
                                             .overflow_hidden()
-                                            .child(div().text_sm().child(commit.subject.clone()))
                                             .child(
                                                 div()
+                                                    .text_sm()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(commit.subject.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .text_xs()
                                                     .text_color(MUTED_TEXT_COLOR)
                                                     .child(commit.author_name.clone()),
@@ -3454,8 +5859,26 @@ impl MainWindow {
                             .collect()
                     }),
                 )
-                .flex_1(),
-            )
+                .flex_1()
+                .into_any_element()
+            })
+            .when(can_search_more, |history| {
+                history.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(BORDER_COLOR)
+                        .child(
+                            action_button("search-more-history", "Buscar más", true).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.continue_history_search(repository_id, cx);
+                                }),
+                            ),
+                        ),
+                )
+            })
             .when(has_more, |history| {
                 history.child(
                     div()
@@ -3473,7 +5896,7 @@ impl MainWindow {
                         ),
                 )
             })
-            .when_some(details, |history, details| {
+            .when(has_details_panel, |history| {
                 history.child(
                     div()
                         .id("commit-details")
@@ -3486,15 +5909,124 @@ impl MainWindow {
                         .border_t_1()
                         .border_color(BORDER_COLOR)
                         .text_xs()
-                        .child(format!("Commit {}", details.summary.id))
-                        .child(format!(
-                            "Autor: {} <{}> · {}",
-                            details.summary.author_name,
-                            details.summary.author_email,
-                            details.summary.authored_at
-                        ))
-                        .child(format!("Padres: {}", details.parent_ids.join(" ")))
-                        .when(!details.body.is_empty(), |panel| panel.child(details.body)),
+                        .when(details_loading, |panel| {
+                            panel.child("Cargando detalles del commit…")
+                        })
+                        .when_some(detail_error, |panel, error| {
+                            panel
+                                .child(div().text_color(ERROR_COLOR).child(error))
+                                .when(can_retry_details, |panel| {
+                                    panel.child(
+                                        action_button("retry-commit-details", "Reintentar", true)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.retry_selected_commit(repository_id, cx);
+                                            })),
+                                    )
+                                })
+                        })
+                        .when_some(details, |panel, details| {
+                            panel
+                                .child(format!("Commit {}", details.summary.id))
+                                .child(format!(
+                                    "Autor: {} <{}> · {}",
+                                    details.summary.author_name,
+                                    details.summary.author_email,
+                                    details.summary.authored_at
+                                ))
+                                .child(format!("Padres: {}", details.parent_ids.join(" ")))
+                                .when(!details.body.is_empty(), |panel| panel.child(details.body))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn toggle_error_details(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        if !self.expanded_errors.insert(repository_id) {
+            self.expanded_errors.remove(&repository_id);
+        }
+        cx.notify();
+    }
+
+    fn copy_error_details(&self, details: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(details));
+    }
+
+    fn render_repository_feedback(
+        &self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(RepositoryFeedback {
+            summary,
+            next_step,
+            details,
+        }) = repository_feedback(repository)
+        else {
+            return div().into_any_element();
+        };
+        let repository_id = repository.id;
+        let is_expanded = self.expanded_errors.contains(&repository_id);
+        let details_for_copy = details.clone();
+        div()
+            .id("repository-feedback")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(ERROR_COLOR)
+            .bg(ELEVATED_BACKGROUND_COLOR)
+            .text_sm()
+            .child(div().text_color(ERROR_COLOR).child(summary))
+            .when_some(next_step, |feedback, next_step| {
+                feedback.child(
+                    div()
+                        .id("error-next-step")
+                        .text_color(PRIMARY_TEXT_COLOR)
+                        .child(format!("Siguiente paso: {next_step}")),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        action_button(
+                            "error-details",
+                            if is_expanded {
+                                "Ocultar detalles"
+                            } else {
+                                "Ver detalles"
+                            },
+                            true,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_error_details(repository_id, cx);
+                        })),
+                    )
+                    .child(
+                        action_button("copy-error", "Copiar detalles", true).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.copy_error_details(details_for_copy.clone(), cx);
+                            },
+                        )),
+                    ),
+            )
+            .when(is_expanded, |feedback| {
+                feedback.child(
+                    div()
+                        .id("error-details-content")
+                        .p_2()
+                        .max_h(px(120.0))
+                        .overflow_y_scroll()
+                        .bg(INPUT_BACKGROUND_COLOR)
+                        .text_xs()
+                        .text_color(MUTED_TEXT_COLOR)
+                        .child(details),
                 )
             })
             .into_any_element()
@@ -3504,10 +6036,18 @@ impl MainWindow {
         let path = repository
             .map(|repository| repository.root_path.display().to_string())
             .unwrap_or_default();
+        let status = repository.map_or_else(
+            || self.global_status_message.clone(),
+            |repository| repository.status_message.clone(),
+        );
+        let git_version = self
+            .git_version
+            .clone()
+            .unwrap_or_else(|| "Git no detectado".to_owned());
         div()
             .flex()
             .items_center()
-            .justify_between()
+            .gap_3()
             .h(px(26.0))
             .px_3()
             .border_t_1()
@@ -3515,20 +6055,35 @@ impl MainWindow {
             .bg(ELEVATED_BACKGROUND_COLOR)
             .text_xs()
             .text_color(MUTED_TEXT_COLOR)
-            .child(path)
-            .child(repository.map_or_else(
-                || self.global_status_message.clone(),
-                |repository| repository.status_message.clone(),
-            ))
             .child(
-                self.git_version
-                    .clone()
-                    .unwrap_or_else(|| "Git no detectado".to_owned()),
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .id("status-path")
+                    .aria_label(path.clone())
+                    .child(path),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(PRIMARY_TEXT_COLOR)
+                    .child(status),
+            )
+            .child(div().flex_shrink_0().child(git_version))
             .into_any_element()
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        // La existencia en disco se comprueba al cargar el estado y al abrir cada clon:
+        // repetirla en cada frame de render supondría un acceso a disco por fotograma.
+        let ssh_clones = self.state.ssh_clone_mappings.clone();
         div()
             .flex()
             .flex_1()
@@ -3541,26 +6096,425 @@ impl MainWindow {
                 div()
                     .text_sm()
                     .text_color(MUTED_TEXT_COLOR)
-                    .child("Abre una carpeta que contenga un repositorio Git."),
+                    .child("Abre una carpeta local o clona un repositorio accesible por SSH."),
             )
             .child(
-                action_button("open-empty", "Abrir repositorio", true).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.open_repository(&OpenRepository, window, cx);
-                    },
-                )),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        action_button("open-empty", "Abrir repositorio", !self.clone_in_progress)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_repository(&OpenRepository, window, cx);
+                            })),
+                    )
+                    .child(
+                        action_button("clone-empty", "Clonar repositorio", !self.clone_in_progress)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_clone_panel(cx);
+                            })),
+                    ),
+            )
+            .when(!ssh_clones.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(MUTED_TEXT_COLOR)
+                                .child("Clones SSH recientes"),
+                        )
+                        .children(ssh_clones.into_iter().map(|mapping| {
+                            let label = mapping.local_path.display().to_string();
+                            let mapping_for_click = mapping.clone();
+                            action_button(
+                                format!("ssh-clone-{}", mapping.ssh_url_normalized),
+                                label,
+                                !self.clone_in_progress,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.open_ssh_clone_mapping(&mapping_for_click, cx);
+                                },
+                            ))
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_clone_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_00A0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w(px(560.0))
+                    .p_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(BORDER_COLOR)
+                    .bg(ELEVATED_BACKGROUND_COLOR)
+                    .child(div().text_lg().child("Clonar repositorio por SSH"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(MUTED_TEXT_COLOR)
+                            .child(
+                                "Pega una URL SSH (git@host:org/repo.git o ssh://…). Git Helper usa tu configuración SSH del sistema.",
+                            ),
+                    )
+                    .when_some(self.clone_url_input.clone(), |panel, input| {
+                        panel.child(input)
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                action_button(
+                                    "clone-cancel",
+                                    if self.clone_in_progress {
+                                        "Cancelar clonado"
+                                    } else {
+                                        "Cerrar"
+                                    },
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.clone_in_progress {
+                                        this.cancel_clone(cx);
+                                    } else {
+                                        this.clone_panel_visible = false;
+                                        cx.notify();
+                                    }
+                                })),
+                            )
+                            .child(
+                                action_button(
+                                    "clone-submit",
+                                    "Continuar",
+                                    !self.clone_in_progress,
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_clone_url(window, cx);
+                                })),
+                            ),
+                    )
+                    .when(self.clone_in_progress, |panel| {
+                        panel.child(
+                            div()
+                                .text_sm()
+                                .text_color(ACCENT_COLOR)
+                                .child("Clonando… puedes cancelar en cualquier momento."),
+                        )
+                    }),
+            )
+            .when(!self.state.recent_repositories.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .mt_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(MUTED_TEXT_COLOR)
+                                .child("Recientes"),
+                        )
+                        .children(self.state.recent_repositories.iter().enumerate().map(
+                            |(index, recent)| {
+                                let label = recent
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Repositorio")
+                                    .to_owned();
+                                let path = recent.clone();
+                                action_button(format!("recent-{index}"), label, true).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_recent_repository(path.clone(), cx);
+                                    }),
+                                )
+                            },
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_inaccessible_repository(
+        &self,
+        repository: &RepositorySession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let repository_id = repository.id;
+        let path = repository.root_path.display().to_string();
+        div()
+            .flex()
+            .flex_1()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_4()
+            .child(div().text_xl().child("Repositorio no disponible"))
+            .child(div().text_sm().text_color(MUTED_TEXT_COLOR).child(path))
+            .child(div().text_sm().text_color(MUTED_TEXT_COLOR).child(
+                repository.error.clone().unwrap_or_else(|| {
+                    "La ruta no responde. Comprueba el disco o la red.".to_owned()
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        action_button("retry-repository", "Reintentar", true).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.retry_repository_access(repository_id, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        action_button("close-inaccessible", "Cerrar pestaña", true).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.close_repository(repository_id, cx);
+                            }),
+                        ),
+                    ),
             )
             .into_any_element()
+    }
+}
+
+/// Lista de cambios o aviso de que el filtro no deja nada visible.
+fn change_list_or_empty(
+    rows: Arc<Vec<ChangeListRow>>,
+    row_count: usize,
+    repository_id: RepositoryId,
+    filtered_empty: bool,
+    scroll_handle: &UniformListScrollHandle,
+    cx: &mut Context<MainWindow>,
+) -> AnyElement {
+    if filtered_empty {
+        return state_card(
+            "change-state-no-matches",
+            "Sin coincidencias",
+            "Ningún archivo con cambios coincide con la consulta. Pulsa Escape en la búsqueda o usa Limpiar para volver a verlos todos.",
+            MUTED_TEXT_COLOR,
+        );
+    }
+    uniform_change_list(rows, row_count, repository_id, scroll_handle, cx)
+}
+
+fn uniform_change_list(
+    rows: Arc<Vec<ChangeListRow>>,
+    row_count: usize,
+    repository_id: RepositoryId,
+    scroll_handle: &UniformListScrollHandle,
+    cx: &mut Context<MainWindow>,
+) -> AnyElement {
+    uniform_list(
+        gpui::ElementId::from(format!("change-list-{repository_id:?}")),
+        row_count,
+        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+            rows[range]
+                .iter()
+                .cloned()
+                .map(|row| this.render_change_row(repository_id, row, window, cx))
+                .collect()
+        }),
+    )
+    .track_scroll(scroll_handle)
+    .w_full()
+    .flex_1()
+    .into_any_element()
+}
+
+fn state_banner(title: &str, message: &str, color: gpui::Rgba) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(BORDER_COLOR)
+        .bg(ELEVATED_BACKGROUND_COLOR)
+        .child(div().text_xs().text_color(color).child(title.to_owned()))
+        .child(
+            div()
+                .text_xs()
+                .text_color(MUTED_TEXT_COLOR)
+                .child(message.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn state_card(id: &str, title: &str, message: &str, color: gpui::Rgba) -> AnyElement {
+    div()
+        .id(id.to_owned())
+        .flex()
+        .flex_1()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_5()
+        .text_center()
+        .child(div().text_lg().text_color(color).child(title.to_owned()))
+        .child(
+            div()
+                .max_w(px(520.0))
+                .text_sm()
+                .text_color(MUTED_TEXT_COLOR)
+                .child(message.to_owned()),
+        )
+        .into_any_element()
+}
+
+const fn search_scope_for(view: RepositoryView) -> SearchScope {
+    match view {
+        RepositoryView::Changes => SearchScope::Changes,
+        RepositoryView::History => SearchScope::History,
+    }
+}
+
+/// Describe la consulta activa, los resultados y el avance del recorrido.
+fn history_search_summary(query: Option<&SearchQuery>, search: Option<&HistorySearch>) -> String {
+    let Some(query) = query else {
+        return "Busca por mensaje, autor o hash con Ctrl+F. Escape limpia la consulta.".to_owned();
+    };
+    let Some(search) = search else {
+        return format!("Consulta «{}» · preparando búsqueda…", query.raw());
+    };
+    let results = if search.matches.is_empty() && !search.scanning {
+        "sin coincidencias".to_owned()
+    } else {
+        format!("{} resultados", search.matches.len())
+    };
+    let progress = if search.scanning {
+        "buscando…"
+    } else if search.exhausted {
+        "referencia explorada por completo"
+    } else {
+        "quedan commits por explorar"
+    };
+    format!(
+        "Consulta «{}» · {results} · {} commits explorados · {progress}",
+        query.raw(),
+        search.scanned
+    )
+}
+
+fn repository_content_state(repository: &RepositorySession) -> RepositoryContentState {
+    if !repository.has_loaded_snapshot {
+        return match repository.refresh_state {
+            RefreshState::Failed { .. } | RefreshState::Cancelled { .. } => {
+                RepositoryContentState::RefreshFailed
+            }
+            _ => RepositoryContentState::Loading,
+        };
+    }
+    if matches!(repository.refresh_state, RefreshState::Failed { .. }) {
+        return RepositoryContentState::Stale;
+    }
+    if repository.is_refreshing() {
+        return RepositoryContentState::Refreshing;
+    }
+    if repository.change_counters.change_count == 0 {
+        return if matches!(repository.working_tree.head, HeadState::Unborn) {
+            RepositoryContentState::NoInitialCommit
+        } else {
+            RepositoryContentState::Clean
+        };
+    }
+    RepositoryContentState::Changes
+}
+
+/// Fallo visible de una sesión: qué ocurrió, qué hacer a continuación y el
+/// detalle técnico depurado que se puede expandir o copiar.
+struct RepositoryFeedback {
+    summary: String,
+    next_step: Option<String>,
+    details: String,
+}
+
+/// La banda global no tiene detalle expandible, así que el siguiente paso se
+/// añade al mensaje cuando el error está clasificado.
+fn guided_error_text(error: &GitError) -> String {
+    error.recommended_action().map_or_else(
+        || error.user_message(),
+        |action| format!("{} Siguiente paso: {action}", error.user_message()),
+    )
+}
+
+fn repository_feedback(repository: &RepositorySession) -> Option<RepositoryFeedback> {
+    match &repository.refresh_state {
+        RefreshState::Failed {
+            message,
+            details,
+            next_step,
+        } => Some(RepositoryFeedback {
+            summary: message.clone(),
+            next_step: next_step
+                .clone()
+                .or_else(|| repository.error_next_step.clone())
+                .or_else(|| Some(GENERIC_REFRESH_NEXT_STEP.to_owned())),
+            details: details.clone(),
+        }),
+        _ => match &repository.mutation_state {
+            MutationState::Failed {
+                message,
+                details,
+                next_step,
+                ..
+            } => Some(RepositoryFeedback {
+                summary: message.clone(),
+                next_step: next_step
+                    .clone()
+                    .or_else(|| repository.error_next_step.clone())
+                    .or_else(|| Some(GENERIC_MUTATION_NEXT_STEP.to_owned())),
+                details: details.clone(),
+            }),
+            _ => repository.error.clone().map(|details| RepositoryFeedback {
+                summary:
+                    "No se pudo completar la acción. Revisa los detalles y vuelve a intentarlo."
+                        .to_owned(),
+                next_step: repository.error_next_step.clone(),
+                details,
+            }),
+        },
     }
 }
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.release_change_list_focus_if_hidden(window, cx);
+        self.process_pending_existing_clone_open(window, cx);
         let active_repository = self.active_repository().cloned();
         div()
             .key_context("GitHelper")
             .on_action(cx.listener(Self::open_repository))
+            .on_action(cx.listener(Self::clone_repository))
             .on_action(cx.listener(Self::close_active_repository))
             .on_action(cx.listener(Self::next_repository))
             .on_action(cx.listener(Self::previous_repository))
@@ -3571,6 +6525,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::generate_commit_message))
             .on_action(cx.listener(Self::stage_selection))
             .on_action(cx.listener(Self::unstage_selection))
+            .on_action(cx.listener(Self::find_in_view))
             .flex()
             .flex_col()
             .size_full()
@@ -3578,34 +6533,26 @@ impl Render for MainWindow {
             .text_color(PRIMARY_TEXT_COLOR)
             .child(self.render_repository_tabs(cx))
             .when_some(active_repository.clone(), |root, repository| {
-                root.child(self.render_toolbar(&repository, cx))
-                    .child(self.render_internal_tabs(&repository, cx))
-                    .child(match repository.selected_view {
-                        RepositoryView::Changes => self.render_changes(&repository, window, cx),
-                        RepositoryView::History => self.render_history(&repository, cx),
-                    })
+                if repository.path_accessible {
+                    root.child(self.render_toolbar(&repository, cx))
+                        .child(self.render_internal_tabs(&repository, cx))
+                        .child(match repository.selected_view {
+                            RepositoryView::Changes => self.render_changes(&repository, window, cx),
+                            RepositoryView::History => self.render_history(&repository, cx),
+                        })
+                } else {
+                    root.child(self.render_inaccessible_repository(&repository, cx))
+                }
             })
             .when(active_repository.is_none(), |root| {
                 root.child(self.render_empty_state(cx))
             })
-            .when_some(
-                active_repository
-                    .as_ref()
-                    .and_then(|repository| repository.error.clone()),
-                |root, error| {
-                    root.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(ERROR_COLOR)
-                            .bg(ELEVATED_BACKGROUND_COLOR)
-                            .text_sm()
-                            .text_color(ERROR_COLOR)
-                            .child(error),
-                    )
-                },
-            )
+            .when(self.clone_panel_visible || self.clone_in_progress, |root| {
+                root.child(self.render_clone_panel(cx))
+            })
+            .when_some(active_repository.as_ref(), |root, repository| {
+                root.child(self.render_repository_feedback(repository, cx))
+            })
             .when_some(self.global_error.clone(), |root, error| {
                 root.child(
                     div()
@@ -3623,6 +6570,22 @@ impl Render for MainWindow {
     }
 }
 
+fn repository_has_commits(head: &HeadState) -> bool {
+    match head {
+        HeadState::Branch { oid: Some(_), .. } | HeadState::Detached { .. } => true,
+        HeadState::Branch { oid: None, .. } | HeadState::Unborn => false,
+    }
+}
+
+fn head_label(head: &HeadState) -> String {
+    match head {
+        HeadState::Branch { name, oid: Some(_) } => name.clone(),
+        HeadState::Branch { name, oid: None } => format!("{name} (sin commits)"),
+        HeadState::Detached { .. } => "HEAD separado".to_owned(),
+        HeadState::Unborn => "Sin commit inicial".to_owned(),
+    }
+}
+
 fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
     match head {
         HeadState::Branch {
@@ -3637,8 +6600,148 @@ fn history_target_for_head(head: &HeadState) -> Option<(String, String)> {
 }
 
 fn history_target_is_current(repository: &RepositorySession, reference: &str, oid: &str) -> bool {
-    repository.snapshot.history_reference.as_deref() == Some(reference)
-        && repository.snapshot.history_oid.as_deref() == Some(oid)
+    repository.history.history_reference.as_deref() == Some(reference)
+        && repository.history.history_oid.as_deref() == Some(oid)
+}
+
+/// Objetivo de recarga cuando el historial visible quedó invalidado.
+///
+/// Respeta referencias fijadas con nombre; un OID suelto o HEAD desacoplado
+/// sigue al commit actual en lugar de quedar anclado.
+fn history_reload_target(repository: &RepositorySession) -> Option<(String, String)> {
+    if let Some(reference) = repository
+        .history
+        .history_reference
+        .as_ref()
+        .filter(|reference| reference.starts_with("refs/"))
+        .cloned()
+    {
+        return repository
+            .history
+            .history_oid
+            .clone()
+            .map(|oid| (reference, oid));
+    }
+    history_target_for_head(&repository.working_tree.head)
+}
+
+fn load_history_page(
+    git_client: &GitClient,
+    root_path: &Path,
+    head: &HeadState,
+    reference: &str,
+    expected_oid: &str,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<HistoryPage, GitError> {
+    let load = |reference: &str, expected_oid: &str| -> Result<HistoryPage, GitError> {
+        if reference.starts_with("refs/") {
+            git_client.history_for_ref(root_path, reference, history_limit + 1, 0, cancellation)
+        } else {
+            git_client.history_for_oid(
+                root_path,
+                reference,
+                expected_oid,
+                history_limit + 1,
+                0,
+                cancellation,
+            )
+        }
+    };
+    match load(reference, expected_oid) {
+        Ok(page) => Ok(page),
+        Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. })
+            if reference.starts_with("refs/") =>
+        {
+            let Some((fallback_reference, fallback_oid)) = history_target_for_head(head) else {
+                return Err(GitError::ReferenceNotFound {
+                    value: reference.to_owned(),
+                });
+            };
+            load(&fallback_reference, &fallback_oid)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Lee el working tree y el historial de la referencia fijada por la vista.
+///
+/// La fijación solo se respeta si es una referencia con nombre. Un OID suelto
+/// —HEAD desacoplado— no puede fijarse: se quedaría anclado al commit anterior
+/// y los commits nuevos no aparecerían nunca.
+///
+/// Si la referencia fijada ya no existe, el historial vuelve a HEAD en lugar de
+/// hacer fallar todo el refresco: el estado del repositorio sigue siendo válido
+/// y una rama borrada no debe dejar la sesión en error de forma permanente.
+fn snapshot_with_history_target(
+    git_client: &GitClient,
+    root_path: &Path,
+    history_target: Option<(String, String)>,
+    history_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<RefreshPayload, GitError> {
+    let working_tree = git_client.snapshot(root_path, cancellation)?;
+    let pinned_reference = history_target
+        .map(|(reference, _)| reference)
+        .filter(|reference| reference.starts_with("refs/"));
+    let history = match pinned_reference {
+        Some(reference) => {
+            match git_client.history_for_ref(
+                root_path,
+                &reference,
+                history_limit + 1,
+                0,
+                cancellation,
+            ) {
+                Ok(page) => history_snapshot_from_page(page, history_limit),
+                Err(GitError::ReferenceNotFound { .. } | GitError::InvalidReferenceName { .. }) => {
+                    git_client.history_page_as_snapshot(
+                        root_path,
+                        &working_tree.head,
+                        history_limit,
+                        0,
+                        cancellation,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => git_client.history_page_as_snapshot(
+            root_path,
+            &working_tree.head,
+            history_limit,
+            0,
+            cancellation,
+        )?,
+    };
+    Ok(RefreshPayload::WithHistory {
+        working_tree,
+        history,
+    })
+}
+
+fn history_details_key(repository: &RepositorySession) -> Option<HistoryDetailsKey> {
+    Some(HistoryDetailsKey {
+        reference: repository.history.history_reference.clone()?,
+        oid: repository.history.history_oid.clone()?,
+        commit_id: repository.selected_commit.clone()?,
+    })
+}
+
+fn history_snapshot_from_page(page: crate::domain::HistoryPage, limit: usize) -> HistorySnapshot {
+    let has_more_commits = page.commits.len() > limit;
+    HistorySnapshot {
+        commits: Arc::new(
+            page.commits
+                .into_iter()
+                .take(limit)
+                .map(|commit| commit.summary)
+                .collect(),
+        ),
+        has_more_commits,
+        history_reference: Some(page.reference),
+        history_oid: Some(page.oid),
+    }
 }
 
 const fn branch_kind_label(kind: BranchKind) -> &'static str {
@@ -3666,11 +6769,31 @@ fn branch_upstream_label(upstream: &BranchUpstream) -> String {
     }
 }
 
+/// Agrupa los cambios visibles, aplicando el filtro por ruta si lo hay.
+///
+/// Cada grupo conserva su propia entrada para un mismo archivo: filtrar no
+/// fusiona la fila staged con la unstaged ni comparte sus acciones.
+///
+/// Con filtro activo los botones de grupo desaparecen: `Stage todo` y
+/// `Unstage todo` actúan sobre el repositorio entero, no sobre lo visible, y
+/// ofrecerlos junto a una lista recortada invitaría a tocar archivos ocultos.
 fn build_change_rows(
     repository_id: RepositoryId,
     changes: &[FileChange],
     collapsed_groups: &HashSet<(RepositoryId, ChangeRepresentation)>,
+    query: Option<&SearchQuery>,
 ) -> Vec<ChangeListRow> {
+    let changes = match query {
+        Some(query) => Cow::Owned(
+            changes
+                .iter()
+                .filter(|change| change_matches(change, query))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        None => Cow::Borrowed(changes),
+    };
+    let group_action = |action: GroupAction| query.is_none().then_some(action);
     let groups = [
         (
             "Conflictos",
@@ -3685,7 +6808,7 @@ fn build_change_rows(
         (
             "Cambios staged",
             ChangeRepresentation::Staged,
-            Some(GroupAction::UnstageAll),
+            group_action(GroupAction::UnstageAll),
             changes
                 .iter()
                 .filter(|change| change.has_staged_change())
@@ -3695,7 +6818,7 @@ fn build_change_rows(
         (
             "Cambios",
             ChangeRepresentation::Worktree,
-            Some(GroupAction::StageAll),
+            group_action(GroupAction::StageAll),
             changes
                 .iter()
                 .filter(|change| change.has_worktree_change())
@@ -3705,7 +6828,7 @@ fn build_change_rows(
         (
             "Sin seguimiento",
             ChangeRepresentation::Untracked,
-            Some(GroupAction::StageAll),
+            group_action(GroupAction::StageAll),
             changes
                 .iter()
                 .filter(|change| change.is_untracked())
@@ -3779,6 +6902,16 @@ fn status_color(representation: ChangeRepresentation) -> gpui::Rgba {
     }
 }
 
+fn capture_window_placement(window: &Window) -> WindowPlacement {
+    let bounds = window.bounds();
+    WindowPlacement {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+    }
+}
+
 fn normalized_path_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
@@ -3797,6 +6930,7 @@ fn operation_running_message(kind: OperationKind) -> &'static str {
         OperationKind::Unstage => "Quitando del staging area…",
         OperationKind::Discard => "Descartando cambios…",
         OperationKind::Commit => "Creando commit…",
+        OperationKind::Clone => "Clonando repositorio…",
         OperationKind::Fetch => "Ejecutando fetch…",
         OperationKind::Pull => "Ejecutando pull --ff-only…",
         OperationKind::Push => "Ejecutando push…",
@@ -3811,6 +6945,7 @@ fn operation_success_message(kind: OperationKind) -> &'static str {
         OperationKind::Unstage => "Cambios retirados del staging area",
         OperationKind::Discard => "Cambios descartados",
         OperationKind::Commit => "Commit creado",
+        OperationKind::Clone => "Repositorio clonado",
         OperationKind::Fetch => "Fetch completado",
         OperationKind::Pull => "Pull completado",
         OperationKind::Push => "Push completado",
@@ -3818,8 +6953,67 @@ fn operation_success_message(kind: OperationKind) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessFailure {
+    Cancelled,
+    TimedOut(Duration),
+    Other,
+}
+
+fn classify_process_failure(error: &crate::process::ProcessError) -> ProcessFailure {
+    match error {
+        crate::process::ProcessError::Cancelled => ProcessFailure::Cancelled,
+        crate::process::ProcessError::TimedOut(timeout) => ProcessFailure::TimedOut(*timeout),
+        _ => ProcessFailure::Other,
+    }
+}
+
+fn classify_git_process_failure(error: &GitError) -> ProcessFailure {
+    match error {
+        GitError::Process(process_error) => classify_process_failure(process_error),
+        GitError::NotInstalled { source } => classify_process_failure(source),
+        _ => ProcessFailure::Other,
+    }
+}
+
+/// Operaciones que pueden mover referencias y, por tanto, invalidar el
+/// historial cacheado tanto si terminan bien como si se cancelan o agotan el
+/// tiempo: el proceso puede haber actualizado refs antes de ser terminado.
+const fn kind_can_move_references(kind: OperationKind) -> bool {
+    matches!(
+        kind,
+        OperationKind::Commit | OperationKind::Fetch | OperationKind::Pull | OperationKind::Push
+    )
+}
+
+fn classify_cursor_failure(error: &crate::cursor::CursorError) -> ProcessFailure {
+    match error {
+        crate::cursor::CursorError::Process(process_error) => {
+            classify_process_failure(process_error)
+        }
+        crate::cursor::CursorError::NotInstalled { source } => classify_process_failure(source),
+        _ => ProcessFailure::Other,
+    }
+}
+
+/// Formatea un timeout para texto visible: `Duration` en `Debug` produce
+/// unidades inconsistentes (`2s`, `1.5s`, `350ms`) dentro de una misma frase.
 fn is_cancelled_error(error: &GitError) -> bool {
     error.is_cancelled()
+}
+
+fn format_timeout(timeout: Duration) -> String {
+    let seconds = timeout.as_secs_f64();
+    if seconds >= 1.0 {
+        let rounded = seconds.round();
+        if (seconds - rounded).abs() < 0.05 {
+            format!("{rounded:.0} s")
+        } else {
+            format!("{seconds:.1} s")
+        }
+    } else {
+        format!("{} ms", timeout.as_millis())
+    }
 }
 
 fn action_button(
@@ -3842,6 +7036,25 @@ fn action_button(
             button.text_color(MUTED_TEXT_COLOR).opacity(0.55)
         })
         .child(label.into())
+}
+
+/// Botón que avanza una preferencia del mensaje en la capa seleccionada.
+fn commit_preference_button(
+    id: &'static str,
+    label: String,
+    field: CommitPreferenceField,
+    repository_id: RepositoryId,
+    cx: &mut Context<MainWindow>,
+) -> gpui::Stateful<gpui::Div> {
+    action_button(id, label, true).on_click(cx.listener(move |this, _, _, cx| {
+        this.cycle_commit_preference_field(repository_id, field, cx);
+    }))
+}
+
+/// El commit depende solo del estado Git y del borrador: las convenciones
+/// orientan la propuesta y nunca bloquean un mensaje escrito a mano.
+const fn can_create_commit(staged_count: usize, message_is_empty: bool, can_mutate: bool) -> bool {
+    staged_count > 0 && !message_is_empty && can_mutate
 }
 
 fn tab_button(
@@ -3878,7 +7091,14 @@ mod tests {
         thread,
     };
 
-    use crate::process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
+    use crate::{
+        domain::{CommitDetails, CommitSummary},
+        process::{ProcessError, ProcessOutput, ProcessRequest, ProcessRunner},
+    };
+
+    use crate::ui::history_selection::{
+        BeginDetailsSelection, DetailsCompletion, HistoryDetailsKey,
+    };
 
     use super::*;
 
@@ -3918,6 +7138,7 @@ mod tests {
 
     fn test_window(git_client: GitClient, repositories: Vec<RepositorySession>) -> MainWindow {
         MainWindow {
+            startup_store: None,
             state: AppState {
                 active_repository_id: repositories.first().map(|repository| repository.id),
                 repositories,
@@ -3925,9 +7146,13 @@ mod tests {
             },
             git_client,
             cursor_client: CursorClient::new(PathBuf::from("agent")),
-            state_store: None,
+            state_writer: None,
+            window_placement: None,
             commit_inputs: HashMap::new(),
             selected_commit_details: HashMap::new(),
+            history_details: HistoryDetailsController::default(),
+            history_detail_errors: HashMap::new(),
+            history_detail_cancellations: HashMap::new(),
             commit_input_subscriptions: HashMap::new(),
             window_subscriptions: Vec::new(),
             active_refresh_cancellations: HashMap::new(),
@@ -3938,14 +7163,154 @@ mod tests {
             pending_refreshes: HashSet::new(),
             global_refresh_in_flight: None,
             collapsed_groups: HashSet::new(),
+            expanded_errors: HashSet::new(),
             change_rows: HashMap::new(),
             change_list_focus: None,
             change_list_scrolls: HashMap::new(),
             save_generation: 0,
+            search_boxes: HashMap::new(),
+            history_searches: HashMap::new(),
+            history_search_cancellations: HashMap::new(),
             git_version: None,
             global_status_message: String::new(),
             global_error: None,
+            clone_panel_visible: false,
+            clone_url_input: None,
+            clone_in_progress: false,
+            active_clone_cancellation: None,
+            pending_existing_clone_open: None,
+            pending_startup_repository: None,
+            instance_request_receiver: None,
+            periodic_fetch_generation: 0,
+            periodic_fetch_in_flight: HashSet::new(),
+            active_fetch_contexts: HashMap::new(),
+            pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
+    }
+
+    #[test]
+    fn repository_overrides_only_affect_their_own_session() {
+        use crate::domain::{
+            CommitMessageLanguage, CommitMessagePreferenceOverrides, CommitMessagePreferences,
+        };
+
+        let overridden = RepositorySession::new(PathBuf::from(r"C:\repos\uno"));
+        let inherited = RepositorySession::new(PathBuf::from(r"C:\repos\dos"));
+        let overridden_id = overridden.id;
+        let inherited_id = inherited.id;
+        let mut window = test_window(GitClient::default(), vec![overridden, inherited]);
+        window.state.settings.commit_message_preferences = CommitMessagePreferences {
+            language: CommitMessageLanguage::Spanish,
+            ..CommitMessagePreferences::default()
+        };
+        window
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .insert(
+                normalized_repo_key(Path::new(r"C:\repos\uno")),
+                CommitMessagePreferenceOverrides {
+                    language: Some(CommitMessageLanguage::English),
+                    ..CommitMessagePreferenceOverrides::default()
+                },
+            );
+
+        let overridden_preferences = window.commit_preferences(overridden_id);
+        let inherited_preferences = window.commit_preferences(inherited_id);
+
+        assert_eq!(
+            overridden_preferences.values().language,
+            CommitMessageLanguage::English
+        );
+        assert!(overridden_preferences.has_repository_overrides());
+        assert_eq!(
+            inherited_preferences.values().language,
+            CommitMessageLanguage::Spanish
+        );
+        assert!(!inherited_preferences.has_repository_overrides());
+    }
+
+    #[test]
+    fn conventions_never_block_a_manual_commit() {
+        use crate::domain::{CommitMessageConvention, CommitMessagePreferences};
+
+        let preferences = CommitMessagePreferences {
+            convention: CommitMessageConvention::ConventionalCommits,
+            subject_max_length: 20,
+            ..CommitMessagePreferences::default()
+        };
+        let message = "Mensaje manual que ignora la convención y la longitud orientativa";
+
+        assert!(commit_message_guidance(message, preferences).is_some());
+        assert!(can_create_commit(1, message.trim().is_empty(), true));
+        assert!(!can_create_commit(0, message.trim().is_empty(), true));
+    }
+
+    #[test]
+    fn failed_refresh_after_fetch_releases_periodic_fetch_state() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        {
+            let working_tree = Arc::make_mut(&mut repository.working_tree);
+            working_tree.remotes.push(crate::domain::Remote {
+                name: "origin".to_owned(),
+            });
+            working_tree.upstream = Some(crate::domain::UpstreamState {
+                remote_name: "origin".to_owned(),
+                branch_name: "main".to_owned(),
+                full_name: "origin/main".to_owned(),
+                ahead: 0,
+                behind: 0,
+            });
+        }
+        repository
+            .remote_freshness
+            .mark_fetch_started("origin", 100);
+        repository.remote_freshness.schedule_immediately(100);
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.settings.periodic_fetch_enabled = true;
+        window
+            .pending_fetch_refresh
+            .insert(repository_id, ("origin".to_owned(), FetchOrigin::Periodic));
+        window
+            .periodic_fetch_in_flight
+            .insert((repository_id, "origin".to_owned()));
+
+        let pending = window.prepare_refresh(repository_id).unwrap();
+        let outcome = window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            true,
+            Err(GitError::InvalidStatus {
+                message: "refresh roto".to_owned(),
+            }),
+        );
+
+        assert!(!outcome.succeeded);
+        assert!(window.pending_fetch_refresh.is_empty());
+        assert!(window.periodic_fetch_in_flight.is_empty());
+        let repository = &window.state.repositories[0];
+        assert!(
+            !repository
+                .remote_freshness
+                .record("origin")
+                .expect("debe existir el remote")
+                .fetch_in_progress
+        );
+        assert!(
+            select_periodic_fetch(
+                u64::MAX / 2,
+                Some(repository_id),
+                &window.state.repositories,
+                true,
+                crate::domain::DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
+                &window.state.settings.repository_preferred_remotes,
+                &window.periodic_fetch_in_flight,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -3978,7 +7343,8 @@ mod tests {
             repository_id,
             first_generation,
             first_include_history,
-            first_result,
+            true,
+            first_result.map(RefreshPayload::WorkingTree),
         );
         assert_eq!(first_outcome.continuation, RefreshContinuation::Repeat);
 
@@ -3990,7 +7356,8 @@ mod tests {
             repository_id,
             follow_up.generation,
             follow_up.include_history,
-            follow_up_result,
+            true,
+            follow_up_result.map(RefreshPayload::WorkingTree),
         );
 
         assert_eq!(
@@ -4005,13 +7372,13 @@ mod tests {
             .find(|repository| repository.id == repository_id)
             .unwrap();
         assert_eq!(
-            repository.snapshot.head,
+            repository.working_tree.head,
             HeadState::Branch {
                 name: "main".to_owned(),
                 oid: Some("new".to_owned()),
             }
         );
-        assert_eq!(repository.snapshot.changes.len(), 1);
+        assert_eq!(repository.working_tree.changes.len(), 1);
     }
 
     #[test]
@@ -4030,20 +7397,21 @@ mod tests {
             old_id,
             pending.generation,
             pending.include_history,
-            Ok(RepositorySnapshot {
+            true,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
                 head: HeadState::Branch {
                     name: "stale".to_owned(),
                     oid: Some("old".to_owned()),
                 },
-                ..RepositorySnapshot::default()
-            }),
+                ..WorkingTreeSnapshot::default()
+            })),
         );
 
         assert!(!outcome.succeeded);
         assert!(!window.repository_session_is_open(old_id));
         assert!(window.repository_session_is_open(reopened_id));
         assert_eq!(
-            window.state.repositories[0].snapshot.head,
+            window.state.repositories[0].working_tree.head,
             HeadState::Unborn
         );
     }
@@ -4059,9 +7427,35 @@ mod tests {
         };
 
         assert!(window.prepare_refresh(repository_id).is_none());
+        assert!(window.pending_refreshes.contains(&repository_id));
         window.state.repositories[0].mutation_state = MutationState::Cancelled {
             kind: OperationKind::Stage,
             message: "cancelada".to_owned(),
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_some());
+        assert!(matches!(
+            window.state.repositories[0].refresh_state,
+            RefreshState::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn invalidation_during_ai_generation_reconciles_after_finish() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].mutation_state = MutationState::Running {
+            kind: OperationKind::GenerateCommitMessage,
+            generation: 0,
+        };
+
+        assert!(window.prepare_refresh(repository_id).is_none());
+        assert!(window.pending_refreshes.contains(&repository_id));
+
+        window.state.repositories[0].mutation_state = MutationState::Succeeded {
+            kind: OperationKind::GenerateCommitMessage,
+            message: "Mensaje generado".to_owned(),
         };
 
         assert!(window.prepare_refresh(repository_id).is_some());
@@ -4084,6 +7478,7 @@ mod tests {
             second_id,
             pending.generation,
             pending.include_history,
+            true,
             Err(GitError::InvalidStatus {
                 message: "respuesta rota".to_owned(),
             }),
@@ -4109,12 +7504,63 @@ mod tests {
     }
 
     #[test]
+    fn refresh_failure_marks_a_lost_repository_unavailable() {
+        let repository = RepositorySession::new(PathBuf::from("disconnected"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            false,
+            Err(GitError::Io {
+                path: PathBuf::from("disconnected"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            }),
+        );
+
+        let repository = &window.state.repositories[0];
+        assert!(!repository.path_accessible);
+        assert_eq!(repository.status_message, "Repositorio no disponible");
+        assert!(
+            repository
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reintentar"))
+        );
+    }
+
+    #[test]
+    fn working_tree_refresh_error_does_not_clear_history_loading() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.history_loading = true;
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        assert!(!pending.include_history);
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            true,
+            Err(GitError::InvalidStatus {
+                message: "respuesta rota".to_owned(),
+            }),
+        );
+
+        assert!(window.state.repositories[0].history_loading);
+    }
+
+    #[test]
     fn rapid_branch_selection_rejects_the_previous_response() {
         let mut repository = RepositorySession::new(PathBuf::from("repo"));
         {
-            let snapshot = Arc::make_mut(&mut repository.snapshot);
-            snapshot.history_reference = Some("refs/heads/first".to_owned());
-            snapshot.history_oid = Some("1111".to_owned());
+            let history = Arc::make_mut(&mut repository.history);
+            history.history_reference = Some("refs/heads/first".to_owned());
+            history.history_oid = Some("1111".to_owned());
         }
         assert!(history_target_is_current(
             &repository,
@@ -4123,9 +7569,9 @@ mod tests {
         ));
 
         {
-            let snapshot = Arc::make_mut(&mut repository.snapshot);
-            snapshot.history_reference = Some("refs/heads/second".to_owned());
-            snapshot.history_oid = Some("2222".to_owned());
+            let history = Arc::make_mut(&mut repository.history);
+            history.history_reference = Some("refs/heads/second".to_owned());
+            history.history_oid = Some("2222".to_owned());
         }
         assert!(!history_target_is_current(
             &repository,
@@ -4158,6 +7604,24 @@ mod tests {
     }
 
     #[test]
+    fn labels_an_unborn_branch_without_hiding_its_name() {
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: None,
+            }),
+            "main (sin commits)"
+        );
+        assert_eq!(
+            head_label(&HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("abc".to_owned()),
+            }),
+            "main"
+        );
+    }
+
+    #[test]
     fn active_repository_waits_for_the_single_global_refresh_slot() {
         let first = RepositorySession::new(PathBuf::from("first"));
         let second = RepositorySession::new(PathBuf::from("second"));
@@ -4174,13 +7638,313 @@ mod tests {
             first_id,
             first_refresh.generation,
             first_refresh.include_history,
-            Ok(RepositorySnapshot::default()),
+            true,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot::default())),
         );
         let second_refresh = window.prepare_refresh(second_id).unwrap();
 
         assert_eq!(window.global_refresh_in_flight, Some(second_id));
         assert!(!window.pending_refreshes.contains(&second_id));
         assert!(second_refresh.generation > 0);
+    }
+
+    fn sample_commit_summary(index: usize) -> CommitSummary {
+        CommitSummary {
+            id: format!("commit-{index:05}"),
+            short_id: format!("{index:05}"),
+            subject: format!("Subject {index}"),
+            author_name: "Author".to_owned(),
+            author_email: "author@example.com".to_owned(),
+            authored_at: i64::try_from(index).unwrap_or(0),
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn working_tree_refresh_preserves_large_history_without_cloning() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let large_commits = Arc::new(
+            (0..10_000)
+                .map(sample_commit_summary)
+                .collect::<Vec<CommitSummary>>(),
+        );
+        let mut repository = repository;
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::clone(&large_commits),
+            has_more_commits: true,
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("abcd".to_owned()),
+        });
+        repository.history_loaded = true;
+        let history_before = Arc::clone(&repository.history);
+        let commits_before = Arc::clone(&repository.history.commits);
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+
+        let outcome = window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            true,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
+                changes: vec![FileChange {
+                    path: PathBuf::from("changed.txt"),
+                    original_path: None,
+                    index_status: ChangeKind::Unmodified,
+                    worktree_status: ChangeKind::Modified,
+                    is_conflicted: false,
+                }],
+                ..WorkingTreeSnapshot::default()
+            })),
+        );
+
+        assert!(outcome.succeeded);
+        let repository = window
+            .state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .unwrap();
+        assert_eq!(repository.working_tree.changes.len(), 1);
+        assert_eq!(repository.history.commits.len(), 10_000);
+        assert!(Arc::ptr_eq(&repository.history, &history_before));
+        assert!(Arc::ptr_eq(&repository.history.commits, &commits_before));
+    }
+
+    #[test]
+    #[ignore = "medición de rendimiento manual; no usar como puerta determinista"]
+    fn finish_refresh_comparison_cost_is_bounded_with_large_history() {
+        let large_commits = Arc::new(
+            (0..10_000)
+                .map(sample_commit_summary)
+                .collect::<Vec<CommitSummary>>(),
+        );
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::clone(&large_commits),
+            has_more_commits: true,
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("abcd".to_owned()),
+        });
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        let pending = window.prepare_refresh(repository_id).unwrap();
+        let incoming = WorkingTreeSnapshot {
+            changes: vec![FileChange {
+                path: PathBuf::from("changed.txt"),
+                original_path: None,
+                index_status: ChangeKind::Unmodified,
+                worktree_status: ChangeKind::Modified,
+                is_conflicted: false,
+            }],
+            ..WorkingTreeSnapshot::default()
+        };
+
+        let start = std::time::Instant::now();
+        window.finish_refresh(
+            repository_id,
+            pending.generation,
+            pending.include_history,
+            true,
+            Ok(RefreshPayload::WorkingTree(incoming)),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 50,
+            "finish_refresh tardó {elapsed:?}; no debe escalar con el historial cargado"
+        );
+    }
+
+    #[test]
+    fn history_reload_target_honours_a_pinned_branch() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("abc123".to_owned()),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            history_reference: Some("refs/heads/feature".to_owned()),
+            history_oid: Some("def456".to_owned()),
+            ..HistorySnapshot::empty()
+        });
+
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("refs/heads/feature".to_owned(), "def456".to_owned()))
+        );
+    }
+
+    #[test]
+    fn history_reload_target_ignores_a_detached_oid_pin() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Detached {
+                oid: "new-head".to_owned(),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            history_reference: Some("old-head".to_owned()),
+            history_oid: Some("old-head".to_owned()),
+            ..HistorySnapshot::empty()
+        });
+
+        assert_eq!(
+            history_reload_target(&repository),
+            Some(("new-head".to_owned(), "new-head".to_owned()))
+        );
+    }
+
+    fn summary(id: &str) -> CommitSummary {
+        CommitSummary {
+            id: id.to_owned(),
+            short_id: id.to_owned(),
+            subject: String::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            authored_at: 0,
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_a_selected_commit_that_is_still_visible() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("keep".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("keep")]),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(
+            window.reconcile_selected_commit(repository_id),
+            Some("keep".to_owned())
+        );
+        assert_eq!(
+            window.state.repositories[0].selected_commit.as_deref(),
+            Some("keep")
+        );
+    }
+
+    #[test]
+    fn refresh_clears_a_selected_commit_that_left_the_visible_history() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("gone".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("other")]),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(window.reconcile_selected_commit(repository_id), None);
+        assert!(window.state.repositories[0].selected_commit.is_none());
+    }
+
+    #[test]
+    fn refresh_clears_paginated_selection_with_explicit_fallback() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.selected_commit = Some("deep".to_owned());
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("recent")]),
+            has_more_commits: true,
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        assert_eq!(window.reconcile_selected_commit(repository_id), None);
+        assert!(window.state.repositories[0].selected_commit.is_none());
+        assert!(window.history_detail_errors.contains_key(&repository_id));
+    }
+
+    #[test]
+    fn head_change_during_details_load_cancels_active_request() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        repository.selected_view = RepositoryView::History;
+        repository.history_loaded = true;
+        repository.refresh_generation = 1;
+        repository.selected_commit = Some("commit-a".to_owned());
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
+            head: HeadState::Branch {
+                name: "main".to_owned(),
+                oid: Some("old-oid".to_owned()),
+            },
+            ..WorkingTreeSnapshot::default()
+        });
+        repository.history = Arc::new(HistorySnapshot {
+            commits: Arc::new(vec![summary("commit-a")]),
+            history_reference: Some("refs/heads/main".to_owned()),
+            history_oid: Some("old-oid".to_owned()),
+            ..HistorySnapshot::empty()
+        });
+        let mut window = test_window(GitClient::default(), vec![repository]);
+
+        let history_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "old-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        let request = match window
+            .history_details
+            .begin(repository_id, 1, history_key.clone())
+        {
+            BeginDetailsSelection::Loading(request) => request,
+            BeginDetailsSelection::Cached(_) => panic!("la prueba necesita una carga en curso"),
+        };
+        assert!(window.history_details.is_loading(repository_id));
+
+        let outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            true,
+            Ok(RefreshPayload::WorkingTree(WorkingTreeSnapshot {
+                head: HeadState::Branch {
+                    name: "main".to_owned(),
+                    oid: Some("new-oid".to_owned()),
+                },
+                ..WorkingTreeSnapshot::default()
+            })),
+        );
+        assert!(outcome.succeeded);
+
+        assert!(!window.history_details.is_loading(repository_id));
+        let current_generation = window.state.repositories[0].history_generation;
+        let current_key = HistoryDetailsKey {
+            reference: "refs/heads/main".to_owned(),
+            oid: "old-oid".to_owned(),
+            commit_id: "commit-a".to_owned(),
+        };
+        assert!(matches!(
+            window.history_details.complete(
+                &request,
+                Ok(CommitDetails {
+                    summary: summary("commit-a"),
+                    body: String::new(),
+                    committer_name: String::new(),
+                    committer_email: String::new(),
+                    committed_at: 0,
+                    parent_ids: Vec::new(),
+                }),
+                current_generation,
+                Some(&current_key),
+                Some("commit-a"),
+            ),
+            DetailsCompletion::Stale
+        ));
+        assert!(!window.history_details.is_loading(repository_id));
     }
 
     #[test]
@@ -4207,6 +7971,108 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_mutation_shows_the_next_safe_step_next_to_the_technical_detail() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let error = crate::git::classify_command_failure(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.",
+            Some(128),
+        );
+        repository.mutation_state = MutationState::Failed {
+            kind: OperationKind::Commit,
+            message: error.user_message(),
+            details: error.technical_details(),
+            next_step: error.recommended_action(),
+        };
+        repository.set_error(error.technical_details(), error.recommended_action());
+
+        let feedback = repository_feedback(&repository).expect("debe haber feedback visible");
+
+        assert!(feedback.summary.contains("bloqueado"));
+        assert!(feedback.details.contains("index.lock"));
+        let next_step = feedback.next_step.expect("debe proponer un siguiente paso");
+        assert!(next_step.contains("Git Helper no lo elimina"));
+    }
+
+    #[test]
+    fn an_unclassified_failure_keeps_details_and_a_generic_next_step() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.refresh_state = RefreshState::Failed {
+            message: "Git rechazó la operación".to_owned(),
+            details: "error: algo inesperado".to_owned(),
+            next_step: None,
+        };
+
+        let feedback = repository_feedback(&repository).expect("debe haber feedback visible");
+
+        assert_eq!(feedback.details, "error: algo inesperado");
+        assert_eq!(
+            feedback.next_step.as_deref(),
+            Some(GENERIC_REFRESH_NEXT_STEP)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_operation_shows_no_failure_feedback() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.set_error("algo falló", Some("haz esto".to_owned()));
+        repository.clear_error();
+        repository.mutation_state = MutationState::Cancelled {
+            kind: OperationKind::Commit,
+            message: "Operación cancelada".to_owned(),
+        };
+
+        assert!(repository_feedback(&repository).is_none());
+        assert!(repository.error_next_step.is_none());
+    }
+
+    #[test]
+    fn repository_content_states_distinguish_loading_clean_stale_and_unborn() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Loading
+        );
+
+        repository.refresh_state = RefreshState::Failed {
+            message: "fallo".to_owned(),
+            details: "stderr".to_owned(),
+            next_step: None,
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::RefreshFailed
+        );
+
+        repository.has_loaded_snapshot = true;
+        repository.refresh_state = RefreshState::Succeeded {
+            message: "ok".to_owned(),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::NoInitialCommit
+        );
+
+        Arc::make_mut(&mut repository.working_tree).head = HeadState::Branch {
+            name: "main".to_owned(),
+            oid: Some("abc".to_owned()),
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Clean
+        );
+
+        repository.refresh_state = RefreshState::Failed {
+            message: "fallo".to_owned(),
+            details: "stderr".to_owned(),
+            next_step: None,
+        };
+        assert_eq!(
+            repository_content_state(&repository),
+            RepositoryContentState::Stale
+        );
+    }
+
+    #[test]
     fn staged_and_worktree_rows_have_distinct_action_ids() {
         let path = Path::new("src/main.rs");
 
@@ -4229,6 +8095,10 @@ mod tests {
         }
     }
 
+    fn tracked_change(path: &str) -> FileChange {
+        change(path, ChangeKind::Modified, ChangeKind::Modified)
+    }
+
     fn conflicted(path: &str) -> FileChange {
         FileChange {
             path: PathBuf::from(path),
@@ -4241,10 +8111,12 @@ mod tests {
 
     fn window_with_changes(changes: Vec<FileChange>) -> (MainWindow, RepositoryId) {
         let mut repository = RepositorySession::new(PathBuf::from("repo"));
-        repository.snapshot = Arc::new(RepositorySnapshot {
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
             changes,
-            ..RepositorySnapshot::default()
+            ..WorkingTreeSnapshot::default()
         });
+        repository.change_counters = repository.working_tree.change_counters();
+        repository.has_loaded_snapshot = true;
         let repository_id = repository.id;
         let window = test_window(GitClient::default(), vec![repository]);
         (window, repository_id)
@@ -4257,10 +8129,11 @@ mod tests {
             .iter_mut()
             .find(|repository| repository.id == repository_id)
             .unwrap();
-        repository.snapshot = Arc::new(RepositorySnapshot {
+        repository.working_tree = Arc::new(WorkingTreeSnapshot {
             changes,
-            ..RepositorySnapshot::default()
+            ..WorkingTreeSnapshot::default()
         });
+        repository.change_counters = repository.working_tree.change_counters();
         window.change_rows.remove(&repository_id);
     }
 
@@ -4452,6 +8325,240 @@ mod tests {
         );
     }
 
+    fn row_paths(rows: &[ChangeListRow], wanted: ChangeRepresentation) -> Vec<PathBuf> {
+        rows.iter()
+            .filter_map(|row| match row {
+                ChangeListRow::File {
+                    change,
+                    representation,
+                } if *representation == wanted => Some(change.path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn filtering_changes_keeps_staged_and_worktree_rows_independent() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![
+            tracked_change("src/ui/main_window.rs"),
+            tracked_change("README.md"),
+        ];
+        let query = SearchQuery::parse("MAIN_window").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        // El mismo archivo sigue teniendo una fila staged y otra de worktree,
+        // cada una con su propia acción.
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Staged),
+            vec![PathBuf::from("src/ui/main_window.rs")]
+        );
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Worktree),
+            vec![PathBuf::from("src/ui/main_window.rs")]
+        );
+        assert_ne!(
+            change_row_action_id(
+                "stage-toggle",
+                Path::new("src/ui/main_window.rs"),
+                ChangeRepresentation::Staged
+            ),
+            change_row_action_id(
+                "stage-toggle",
+                Path::new("src/ui/main_window.rs"),
+                ChangeRepresentation::Worktree
+            )
+        );
+    }
+
+    #[test]
+    fn filtering_changes_hides_bulk_group_actions() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![tracked_change("src/main.rs")];
+
+        let unfiltered = build_change_rows(repository_id, &changes, &HashSet::new(), None);
+        let query = SearchQuery::parse("main").unwrap();
+        let filtered = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        let has_action = |rows: &[ChangeListRow]| {
+            rows.iter().any(|row| {
+                matches!(
+                    row,
+                    ChangeListRow::Group {
+                        action: Some(_),
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(has_action(&unfiltered));
+        // «Stage todo» actuaría sobre archivos que el filtro está ocultando.
+        assert!(!has_action(&filtered));
+    }
+
+    #[test]
+    fn filtering_changes_without_matches_leaves_no_rows() {
+        let repository_id = RepositoryId::default();
+        let changes = vec![tracked_change("src/main.rs")];
+        let query = SearchQuery::parse("inexistente").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn filtering_ten_thousand_changes_keeps_only_the_matching_paths() {
+        let repository_id = RepositoryId::default();
+        let changes = (0..10_000)
+            .map(|index| tracked_change(&format!("src/modulo{index}/archivo.rs")))
+            .collect::<Vec<_>>();
+        let query = SearchQuery::parse("modulo7/").unwrap();
+
+        let rows = build_change_rows(repository_id, &changes, &HashSet::new(), Some(&query));
+
+        // Solo `src/modulo7/`: los prefijos como `modulo70` no llevan barra ahí.
+        assert_eq!(
+            row_paths(&rows, ChangeRepresentation::Staged),
+            vec![PathBuf::from("src/modulo7/archivo.rs")]
+        );
+    }
+
+    fn search_page(reference: &str, oid: &str, subjects: &[&str]) -> HistoryPage {
+        HistoryPage {
+            reference: reference.to_owned(),
+            oid: oid.to_owned(),
+            commits: subjects
+                .iter()
+                .enumerate()
+                .map(|(index, subject)| CommitDetails {
+                    summary: CommitSummary {
+                        id: format!("{index:040x}"),
+                        short_id: format!("{index:07x}"),
+                        subject: (*subject).to_owned(),
+                        author_name: "Autora".to_owned(),
+                        author_email: "autora@example.test".to_owned(),
+                        authored_at: 0,
+                        references: Vec::new(),
+                    },
+                    body: String::new(),
+                    committer_name: "Autora".to_owned(),
+                    committer_email: "autora@example.test".to_owned(),
+                    committed_at: 0,
+                    parent_ids: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn started_search(query: &str) -> HistorySearch {
+        HistorySearch {
+            query: query.to_owned(),
+            generation: 3,
+            reference: Some("refs/heads/main".to_owned()),
+            oid: Some("abc".to_owned()),
+            ..HistorySearch::default()
+        }
+    }
+
+    #[test]
+    fn history_search_accumulates_matches_across_pages() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let first = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno", "otra cosa"]),
+        );
+
+        assert_eq!(first, HistorySearchPage::Applied);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.scanned, 2);
+        // Una página más corta de lo pedido significa referencia agotada.
+        assert!(search.exhausted);
+    }
+
+    #[test]
+    fn history_search_discards_pages_from_a_previous_query() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let outcome = search.apply_page(
+            2,
+            0,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno"]),
+        );
+
+        assert_eq!(outcome, HistorySearchPage::Stale);
+        assert!(search.matches.is_empty());
+        assert_eq!(search.scanned, 0);
+    }
+
+    #[test]
+    fn history_search_discards_pages_from_another_reference() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let other_reference = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/otra", "abc", &["arreglo uno"]),
+        );
+        let other_oid = search.apply_page(
+            3,
+            0,
+            &query,
+            search_page("refs/heads/main", "def", &["arreglo uno"]),
+        );
+
+        assert_eq!(other_reference, HistorySearchPage::Stale);
+        assert_eq!(other_oid, HistorySearchPage::Stale);
+        assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn history_search_discards_pages_read_from_another_offset() {
+        let mut search = started_search("arreglo");
+        let query = SearchQuery::parse(&search.query).unwrap();
+
+        let outcome = search.apply_page(
+            3,
+            120,
+            &query,
+            search_page("refs/heads/main", "abc", &["arreglo uno"]),
+        );
+
+        assert_eq!(outcome, HistorySearchPage::Stale);
+        assert_eq!(search.scanned, 0);
+    }
+
+    #[test]
+    fn history_search_summary_reports_query_results_and_progress() {
+        let query = SearchQuery::parse("arreglo").unwrap();
+        let mut search = started_search("arreglo");
+        search.scanned = 500;
+        search.scanning = true;
+
+        let scanning = history_search_summary(Some(&query), Some(&search));
+        assert!(scanning.contains("«arreglo»"), "{scanning}");
+        assert!(scanning.contains("500 commits explorados"), "{scanning}");
+        assert!(scanning.contains("buscando"), "{scanning}");
+
+        search.scanning = false;
+        search.exhausted = true;
+        let empty = history_search_summary(Some(&query), Some(&search));
+        assert!(empty.contains("sin coincidencias"), "{empty}");
+        assert!(empty.contains("por completo"), "{empty}");
+
+        let inactive = history_search_summary(None, None);
+        assert!(inactive.contains("Ctrl+F"), "{inactive}");
+    }
+
     #[cfg(windows)]
     fn success_status() -> ExitStatus {
         use std::os::windows::process::ExitStatusExt;
@@ -4474,7 +8581,155 @@ mod tests {
             stderr: "hook rejected the commit".to_owned(),
         };
 
-        assert!(is_cancelled_error(&cancelled));
-        assert!(!is_cancelled_error(&failed));
+        assert_eq!(
+            classify_git_process_failure(&cancelled),
+            ProcessFailure::Cancelled
+        );
+        assert_eq!(classify_git_process_failure(&failed), ProcessFailure::Other);
+    }
+
+    #[test]
+    fn interrupted_reference_moving_operations_invalidate_the_cached_history() {
+        for kind in [
+            OperationKind::Commit,
+            OperationKind::Fetch,
+            OperationKind::Pull,
+            OperationKind::Push,
+        ] {
+            assert!(kind_can_move_references(kind));
+        }
+        for kind in [
+            OperationKind::Refresh,
+            OperationKind::Stage,
+            OperationKind::Unstage,
+            OperationKind::Discard,
+            OperationKind::GenerateCommitMessage,
+        ] {
+            assert!(!kind_can_move_references(kind));
+        }
+    }
+
+    #[test]
+    fn timeouts_are_formatted_with_consistent_units() {
+        assert_eq!(format_timeout(Duration::from_secs(2)), "2 s");
+        assert_eq!(format_timeout(Duration::from_millis(1500)), "1.5 s");
+        assert_eq!(format_timeout(Duration::from_millis(350)), "350 ms");
+    }
+
+    #[test]
+    fn process_failure_classification_preserves_cancelled_and_timed_out() {
+        assert_eq!(
+            classify_git_process_failure(&GitError::Process(
+                crate::process::ProcessError::Cancelled
+            )),
+            ProcessFailure::Cancelled
+        );
+        assert_eq!(
+            classify_git_process_failure(&GitError::Process(
+                crate::process::ProcessError::TimedOut(Duration::from_secs(3))
+            )),
+            ProcessFailure::TimedOut(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn refresh_failures_leave_cancelled_and_timed_out_states_distinct() {
+        let repository = RepositorySession::new(PathBuf::from("repo"));
+        let repository_id = repository.id;
+        let mut window = test_window(GitClient::default(), vec![repository]);
+        window.state.repositories[0].refresh_generation = 1;
+
+        let cancelled_outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            true,
+            Err(GitError::Process(crate::process::ProcessError::Cancelled)),
+        );
+        assert!(cancelled_outcome.should_notify);
+        assert!(matches!(
+            &window.state.repositories[0].refresh_state,
+            RefreshState::Cancelled {
+                message,
+            } if message == "Actualización cancelada"
+        ));
+
+        window.state.repositories[0].refresh_generation = 1;
+        let timed_out_outcome = window.finish_refresh(
+            repository_id,
+            1,
+            false,
+            true,
+            Err(GitError::Process(crate::process::ProcessError::TimedOut(
+                Duration::from_secs(2),
+            ))),
+        );
+        assert!(timed_out_outcome.should_notify);
+        assert!(matches!(
+            &window.state.repositories[0].refresh_state,
+            RefreshState::Failed { message, .. }
+                if message == "La actualización agotó el tiempo máximo de 2 s"
+        ));
+    }
+
+    #[test]
+    fn reconciled_snapshot_replaces_the_state_left_by_a_failed_or_cancelled_mutation() {
+        let previous_change = FileChange {
+            path: PathBuf::from("old.txt"),
+            original_path: None,
+            index_status: ChangeKind::Unmodified,
+            worktree_status: ChangeKind::Modified,
+            is_conflicted: false,
+        };
+        let actual_change = FileChange {
+            path: PathBuf::from("new.txt"),
+            original_path: None,
+            index_status: ChangeKind::Unmodified,
+            worktree_status: ChangeKind::Untracked,
+            is_conflicted: false,
+        };
+        let refreshed_snapshot = WorkingTreeSnapshot {
+            changes: vec![actual_change],
+            ..WorkingTreeSnapshot::default()
+        };
+
+        for failure in [
+            MutationState::Cancelled {
+                kind: OperationKind::Commit,
+                message: "Operación cancelada".to_owned(),
+            },
+            MutationState::Failed {
+                kind: OperationKind::Commit,
+                message: "La operación agotó el tiempo máximo de 2 s".to_owned(),
+                details: "timeout".to_owned(),
+                next_step: None,
+            },
+        ] {
+            let repository = RepositorySession::new(PathBuf::from("repo"));
+            let repository_id = repository.id;
+            let mut window = test_window(GitClient::default(), vec![repository]);
+            window.state.repositories[0].mutation_state = failure;
+            window.state.repositories[0].refresh_generation = 1;
+            Arc::make_mut(&mut window.state.repositories[0].working_tree).changes =
+                vec![previous_change.clone()];
+
+            let outcome = window.finish_refresh(
+                repository_id,
+                1,
+                false,
+                true,
+                Ok(RefreshPayload::WorkingTree(refreshed_snapshot.clone())),
+            );
+
+            assert!(outcome.succeeded);
+            assert_eq!(
+                *window.state.repositories[0].working_tree,
+                refreshed_snapshot
+            );
+            assert!(matches!(
+                window.state.repositories[0].refresh_state,
+                RefreshState::Succeeded { .. }
+            ));
+        }
     }
 }

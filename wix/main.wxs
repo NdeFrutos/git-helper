@@ -136,6 +136,14 @@
                                     Advertise='yes'/>
                             </File>
                         </Component>
+                        <Component Id='binary1' Guid='*'>
+                            <File
+                                Id='exe1'
+                                Name='ghelper.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\ghelper.exe'
+                                KeyPath='yes'/>
+                        </Component>
                     </Directory>
                 </Directory>
             </Directory>
@@ -159,6 +167,7 @@
             <ComponentRef Id='ThirdPartyNotices'/>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='binary1'/>
 
             <Feature
                 Id='Environment'

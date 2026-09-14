@@ -5,8 +5,11 @@ use std::{
 };
 
 use git_helper::{
-    domain::ChangeKind,
-    git::{GitClient, GitError, plan_discard, plan_pull, plan_push},
+    domain::{BranchUpstream, ChangeKind, HeadState},
+    git::{
+        GitClient, GitError, classify_remote_failure, parse_ssh_url, plan_clone_destination,
+        plan_discard, plan_pull, plan_push,
+    },
     process::CancellationToken,
 };
 use tempfile::tempdir;
@@ -519,7 +522,13 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
         .expect_err("pull divergente debe rechazarse");
     let head_after = run_git(&first, &["rev-parse", "HEAD"]).stdout;
 
-    assert!(pull_error.to_string().contains("Git rechazó"));
+    assert!(
+        matches!(
+            pull_error,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "un pull divergente debe clasificarse como divergencia: {pull_error:?}"
+    );
     assert_eq!(head_before, head_after);
 }
 
@@ -609,6 +618,15 @@ fn enumerates_branches_and_reads_selected_history_without_checkout() {
         snapshot
             .branches
             .iter()
+            .find(|branch| branch.name == "sin-upstream")
+            .expect("debe listar ramas locales sin upstream")
+            .upstream,
+        BranchUpstream::NoUpstream
+    ));
+    assert!(matches!(
+        snapshot
+            .branches
+            .iter()
             .find(|branch| branch.name == "upstream-eliminado")
             .expect("debe conservar el upstream configurado")
             .upstream,
@@ -644,6 +662,112 @@ fn enumerates_branches_and_reads_selected_history_without_checkout() {
         .branches(&repository, &cancellation)
         .expect("debe invalidar la caché de referencias");
     assert!(refreshed.iter().any(|branch| branch.name == "externa"));
+}
+
+#[test]
+fn unborn_and_detached_heads_keep_branch_inventory_consistent() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    let unborn = client
+        .branches(temporary.path(), &cancellation)
+        .expect("debe listar la rama activa en un repositorio unborn");
+    let main = unborn
+        .iter()
+        .find(|branch| branch.name == "main")
+        .expect("debe exponer main como rama activa sin commits");
+    assert!(main.is_active);
+    assert!(main.oid.is_none());
+    assert_eq!(main.upstream, BranchUpstream::NoUpstream);
+
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+    client.invalidate_branches(temporary.path());
+    require_git(temporary.path(), &["checkout", "--detach", "HEAD"]);
+    let detached_status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer HEAD separado");
+    assert!(matches!(detached_status.head, HeadState::Detached { .. }));
+
+    let detached = client
+        .branches(temporary.path(), &cancellation)
+        .expect("debe conservar el inventario con HEAD separado");
+    assert!(detached.iter().all(|branch| !branch.is_active));
+    assert!(detached.iter().any(|branch| branch.name == "main"));
+}
+
+#[test]
+fn lists_remote_tracking_refs_from_multiple_remotes() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+    let head_oid = String::from_utf8(run_git(temporary.path(), &["rev-parse", "HEAD"]).stdout)
+        .expect("OID UTF-8")
+        .trim()
+        .to_owned();
+
+    let origin = temporary.path().join("origin.git");
+    let team = temporary.path().join("team.git");
+    fs::create_dir_all(&origin).expect("debe crear origin");
+    fs::create_dir_all(&team).expect("debe crear team");
+    require_git(&origin, &["init", "--bare"]);
+    require_git(&team, &["init", "--bare"]);
+    require_git(
+        temporary.path(),
+        &["remote", "add", "origin", &origin.display().to_string()],
+    );
+    require_git(
+        temporary.path(),
+        &["remote", "add", "team", &team.display().to_string()],
+    );
+    require_git(
+        temporary.path(),
+        &["update-ref", "refs/remotes/origin/main", &head_oid],
+    );
+    require_git(
+        temporary.path(),
+        &["update-ref", "refs/remotes/team/main", &head_oid],
+    );
+
+    let snapshot = client
+        .snapshot(temporary.path(), &cancellation)
+        .expect("debe enumerar refs de varios remotes");
+    assert_eq!(snapshot.remotes.len(), 2);
+    assert!(
+        snapshot
+            .remotes
+            .iter()
+            .any(|remote| remote.name == "origin")
+    );
+    assert!(snapshot.remotes.iter().any(|remote| remote.name == "team"));
+    assert!(
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "origin/main")
+    );
+    assert!(
+        snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.name == "team/main")
+    );
 }
 
 #[test]
@@ -697,4 +821,272 @@ fn pagination_stays_on_the_selected_oid_when_the_branch_moves() {
         .expect("debe resolver la rama movida");
     assert_ne!(moved.oid, first.oid);
     assert_eq!(moved.commits[0].summary.subject, "test: four");
+}
+
+#[test]
+fn clones_from_a_local_bare_remote() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let bare = temporary.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .expect("git init --bare debe funcionar");
+    let clone_destination = temporary.path().join("working-copy");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let remote_url = format!("file://{}", bare.display());
+
+    client
+        .clone_repository(&remote_url, &clone_destination, &cancellation)
+        .expect("git clone debe funcionar contra un bare local");
+    let origin = client
+        .remote_url(&clone_destination, "origin", &cancellation)
+        .expect("debe leer origin");
+
+    assert!(origin.contains("origin.git"));
+}
+
+#[test]
+fn reuses_destination_when_origin_matches_requested_ssh_url() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    initialize_repository(temporary.path());
+    require_git(
+        temporary.path(),
+        &["remote", "add", "origin", "git@github.com:org/demo.git"],
+    );
+    let parsed = parse_ssh_url("ssh://git@github.com/org/demo").expect("url ssh de prueba");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let plan = plan_clone_destination(&client, &parsed, temporary.path(), &cancellation)
+        .expect("debe reutilizar el clon existente");
+
+    assert!(matches!(
+        plan,
+        git_helper::git::CloneDestinationPlan::OpenExisting(_)
+    ));
+}
+
+#[test]
+fn classifies_common_ssh_failures() {
+    let auth = classify_remote_failure("Permission denied (publickey).", Some(128));
+    assert!(matches!(
+        auth,
+        git_helper::git::GitError::SshAuthenticationFailed { .. }
+    ));
+    let host = classify_remote_failure("Host key verification failed.", Some(128));
+    assert!(matches!(
+        host,
+        git_helper::git::GitError::SshHostKeyVerificationFailed { .. }
+    ));
+}
+
+#[test]
+fn failed_clone_leaves_no_partial_destination() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let missing_remote = temporary.path().join("no-existe.git");
+    let clone_destination = temporary.path().join("working-copy");
+    let client = GitClient::default();
+
+    let error = client
+        .clone_repository(
+            &format!("file://{}", missing_remote.display()),
+            &clone_destination,
+            &CancellationToken::default(),
+        )
+        .expect_err("clonar un remoto inexistente debe fallar");
+
+    assert!(!matches!(
+        error,
+        git_helper::git::GitError::InvalidSshUrl { .. }
+    ));
+    assert!(
+        !clone_destination.exists(),
+        "un clonado fallido no debe dejar el destino a medias"
+    );
+}
+
+#[test]
+fn rejects_clone_arguments_that_git_would_read_as_options() {
+    let temporary = tempdir().expect("debe crear el temporal");
+    let client = GitClient::default();
+
+    let error = client
+        .clone_repository(
+            "--upload-pack=payload",
+            &temporary.path().join("destino"),
+            &CancellationToken::default(),
+        )
+        .expect_err("una URL con guion inicial debe rechazarse antes de ejecutar git");
+
+    assert!(matches!(
+        error,
+        git_helper::git::GitError::InvalidSshUrl { .. }
+    ));
+}
+
+#[test]
+fn a_locked_index_is_reported_without_being_deleted() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let lock_path = temporary.path().join(".git").join("index.lock");
+    fs::write(&lock_path, "").expect("debe simular el bloqueo");
+    let client = GitClient::default();
+
+    let error = client
+        .stage(
+            temporary.path(),
+            Path::new("a.txt"),
+            &CancellationToken::default(),
+        )
+        .expect_err("stage debe fallar con el índice bloqueado");
+
+    assert!(
+        matches!(error, git_helper::git::GitError::IndexLocked { .. }),
+        "un índice bloqueado debe clasificarse como tal: {error:?}"
+    );
+    assert!(
+        error
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("Git Helper no lo elimina")
+    );
+    assert!(
+        lock_path.exists(),
+        "Git Helper no debe borrar index.lock automáticamente"
+    );
+}
+
+#[test]
+fn a_rejected_hook_keeps_the_repository_intact_and_names_the_hook() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let hooks = temporary.path().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("debe crear la carpeta de hooks");
+    let hook_path = hooks.join("pre-commit");
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\necho 'pre-commit: la comprobación de formato falló' >&2\nexit 1\n",
+    )
+    .expect("debe escribir el hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
+            .expect("debe hacer ejecutable el hook");
+    }
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage debe funcionar");
+
+    let error = client
+        .commit(temporary.path(), "mensaje de prueba", &cancellation)
+        .expect_err("el hook debe rechazar el commit");
+
+    let git_helper::git::GitError::HookRejected { hook, .. } = &error else {
+        panic!("un hook que rechaza debe clasificarse como tal: {error:?}");
+    };
+    assert_eq!(hook.as_deref(), Some("pre-commit"));
+    assert!(
+        error
+            .technical_details()
+            .contains("la comprobación de formato falló")
+    );
+    assert!(
+        !run_git(temporary.path(), &["log", "--oneline"])
+            .status
+            .success(),
+        "el commit rechazado no debe crear historial"
+    );
+}
+
+#[test]
+fn rejected_push_and_divergent_pull_get_next_steps_without_forcing_anything() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    let origin = temporary.path().join("origin.git");
+    require_git(
+        temporary.path(),
+        &["init", "--bare", "-b", "main", "origin.git"],
+    );
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    for clone in [&first, &second] {
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(&origin)
+            .arg(clone)
+            .output()
+            .expect("Git debe poder clonar el repositorio local");
+        assert!(output.status.success(), "clonar debe funcionar");
+        require_git(clone, &["config", "user.name", "Git Helper Tests"]);
+        require_git(
+            clone,
+            &["config", "user.email", "git-helper-tests@example.invalid"],
+        );
+    }
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    commit_file(&client, &first, "a.txt", "uno", "primer commit");
+    require_git(&first, &["push", "-u", "origin", "main"]);
+    commit_file(&client, &second, "b.txt", "dos", "commit divergente");
+
+    let rejected = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::SetUpstreamAndPush {
+                remote_name: "origin".to_owned(),
+                branch_name: "main".to_owned(),
+            },
+            &cancellation,
+        )
+        .expect_err("el push sin integrar debe ser rechazado");
+
+    assert!(
+        matches!(rejected, git_helper::git::GitError::PushRejected { .. }),
+        "un push rechazado debe clasificarse como tal: {rejected:?}"
+    );
+    let action = rejected
+        .recommended_action()
+        .expect("debe recomendar una acción");
+    assert!(action.contains("Fetch"));
+    assert!(action.to_lowercase().contains("no uses push forzado"));
+
+    require_git(&second, &["fetch", "origin"]);
+    require_git(
+        &second,
+        &["branch", "--set-upstream-to", "origin/main", "main"],
+    );
+    let divergent = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::PullFastForward,
+            &cancellation,
+        )
+        .expect_err("un pull fast-forward sobre ramas divergentes debe fallar");
+
+    assert!(
+        matches!(
+            divergent,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "una divergencia debe clasificarse como tal: {divergent:?}"
+    );
+    assert!(
+        divergent
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("fuera de Git Helper")
+    );
+    let local_head = run_git(&second, &["rev-parse", "HEAD"]);
+    let commit_message = run_git(&second, &["log", "-1", "--pretty=%s"]);
+    assert!(local_head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&commit_message.stdout).trim(),
+        "commit divergente",
+        "ni el push rechazado ni el pull fallido deben mover la rama local"
+    );
 }

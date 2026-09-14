@@ -25,6 +25,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Debe coincidir con .github/workflows/ci.yml: el job que calienta la caché en
+  # main y este pipeline comparten clave y rutas.
+  CARGO_CACHE_VERSION: v2
+  CARGO_WIX_VERSION: 0.3.9
+
 concurrency:
   group: release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
@@ -61,15 +67,28 @@ jobs:
             throw "La release debe usar una versión semántica estable, por ejemplo v0.2.0."
           }
           $version = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
-          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw
-          if ($manifest -notmatch '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$') {
+          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw -Encoding utf8
+          $cargoMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"(?<cargoVersion>[^"]+)"\s*$')
+          if (-not $cargoMatch.Success) {
             throw "No se pudo leer package.version de Cargo.toml."
           }
-          if ($Matches.cargoVersion -ne $version) {
-            throw "La etiqueta $tag no coincide con Cargo.toml ($($Matches.cargoVersion))."
+          $cargoVersion = $cargoMatch.Groups['cargoVersion'].Value
+          if ($cargoVersion -ne $version) {
+            throw "La etiqueta $tag no coincide con Cargo.toml ($cargoVersion)."
           }
-          if ($env:DRY_RUN -ne "true" -and (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)) {
-            throw "La release $tag ya existe."
+          if ($env:DRY_RUN -ne "true") {
+            $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+            try {
+              Invoke-RestMethod -Uri $releaseUri -Headers @{
+                Authorization = "Bearer $env:GH_TOKEN"
+                "User-Agent" = "git-helper-release"
+              } | Out-Null
+              throw "La release $tag ya existe."
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+                throw
+              }
+            }
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -91,6 +110,7 @@ jobs:
     outputs:
       duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
       cache_hit: ${{ steps.cache.outputs.cache-hit }}
+      cache_size_mb: ${{ steps.metrics.outputs.cache_size_mb }}
     steps:
       - name: Start timing
         id: clock
@@ -109,10 +129,10 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ env.CARGO_CACHE_VERSION }}-
       - name: Controlled checks failure
         if: inputs.failure_mode == 'checks'
         shell: pwsh
@@ -123,17 +143,14 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
         run: cargo test --all-targets --locked
-      - name: Record checks timing
+      - name: Record checks timing and cache metrics
         id: metrics
         if: always()
         shell: pwsh
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-        run: |
-          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
-          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
-          "Checks: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Checks" -StartedAt $env:STARTED_AT
 
   package:
     name: Build Windows packages
@@ -142,6 +159,7 @@ jobs:
     outputs:
       duration_seconds: ${{ steps.metrics.outputs.duration_seconds }}
       cache_hit: ${{ steps.cache.outputs.cache-hit }}
+      cache_size_mb: ${{ steps.metrics.outputs.cache_size_mb }}
     steps:
       - name: Start timing
         id: clock
@@ -160,10 +178,10 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('rust-toolchain.toml') }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ env.CARGO_CACHE_VERSION }}-wix${{ env.CARGO_WIX_VERSION }}-
       - name: Controlled package failure
         if: inputs.failure_mode == 'package'
         shell: pwsh
@@ -172,11 +190,7 @@ jobs:
         run: cargo build --release --locked
       - name: Install cargo-wix
         shell: pwsh
-        run: |
-          $cargoWix = Join-Path $env:USERPROFILE ".cargo\bin\cargo-wix.exe"
-          if (-not (Test-Path -LiteralPath $cargoWix -PathType Leaf)) {
-            cargo install cargo-wix --version 0.3.9 --locked
-          }
+        run: ./.github/scripts/ensure-cargo-wix.ps1 -Version $env:CARGO_WIX_VERSION
       - name: Build MSI without rebuilding Rust
         run: cargo wix --no-build --nocapture
       - name: Prepare and verify release assets
@@ -188,11 +202,13 @@ jobs:
           $msiPath = "target\wix\git-helper-$env:RELEASE_VERSION-x86_64.msi"
           if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) { throw "Falta el MSI: $msiPath" }
           if (-not (Test-Path -LiteralPath "target\release\git-helper.exe" -PathType Leaf)) { throw "Falta git-helper.exe" }
+          if (-not (Test-Path -LiteralPath "target\release\ghelper.exe" -PathType Leaf)) { throw "Falta ghelper.exe" }
           $msiName = "git-helper-$env:RELEASE_VERSION-windows-x86_64.msi"
           Copy-Item -LiteralPath $msiPath -Destination "dist\$msiName"
           $portable = "dist\portable"
           New-Item -ItemType Directory -Path $portable -Force | Out-Null
           Copy-Item -LiteralPath "target\release\git-helper.exe" -Destination $portable
+          Copy-Item -LiteralPath "target\release\ghelper.exe" -Destination $portable
           Copy-Item -LiteralPath "LICENSE" -Destination $portable
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $portable
           $zipName = "git-helper-$env:RELEASE_VERSION-windows-x86_64-portable.zip"
@@ -211,17 +227,14 @@ jobs:
           path: dist
           if-no-files-found: error
           retention-days: 7
-      - name: Record package timing
+      - name: Record package timing and cache metrics
         id: metrics
         if: always()
         shell: pwsh
         env:
           STARTED_AT: ${{ steps.clock.outputs.started_at }}
           CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-        run: |
-          $duration = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:STARTED_AT
-          "duration_seconds=$duration" >> $env:GITHUB_OUTPUT
-          "Package: $duration s; exact cache hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+        run: ./.github/scripts/report-cargo-cache.ps1 -Phase "Package" -StartedAt $env:STARTED_AT
 
   publish:
     name: Publish validated artifacts
@@ -264,7 +277,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) { throw "La release ya existe" }
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG"
+          try {
+            Invoke-RestMethod -Uri $releaseUri -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              "User-Agent" = "git-helper-release"
+            } | Out-Null
+            throw "La release ya existe"
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+              throw
+            }
+          }
           $assets = Get-ChildItem -LiteralPath "dist" -File | ForEach-Object { $_.FullName }
           gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --generate-notes
           if ($LASTEXITCODE -ne 0) { throw "GitHub no pudo crear la release" }
@@ -279,6 +303,8 @@ jobs:
           PACKAGE_SECONDS: ${{ needs.package.outputs.duration_seconds }}
           CHECKS_CACHE_HIT: ${{ needs.checks.outputs.cache_hit }}
           PACKAGE_CACHE_HIT: ${{ needs.package.outputs.cache_hit }}
+          CHECKS_CACHE_SIZE_MB: ${{ needs.checks.outputs.cache_size_mb }}
+          PACKAGE_CACHE_SIZE_MB: ${{ needs.package.outputs.cache_size_mb }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -289,8 +315,8 @@ jobs:
           ## Métricas de release
           - Tiempo de pared: $wallSeconds s
           - Tiempo total de runners: $runnerSeconds s
-          - Checks: $env:CHECKS_SECONDS s (cache exacta: $env:CHECKS_CACHE_HIT)
-          - Package: $env:PACKAGE_SECONDS s (cache exacta: $env:PACKAGE_CACHE_HIT)
+          - Checks: $env:CHECKS_SECONDS s (cache exacta: $env:CHECKS_CACHE_HIT; $env:CHECKS_CACHE_SIZE_MB MB en disco)
+          - Package: $env:PACKAGE_SECONDS s (cache exacta: $env:PACKAGE_CACHE_HIT; $env:PACKAGE_CACHE_SIZE_MB MB en disco)
           - Publish: $publishSeconds s
           - Dry run: $env:DRY_RUN
           "@ >> $env:GITHUB_STEP_SUMMARY

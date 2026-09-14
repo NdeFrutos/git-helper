@@ -1,31 +1,52 @@
 use std::{path::PathBuf, sync::OnceLock};
 
-use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
+use async_channel::unbounded;
+use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, point, px, size};
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     actions::{
-        ClearChangeSelection, CloseActiveRepository, CreateCommit, ExtendSelectionToNextChange,
-        ExtendSelectionToPreviousChange, FocusNextChange, FocusPreviousChange,
-        GenerateCommitMessage, NextRepository, OpenRepository, PreviousRepository,
-        RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory, StageSelection,
-        ToggleFocusedChange, UnstageSelection,
+        ClearChangeSelection, CloneRepository, CloseActiveRepository, CreateCommit,
+        ExtendSelectionToNextChange, ExtendSelectionToPreviousChange, FindInView, FocusNextChange,
+        FocusPreviousChange, GenerateCommitMessage, NextRepository, OpenRepository,
+        PreviousRepository, RefreshRepository, SelectAllChanges, ShowChanges, ShowHistory,
+        StageSelection, ToggleFocusedChange, UnstageSelection,
     },
-    ui::{CommitInput, MainWindow},
+    cli::InstanceServer,
+    persistence::{
+        AppStateStore, DisplayBounds, WindowPlacement, default_window_placement,
+        validate_window_placement,
+    },
+    ui::{CommitInput, MainWindow, StartupState},
 };
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
+/// Configuración de arranque de la aplicación gráfica.
+#[derive(Clone, Debug, Default)]
+pub struct AppStartup {
+    /// Repositorio que debe abrirse al iniciar, si se invocó desde la CLI.
+    pub open_repository: Option<PathBuf>,
+}
+
 /// Inicia la aplicación y crea su ventana principal.
-pub fn run() {
+pub fn run(startup: AppStartup) {
     initialize_logging();
 
-    gpui_platform::application().run(|cx: &mut App| {
+    let (instance_sender, instance_receiver) = unbounded();
+    let _instance_server = InstanceServer::start(instance_sender)
+        .inspect_err(
+            |error| error!(error = %error, "No se pudo iniciar el servidor de instancia única"),
+        )
+        .ok();
+
+    gpui_platform::application().run(move |cx: &mut App| {
         CommitInput::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", OpenRepository, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-o", CloneRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-w", CloseActiveRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-tab", NextRepository, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-tab", PreviousRepository, Some("GitHelper")),
@@ -36,6 +57,7 @@ pub fn run() {
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-s", StageSelection, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-u", UnstageSelection, Some("GitHelper")),
+            KeyBinding::new("ctrl-f", FindInView, Some("GitHelper")),
             // Equivalentes de teclado de clic, Ctrl+clic y Mayús+clic. Viven en
             // el contexto de la lista para no competir con el editor de commit.
             KeyBinding::new("down", FocusNextChange, Some("ChangeList")),
@@ -54,13 +76,23 @@ pub fn run() {
             KeyBinding::new("ctrl-a", SelectAllChanges, Some("ChangeList")),
             KeyBinding::new("escape", ClearChangeSelection, Some("ChangeList")),
         ]);
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+        let persisted_startup = locate_startup_store();
+        let bounds = initial_window_bounds(cx, None);
         let window_result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(MainWindow::new),
+            |_, cx| {
+                cx.new(|cx| {
+                    MainWindow::new(
+                        persisted_startup,
+                        startup.clone(),
+                        instance_receiver.clone(),
+                        cx,
+                    )
+                })
+            },
         );
 
         match window_result {
@@ -83,6 +115,42 @@ pub fn run() {
         info!("Git Helper iniciado");
         cx.activate(true);
     });
+}
+
+/// Localiza el almacén sin leerlo; la lectura se hará en background tras el primer frame.
+fn locate_startup_store() -> Option<StartupState> {
+    let store = AppStateStore::default_location()
+        .inspect_err(|error| error!(error = %error, "No se pudo localizar el estado persistido"))
+        .ok()?;
+    Some(StartupState { store })
+}
+
+/// Ajusta la geometría ya leída a los monitores visibles; no vuelve a tocar disco.
+fn initial_window_bounds(cx: &App, persisted: Option<WindowPlacement>) -> Bounds<gpui::Pixels> {
+    let displays = display_bounds(cx);
+    let placement = persisted.map_or_else(
+        || default_window_placement(&displays),
+        |placement| validate_window_placement(placement, &displays),
+    );
+    Bounds::new(
+        point(px(placement.x), px(placement.y)),
+        size(px(placement.width), px(placement.height)),
+    )
+}
+
+fn display_bounds(cx: &App) -> Vec<DisplayBounds> {
+    cx.displays()
+        .iter()
+        .map(|display| {
+            let bounds = display.visible_bounds();
+            DisplayBounds {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            }
+        })
+        .collect()
 }
 
 /// Configura consola y rotación diaria sin registrar contenido del repositorio.

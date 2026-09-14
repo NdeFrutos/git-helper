@@ -1,6 +1,6 @@
 [package]
 name = "git-helper"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Aplicación de escritorio nativa para Windows para trabajar con varios repositorios Git"
@@ -8,6 +8,10 @@ authors = ["Git Helper contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/NdeFrutos/git-helper"
 publish = false
+
+[[bin]]
+name = "ghelper"
+path = "src/bin/ghelper.rs"
 
 [package.metadata.wix]
 eula = false
@@ -60,6 +64,16 @@ opt-level = 3
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[features]
+default = []
+# Habilita ganchos solo para mediciones de rendimiento (p. ej. GH_PERF_OPEN_REPO).
+# No debe activarse en los binarios publicados.
+perf-hooks = []
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

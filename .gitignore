@@ -10,3 +10,7 @@
 # Estado y logs locales de la aplicación
 state.json
 logs/
+
+# Resultados de comprobación de rendimiento local
+/perf-fixtures/
+/perf-results/
