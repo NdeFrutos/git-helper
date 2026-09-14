@@ -7,6 +7,7 @@ mod remote_freshness;
 mod repository;
 mod search;
 mod status;
+mod summary;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
 pub use change_selection::ChangeSelectionState;
@@ -39,4 +40,9 @@ pub use repository::{
 pub use search::{SearchQuery, change_matches, commit_matches};
 pub use status::{
     ChangeKind, ChangeRepresentation, ChangeSelection, FileChange, HeadState, StatusSnapshot,
+};
+pub use summary::{
+    RepositorySummaryRow, SnapshotPresentation, build_repository_summaries,
+    build_repository_summary, format_change_counters, format_sync_counters,
+    snapshot_presentation_label,
 };
