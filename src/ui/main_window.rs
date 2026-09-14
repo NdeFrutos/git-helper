@@ -372,7 +372,6 @@ pub struct MainWindow {
     /// Un handle por pestaña: compartirlo arrastraría el desplazamiento de un
     /// repositorio a la lista —de otra longitud— del siguiente.
     change_list_scrolls: HashMap<RepositoryId, UniformListScrollHandle>,
-    save_generation: u64,
     /// Cajas de búsqueda por repositorio y vista; cada pestaña busca aparte.
     search_boxes: HashMap<(RepositoryId, SearchScope), SearchBox>,
     /// Estado del recorrido paginado del historial por repositorio.
@@ -440,7 +439,6 @@ impl MainWindow {
             change_rows: HashMap::new(),
             change_list_focus: None,
             change_list_scrolls: HashMap::new(),
-            save_generation: 0,
             search_boxes: HashMap::new(),
             history_searches: HashMap::new(),
             history_search_cancellations: HashMap::new(),
@@ -7167,7 +7165,6 @@ mod tests {
             change_rows: HashMap::new(),
             change_list_focus: None,
             change_list_scrolls: HashMap::new(),
-            save_generation: 0,
             search_boxes: HashMap::new(),
             history_searches: HashMap::new(),
             history_search_cancellations: HashMap::new(),
