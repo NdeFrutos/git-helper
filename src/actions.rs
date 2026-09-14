@@ -17,5 +17,6 @@ actions!(
         SummaryActivateRow,
         CreateCommit,
         GenerateCommitMessage,
+        FindInView,
     ]
 );

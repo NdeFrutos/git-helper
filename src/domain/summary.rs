@@ -407,6 +407,7 @@ mod tests {
         repository.refresh_state = RefreshState::Failed {
             message: "fallo".to_owned(),
             details: "stderr".to_owned(),
+            next_step: None,
         };
 
         let row = build_repository_summary(&repository, &HashMap::new(), 1_000, 300);

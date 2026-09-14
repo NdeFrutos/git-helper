@@ -195,6 +195,22 @@ Un mismo archivo puede aparecer tanto en `Cambios staged` como en `Cambios` si t
 
 Seleccionar una fila solo la resalta y habilita sus acciones. El MVP no leerá ni mostrará el contenido ni el diff del archivo.
 
+La vista incluye una caja de filtro por ruta o nombre. El filtro se aplica antes de agrupar, así que un archivo filtrado conserva sus filas staged y de worktree por separado. Mientras hay consulta activa los grupos no ofrecen `Stage todo` ni `Unstage todo`: esas acciones operan sobre el repositorio completo y no sobre el subconjunto visible.
+
+### 4.3.1 Búsqueda en Cambios e Historial
+
+Cada repositorio mantiene una consulta independiente por vista. La caja se enfoca con `Ctrl+F` y `Escape` la limpia sin salir de la vista.
+
+Reglas comunes:
+
+- La consulta es dato literal: no se interpreta como expresión regular ni se pasa a Git como patrón, y nunca se construye una línea de shell con ella.
+- La comparación ignora mayúsculas usando plegado Unicode. En rutas, `\` y `/` se consideran equivalentes; en texto de commit, no.
+- Buscar es solo lectura: no modifica `HEAD`, el índice ni el directorio de trabajo.
+- Se muestran la consulta activa, el número de resultados y un estado vacío explícito cuando no hay coincidencias.
+- Cambiar la consulta o la referencia sube una generación interna; cualquier resultado asíncrono anterior se descarta en lugar de mezclarse.
+
+En `Historial` la búsqueda cubre asunto, nombre y correo del autor y prefijo de hash. El prefijo de hash solo se compara cuando la consulta es hexadecimal, para que una palabra corriente no acierte contra un identificador. El recorrido no se limita a la página cargada: se leen páginas sucesivas de la referencia seleccionada, con el mismo OID fijado que usa la paginación normal, hasta acumular un número razonable de resultados o agotar la referencia. `Buscar más` continúa el recorrido desde la última posición leída.
+
 ### 4.4 Stage y unstage
 
 Comandos requeridos:
@@ -689,6 +705,18 @@ Los errores se mostrarán cerca de la acción que falló y podrán expandirse pa
 - Pull no fast-forward.
 - Cursor CLI no instalado, no autenticado o bloqueado por política.
 - Respuesta inválida o cancelación de Cursor CLI.
+
+Cada error visible se presenta con tres elementos: una explicación breve de qué ocurrió, el
+siguiente paso seguro y el detalle técnico expandible y copiable. La clasificación se apoya en
+señales que Git no traduce (nombres de configuración como `user.email`, rutas como `index.lock`,
+nombres de hook y marcadores como `non-fast-forward`) antes que en frases concretas, para que una
+salida localizada siga reconociéndose. Un error sin clasificar conserva su salida íntegra y no
+recibe una causa atribuida: solo una recomendación genérica de revisar los detalles y reconciliar
+el estado.
+
+El siguiente paso nunca describe una reparación implícita: Git Helper no elimina `index.lock`, no
+modifica `user.name` ni `user.email`, no hace merge, rebase ni stash automático y no usa push
+forzado. Las credenciales embebidas en URLs se ocultan antes de mostrar o copiar los detalles.
 
 No se ocultará stderr ni se mostrará únicamente un mensaje genérico.
 
