@@ -8,10 +8,12 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     actions::{
-        CloneRepository, CloseActiveRepository, CreateCommit, FindInView, GenerateCommitMessage,
-        MoveRepositoryLeft, MoveRepositoryRight, NextRepository, OpenRepository,
-        PreviousRepository, RefreshRepository, ReopenClosedRepository, ShowChanges, ShowHistory,
-        ToggleFavoriteRepository,
+        ClearChangeSelection, CloneRepository, CloseActiveRepository, CreateCommit,
+        ExtendSelectionToNextChange, ExtendSelectionToPreviousChange, FindInView, FocusNextChange,
+        FocusPreviousChange, GenerateCommitMessage, MoveRepositoryLeft, MoveRepositoryRight,
+        NextRepository, OpenRepository, PreviousRepository, RefreshRepository,
+        ReopenClosedRepository, SelectAllChanges, ShowChanges, ShowHistory, StageSelection,
+        ToggleFavoriteRepository, ToggleFocusedChange, UnstageSelection,
     },
     cli::InstanceServer,
     persistence::{
@@ -62,7 +64,26 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-s", StageSelection, Some("GitHelper")),
+            KeyBinding::new("ctrl-shift-u", UnstageSelection, Some("GitHelper")),
             KeyBinding::new("ctrl-f", FindInView, Some("GitHelper")),
+            // Equivalentes de teclado de clic, Ctrl+clic y Mayús+clic. Viven en
+            // el contexto de la lista para no competir con el editor de commit.
+            KeyBinding::new("down", FocusNextChange, Some("ChangeList")),
+            KeyBinding::new("up", FocusPreviousChange, Some("ChangeList")),
+            KeyBinding::new(
+                "shift-down",
+                ExtendSelectionToNextChange,
+                Some("ChangeList"),
+            ),
+            KeyBinding::new(
+                "shift-up",
+                ExtendSelectionToPreviousChange,
+                Some("ChangeList"),
+            ),
+            KeyBinding::new("ctrl-space", ToggleFocusedChange, Some("ChangeList")),
+            KeyBinding::new("ctrl-a", SelectAllChanges, Some("ChangeList")),
+            KeyBinding::new("escape", ClearChangeSelection, Some("ChangeList")),
         ]);
         let persisted_startup = locate_startup_store();
         let bounds = initial_window_bounds(cx, None);

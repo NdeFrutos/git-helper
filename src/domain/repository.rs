@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote,
+    BranchReference, ChangeSelectionState, CommitId, CommitSummary, HeadState, Remote,
     RemoteFreshnessTracker, UpstreamState,
     commit_preferences::{CommitMessagePreferenceOverrides, CommitMessagePreferences},
     remote_freshness::{DEFAULT_PERIODIC_FETCH_INTERVAL_SECS, normalized_repo_key},
@@ -234,7 +234,9 @@ pub struct RepositorySession {
     /// No se persiste: las sesiones restauradas deben volver a validarse.
     pub has_loaded_snapshot: bool,
     pub selected_view: RepositoryView,
-    pub selected_change: Option<ChangeSelection>,
+    /// Selección de la vista Cambios. Es efímera: no se persiste porque
+    /// depende del estado que Git reporte en cada momento.
+    pub change_selection: ChangeSelectionState,
     pub selected_commit: Option<CommitId>,
     pub refresh_state: RefreshState,
     pub mutation_state: MutationState,
@@ -267,7 +269,7 @@ impl RepositorySession {
             change_counters: ChangeCounters::default(),
             has_loaded_snapshot: false,
             selected_view: RepositoryView::default(),
-            selected_change: None,
+            change_selection: ChangeSelectionState::default(),
             selected_commit: None,
             refresh_state: RefreshState::default(),
             mutation_state: MutationState::default(),

@@ -4,6 +4,13 @@ use thiserror::Error;
 
 use crate::process::ProcessError;
 
+/// Motivo por el que Git rechazó una ruta concreta de un lote.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathFailure {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// Errores tipados que la UI puede convertir en mensajes accionables.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -63,6 +70,15 @@ pub enum GitError {
     UntrackedStateChanged { path: PathBuf },
     #[error("el index cambió mientras se preparaba el contexto staged")]
     StagedStateChanged,
+    #[error(
+        "resultado parcial: {applied} de {requested} rutas aplicadas; {} fallaron",
+        failures.len()
+    )]
+    PartialBatch {
+        applied: usize,
+        requested: usize,
+        failures: Vec<PathFailure>,
+    },
     #[error("URL SSH inválida: {message}")]
     InvalidSshUrl { message: String },
     #[error("esquema no soportado en esta versión: {scheme}")]
@@ -108,6 +124,15 @@ impl GitError {
     pub fn technical_details(&self) -> String {
         let raw = match self {
             Self::CommandFailed { stderr, .. } => stderr.clone(),
+            Self::PartialBatch { failures, .. } => {
+                use std::fmt::Write as _;
+
+                let mut details = self.to_string();
+                for failure in failures {
+                    let _ = write!(details, "\n{}: {}", failure.path.display(), failure.reason);
+                }
+                details
+            }
             Self::SshAuthenticationFailed { details }
             | Self::SshHostKeyVerificationFailed { details }
             | Self::SshHostKeyChanged { details }
@@ -175,6 +200,18 @@ impl GitError {
             ),
             other => other.to_string(),
         }
+    }
+
+    /// Distingue una cancelación solicitada por el usuario de un fallo real.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::Process(ProcessError::Cancelled)
+                | Self::NotInstalled {
+                    source: ProcessError::Cancelled
+                }
+        )
     }
 
     /// Siguiente acción segura que el usuario puede ejecutar tras el fallo.
@@ -429,7 +466,9 @@ fn detect_hook(lower_stderr: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitError, classify_command_failure, redact_credentials};
+    use std::path::PathBuf;
+
+    use super::{GitError, PathFailure, classify_command_failure, redact_credentials};
 
     #[test]
     fn classifies_missing_identity_from_the_untranslated_config_keys() {
@@ -587,5 +626,25 @@ mod tests {
         );
 
         assert!(!error.technical_details().contains("secreto"));
+    }
+
+    #[test]
+    fn partial_batch_reports_scope_and_every_failed_path() {
+        let error = GitError::PartialBatch {
+            applied: 2,
+            requested: 3,
+            failures: vec![PathFailure {
+                path: PathBuf::from("ruta con ñ.txt"),
+                reason: "pathspec did not match any files".to_owned(),
+            }],
+        };
+
+        let message = error.to_string();
+        let details = error.technical_details();
+
+        assert!(message.contains("2 de 3"));
+        assert!(message.contains("1 fallaron"));
+        assert!(details.contains("ruta con ñ.txt"));
+        assert!(details.contains("pathspec did not match any files"));
     }
 }
