@@ -14,6 +14,8 @@ sincronizar con remotes y consultar el historial.
 ## Qué permite hacer
 
 - Abrir varios repositorios locales y cambiar entre ellos mediante pestañas.
+- Reordenar las pestañas arrastrándolas o con el teclado, fijar repositorios como favoritos y
+  reabrir la última pestaña cerrada.
 - Clonar repositorios remotos accesibles por SSH y abrirlos en una pestaña.
 - Ver cambios staged, sin preparar, sin seguimiento y en conflicto.
 - Hacer stage/unstage por archivo o en bloque y descartar cambios con confirmación.
@@ -24,7 +26,7 @@ sincronizar con remotes y consultar el historial.
 - Consultar el historial y los detalles de cada commit.
 - Abrir el repositorio o un archivo en el editor, abrir una terminal en su raíz y mostrarlo en el Explorador.
 - Filtrar los cambios por ruta y buscar en el historial por mensaje, autor o hash (`Ctrl+F`).
-- Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
+- Restaurar los repositorios abiertos, su orden, los favoritos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
 - Configurar idioma, convención, alcance y longitud del asunto del mensaje, con valores
   globales y sobrescritura por repositorio, e insertar una plantilla manual editable.
@@ -138,13 +140,16 @@ Atajos disponibles:
 | `Ctrl+O` | Abrir repositorio |
 | `Ctrl+Shift+O` | Clonar repositorio por SSH |
 | `Ctrl+W` | Cerrar la pestaña activa |
+| `Ctrl+Shift+T` | Reabrir la última pestaña cerrada |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar de repositorio |
+| `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Mover la pestaña activa a la izquierda / derecha |
+| `Ctrl+Shift+B` | Fijar o quitar el repositorio activo de favoritos |
 | `F5` | Actualizar el estado |
 | `Ctrl+1` / `Ctrl+2` | Mostrar historial / cambios |
 | `Ctrl+Enter` | Crear el commit |
 | `Ctrl+Shift+G` | Generar un mensaje con Cursor |
 | `Ctrl+Shift+E` | Abrir el repositorio en el editor |
-| `Ctrl+Shift+T` | Abrir una terminal en la raíz del repositorio |
+| `Ctrl+Alt+T` | Abrir una terminal en la raíz del repositorio |
 | `Ctrl+Shift+X` | Mostrar el repositorio en el Explorador |
 | `Ctrl+Shift+S` / `Ctrl+Shift+U` | Stage / unstage de la selección (solo en `Cambios`) |
 | `Ctrl+F` | Enfocar la búsqueda de la vista activa |

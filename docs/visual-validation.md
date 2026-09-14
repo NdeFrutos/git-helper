@@ -26,6 +26,7 @@ credenciales ni contenido sensible.
 - [ ] Si un repositorio guardado no está accesible (disco desconectado), la pestaña permanece con
   aviso, botón Reintentar y Cerrar; al recuperar la ruta, el estado vuelve a cargarse.
 - [ ] El estado vacío muestra repositorios recientes persistidos.
+- [ ] Tras reiniciar se conservan el orden de las pestañas y los favoritos fijados.
 
 ## Pestañas y navegación
 
@@ -35,6 +36,29 @@ credenciales ni contenido sensible.
 - [ ] `Ctrl+Tab` / `Ctrl+Shift+Tab` cambian de pestaña.
 - [ ] El botón de cerrar en cada pestaña cierra solo esa sesión.
 - [ ] Las pestañas internas `Changes` e `History` cambian sin perder el estado de la otra.
+
+## Orden, favoritos y reapertura (UX-10)
+
+- [ ] Arrastrar una pestaña sobre otra la coloca en esa posición; durante el arrastre se ve una
+  vista previa con el nombre y la pestaña de destino se resalta.
+- [ ] `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` mueven la pestaña activa; en el primer y último
+  hueco no dan la vuelta y la barra de estado lo indica.
+- [ ] Tras mover una pestaña, su borrador de commit, su vista seleccionada y cualquier operación en
+  curso siguen siendo los mismos; el repositorio activo no cambia.
+- [ ] Con veinte pestañas abiertas, arrastrar y reordenar con teclado sigue siendo fluido y la barra
+  mantiene el scroll horizontal.
+- [ ] La estrella de cada pestaña fija y desfija el repositorio (`Ctrl+Shift+B`): muestra `★` cuando
+  es favorito y `☆` cuando no.
+- [ ] El estado vacío y el panel de clonado listan `Favoritos`; una entrada ya abierta se muestra
+  como `— abierto`, distinta de una pestaña normal.
+- [ ] Abrir un favorito que ya está abierto activa su pestaña en lugar de duplicarla, también si la
+  ruta se escribió con otra capitalización o con `/`.
+- [ ] Con un favorito en una unidad desconectada: la fila pasa a `— no disponible`, se puede
+  reintentar y `✕` lo quita de favoritos sin borrar nada del disco (comprobar la carpeta después).
+- [ ] Cerrar una pestaña permite recuperarla: el botón `↩` de la barra y `Ctrl+Shift+T` la reabren
+  sin crear una segunda pestaña del mismo repositorio.
+- [ ] Repetir el bloque anterior con escala DPI del 100 %, 125 %, 150 % y 200 %: la estrella, `✕` y
+  `↩` siguen siendo pulsables y no desbordan la barra.
 
 ## Vista Changes
 
@@ -85,7 +109,7 @@ credenciales ni contenido sensible.
 
 - [ ] `Editor`, `Terminal` y `Explorador` de la barra de acciones abren el repositorio activo; el
   directorio de trabajo es su raíz aunque haya otra pestaña con el mismo nombre de carpeta.
-- [ ] `Ctrl+Mayús+E`, `Ctrl+Mayús+T` y `Ctrl+Mayús+X` hacen lo mismo desde el teclado.
+- [ ] `Ctrl+Mayús+E`, `Ctrl+Alt+T` y `Ctrl+Mayús+X` hacen lo mismo desde el teclado.
 - [ ] `Abrir` y `Mostrar` de una fila abren el archivo en el editor y lo seleccionan en el
   Explorador, incluso con espacios, acentos y `&` en la ruta.
 - [ ] `Mostrar` sobre un archivo eliminado abre su carpeta y lo explica en la barra de estado, sin
