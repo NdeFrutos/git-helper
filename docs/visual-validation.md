@@ -46,7 +46,38 @@ credenciales ni contenido sensible.
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
 - [ ] Con la ventana estrecha, las cuatro acciones de fila (`Abrir`, `Mostrar`, `Descartar`,
   `Stage`) permanecen en su fila de 56 px y lo que se trunca es el nombre y la ruta.
+- [ ] `Ctrl+F` enfoca el filtro; al escribir, la cabecera muestra la consulta y `n de m archivos`.
+- [ ] Con filtro activo, un archivo modificado en índice y worktree sigue apareciendo en ambos
+  grupos y cada fila hace stage/unstage solo de su estado.
+- [ ] Con filtro activo desaparecen `Stage todo` y `Unstage todo`.
+- [ ] Una consulta sin coincidencias muestra el estado vacío, no una lista en blanco.
+- [ ] `Escape` dentro del filtro y el botón `Limpiar` restauran la lista completa.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
+
+### Selección múltiple
+
+- [ ] Un clic en una fila la resalta; `Ctrl+clic` añade y quita filas sueltas; `Mayús+clic`
+  selecciona el rango visible entre el ancla y la fila pulsada; `Ctrl+Mayús+clic` suma el rango a
+  lo ya seleccionado.
+- [ ] La lista muestra un borde de acento cuando tiene el foco, y un clic en cualquier parte de
+  ella (incluido el espacio vacío) se lo da.
+- [ ] `Ctrl+Shift+S` / `Ctrl+Shift+U` no hacen nada mientras la vista `Historial` está abierta.
+- [ ] Los botones `Stage selección (0)` / `Unstage selección (0)` atenuados no ejecutan nada al
+  pulsarlos ni muestran un error.
+- [ ] Con el foco en la lista, `↑` / `↓` mueven la marca de fila activa y `Mayús+↑` / `Mayús+↓`
+  extienden el rango; la lista hace scroll para mantener visible la fila activa.
+- [ ] `Ctrl+A` selecciona todas las filas visibles y `Esc` vacía la selección.
+- [ ] El contador junto a los botones refleja el número de filas seleccionadas y los rótulos
+  `Stage selección (n)` / `Unstage selección (n)` indican a cuántas rutas afectarán.
+- [ ] Pulsar `Stage`, `Unstage` o `Descartar` de una fila ejecuta esa acción **sin** cambiar la
+  selección.
+- [ ] Un archivo staged y modificado de nuevo se selecciona por separado en cada grupo, y actuar
+  sobre uno no altera el otro.
+- [ ] Modificar archivos fuera de la aplicación quita de la selección las filas que desaparecen y
+  no marca otras por su posición; plegar un grupo libera sus filas.
+- [ ] Las filas de conflicto no se pueden seleccionar.
+- [ ] Con una selección que incluya una ruta que Git rechace, el error indica cuántas rutas se
+  aplicaron y el motivo de cada fallo, y la lista queda reconciliada con Git.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
 - [ ] Una ruta larga se trunca en la barra inferior sin ocultar el estado ni la versión de Git.
 
@@ -77,6 +108,15 @@ credenciales ni contenido sensible.
 - [ ] La lista de commits es scrollable y virtualizada (sin tirones con muchos commits).
 - [ ] Al seleccionar un commit se muestran autor, fecha, asunto y cuerpo si existe.
 - [ ] `Cargar más` añade entradas sin duplicar las ya visibles.
+- [ ] `Ctrl+F` enfoca la búsqueda; la cabecera muestra consulta, resultados, commits explorados y si
+  el recorrido sigue en marcha.
+- [ ] Una consulta encuentra commits que todavía no estaban en la página cargada; `Buscar más`
+  continúa el recorrido y `Cargar más` desaparece mientras hay búsqueda activa.
+- [ ] Seleccionar un resultado carga sus detalles aunque no estuviera en el historial visible.
+- [ ] Cambiar de rama con una búsqueda activa reinicia los resultados sobre la rama nueva y no
+  mezcla commits de la anterior.
+- [ ] Escribir deprisa no encadena procesos de Git ni bloquea la ventana; `Escape` limpia la consulta.
+- [ ] Una búsqueda sin coincidencias en toda la referencia muestra el estado vacío.
 
 ## Estados de error y vacío
 
@@ -170,3 +210,24 @@ sesión de escritorio Windows. Procedimiento, por si hay que reproducirlo:
 
 Limitación conocida: el backend X11 de GPUI no es el de Windows, así que estas capturas validan el
 layout (elipsis, altura de fila, overflow) pero no el renderizado ni la escala nativos de Windows.
+
+## Registro de UX-08
+
+Comprobado en Windows 11 durante esta revisión:
+
+- [x] `cargo build --release --locked` completó correctamente (`target/release/git-helper.exe`).
+- [x] `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`
+  y `cargo test --all-targets --locked` en verde.
+- [x] Cobertura automática del comportamiento buscable, sin interfaz: plegado Unicode y de
+  separadores, consultas con caracteres especiales tratadas como literales, prefijo de hash solo
+  para consultas hexadecimales, filtrado de 10.000 cambios, independencia de las filas staged y de
+  worktree, desaparición de las acciones de grupo con filtro activo y descarte de páginas de
+  historial procedentes de otra consulta, otra referencia u otro desplazamiento.
+
+Pendiente de comprobación manual en una sesión de escritorio Windows; el entorno de esta revisión no
+tiene una, así que la lista de `Vista Changes` y `Vista History` de arriba sigue sin marcar:
+
+- [ ] Foco con `Ctrl+F`, limpieza con `Escape` y recorrido con tabulador dentro de la barra.
+- [ ] Latencia percibida al teclear sobre un repositorio con 10.000 cambios y sobre un historial
+  largo paginado.
+- [ ] Renderizado de la barra de búsqueda con escala del sistema al 125 %, 150 % y 200 %.

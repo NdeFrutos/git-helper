@@ -1,14 +1,14 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use git_helper::{
     domain::{BranchUpstream, ChangeKind, HeadState},
     git::{
-        GitClient, classify_remote_failure, parse_ssh_url, plan_clone_destination, plan_discard,
-        plan_pull, plan_push,
+        GitClient, GitError, classify_remote_failure, parse_ssh_url, plan_clone_destination,
+        plan_discard, plan_pull, plan_push,
     },
     process::CancellationToken,
 };
@@ -134,6 +134,207 @@ fn stages_commits_and_preserves_dual_index_worktree_state() {
         .history(temporary.path(), 200, 0, &cancellation)
         .expect("debe leer historial");
     assert_eq!(history[0].summary.subject, "test: crea commit inicial");
+}
+
+#[test]
+fn stages_only_the_selected_subset_including_renames_and_unicode() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    for name in ["original ñ.txt", "elegido.txt", "intacto.txt"] {
+        fs::write(temporary.path().join(name), "inicial\n").expect("debe crear el archivo");
+    }
+    commit_file(
+        &client,
+        temporary.path(),
+        "base.txt",
+        "base\n",
+        "test: base",
+    );
+
+    // Renombre fuera de la aplicación, más dos archivos modificados.
+    require_git(
+        temporary.path(),
+        &["mv", "original ñ.txt", "renombrado ñ.txt"],
+    );
+    require_git(temporary.path(), &["reset"]);
+    fs::write(temporary.path().join("elegido.txt"), "elegido\n").expect("debe modificar elegido");
+    fs::write(temporary.path().join("intacto.txt"), "intacto\n").expect("debe modificar intacto");
+
+    client
+        .stage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("elegido.txt"),
+                PathBuf::from("original ñ.txt"),
+                PathBuf::from("renombrado ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect("el subconjunto debe aplicarse");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let staged: Vec<_> = status
+        .changes
+        .iter()
+        .filter(|change| change.has_staged_change())
+        .map(|change| change.path.clone())
+        .collect();
+
+    assert!(staged.contains(&PathBuf::from("elegido.txt")));
+    assert!(staged.contains(&PathBuf::from("renombrado ñ.txt")));
+    assert!(
+        !staged.contains(&PathBuf::from("intacto.txt")),
+        "una ruta fuera de la selección no puede acabar staged"
+    );
+
+    // Unstage del mismo subconjunto deja intacto el working tree.
+    client
+        .unstage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("elegido.txt"),
+                PathBuf::from("renombrado ñ.txt"),
+                PathBuf::from("original ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect("unstage del subconjunto debe funcionar");
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe releer status");
+
+    assert!(
+        status
+            .changes
+            .iter()
+            .all(|change| !change.has_staged_change()),
+        "el índice debe quedar vacío tras el unstage de la selección"
+    );
+    assert!(temporary.path().join("renombrado ñ.txt").exists());
+    assert!(temporary.path().join("elegido.txt").exists());
+}
+
+#[test]
+fn unstages_a_subset_before_the_first_commit_without_deleting_files() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    for name in ["uno ñ.txt", "dos.txt"] {
+        fs::write(temporary.path().join(name), "contenido\n").expect("debe crear el archivo");
+    }
+
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage all debe funcionar");
+    client
+        .unstage_paths(
+            temporary.path(),
+            &[PathBuf::from("uno ñ.txt")],
+            &cancellation,
+        )
+        .expect("unstage unborn por lote debe funcionar");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let unstaged = status
+        .changes
+        .iter()
+        .find(|change| change.path == Path::new("uno ñ.txt"))
+        .expect("uno ñ.txt debe seguir reportándose");
+    let staged = status
+        .changes
+        .iter()
+        .find(|change| change.path == Path::new("dos.txt"))
+        .expect("dos.txt debe seguir reportándose");
+
+    assert_eq!(unstaged.worktree_status, ChangeKind::Untracked);
+    assert!(staged.has_staged_change());
+    assert!(temporary.path().join("uno ñ.txt").exists());
+}
+
+#[test]
+fn reports_a_partial_result_instead_of_pretending_the_batch_was_atomic() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    fs::write(temporary.path().join("existe.txt"), "contenido\n").expect("debe crear el archivo");
+
+    let error = client
+        .stage_paths(
+            temporary.path(),
+            &[
+                PathBuf::from("existe.txt"),
+                PathBuf::from("no existe ñ.txt"),
+            ],
+            &cancellation,
+        )
+        .expect_err("una ruta inexistente debe producir un resultado parcial");
+
+    match error {
+        GitError::PartialBatch {
+            applied,
+            requested,
+            failures,
+        } => {
+            assert_eq!(applied, 1);
+            assert_eq!(requested, 2);
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].path, PathBuf::from("no existe ñ.txt"));
+        }
+        other => panic!("se esperaba un resultado parcial, no {other}"),
+    }
+
+    // Git ya aplicó la parte que sí era válida: la UI debe reconciliar con esto.
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    assert!(
+        status
+            .changes
+            .iter()
+            .any(|change| change.path == Path::new("existe.txt") && change.has_staged_change())
+    );
+}
+
+#[test]
+fn stages_a_batch_that_exceeds_the_windows_command_line_limit() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    let directory = temporary.path().join("lote con ñ");
+    fs::create_dir(&directory).expect("debe crear el directorio");
+
+    // 600 rutas largas superan con holgura las 32 767 unidades de CreateProcessW.
+    let paths: Vec<PathBuf> = (0..600)
+        .map(|index| {
+            let name = format!("lote con ñ/archivo-{index:03}-{}.txt", "ñ".repeat(30));
+            fs::write(temporary.path().join(&name), "contenido\n").expect("debe crear el archivo");
+            PathBuf::from(name)
+        })
+        .collect();
+
+    client
+        .stage_paths(temporary.path(), &paths, &cancellation)
+        .expect("un lote mayor que el límite de argumentos debe aplicarse entero");
+
+    let status = client
+        .status(temporary.path(), &cancellation)
+        .expect("debe leer status");
+    let staged = status
+        .changes
+        .iter()
+        .filter(|change| change.has_staged_change())
+        .count();
+
+    assert_eq!(staged, paths.len());
 }
 
 #[test]
@@ -321,7 +522,13 @@ fn pushes_first_branch_pulls_fast_forward_and_rejects_divergence() {
         .expect_err("pull divergente debe rechazarse");
     let head_after = run_git(&first, &["rev-parse", "HEAD"]).stdout;
 
-    assert!(pull_error.to_string().contains("Git rechazó"));
+    assert!(
+        matches!(
+            pull_error,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "un pull divergente debe clasificarse como divergencia: {pull_error:?}"
+    );
     assert_eq!(head_before, head_after);
 }
 
@@ -715,4 +922,171 @@ fn rejects_clone_arguments_that_git_would_read_as_options() {
         error,
         git_helper::git::GitError::InvalidSshUrl { .. }
     ));
+}
+
+#[test]
+fn a_locked_index_is_reported_without_being_deleted() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let lock_path = temporary.path().join(".git").join("index.lock");
+    fs::write(&lock_path, "").expect("debe simular el bloqueo");
+    let client = GitClient::default();
+
+    let error = client
+        .stage(
+            temporary.path(),
+            Path::new("a.txt"),
+            &CancellationToken::default(),
+        )
+        .expect_err("stage debe fallar con el índice bloqueado");
+
+    assert!(
+        matches!(error, git_helper::git::GitError::IndexLocked { .. }),
+        "un índice bloqueado debe clasificarse como tal: {error:?}"
+    );
+    assert!(
+        error
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("Git Helper no lo elimina")
+    );
+    assert!(
+        lock_path.exists(),
+        "Git Helper no debe borrar index.lock automáticamente"
+    );
+}
+
+#[test]
+fn a_rejected_hook_keeps_the_repository_intact_and_names_the_hook() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    initialize_repository(temporary.path());
+    let hooks = temporary.path().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("debe crear la carpeta de hooks");
+    let hook_path = hooks.join("pre-commit");
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\necho 'pre-commit: la comprobación de formato falló' >&2\nexit 1\n",
+    )
+    .expect("debe escribir el hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
+            .expect("debe hacer ejecutable el hook");
+    }
+    fs::write(temporary.path().join("a.txt"), "contenido").expect("debe escribir el archivo");
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    client
+        .stage_all(temporary.path(), &cancellation)
+        .expect("stage debe funcionar");
+
+    let error = client
+        .commit(temporary.path(), "mensaje de prueba", &cancellation)
+        .expect_err("el hook debe rechazar el commit");
+
+    let git_helper::git::GitError::HookRejected { hook, .. } = &error else {
+        panic!("un hook que rechaza debe clasificarse como tal: {error:?}");
+    };
+    assert_eq!(hook.as_deref(), Some("pre-commit"));
+    assert!(
+        error
+            .technical_details()
+            .contains("la comprobación de formato falló")
+    );
+    assert!(
+        !run_git(temporary.path(), &["log", "--oneline"])
+            .status
+            .success(),
+        "el commit rechazado no debe crear historial"
+    );
+}
+
+#[test]
+fn rejected_push_and_divergent_pull_get_next_steps_without_forcing_anything() {
+    let temporary = tempdir().expect("debe crear el directorio temporal");
+    let origin = temporary.path().join("origin.git");
+    require_git(
+        temporary.path(),
+        &["init", "--bare", "-b", "main", "origin.git"],
+    );
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    for clone in [&first, &second] {
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(&origin)
+            .arg(clone)
+            .output()
+            .expect("Git debe poder clonar el repositorio local");
+        assert!(output.status.success(), "clonar debe funcionar");
+        require_git(clone, &["config", "user.name", "Git Helper Tests"]);
+        require_git(
+            clone,
+            &["config", "user.email", "git-helper-tests@example.invalid"],
+        );
+    }
+    let client = GitClient::default();
+    let cancellation = CancellationToken::default();
+    commit_file(&client, &first, "a.txt", "uno", "primer commit");
+    require_git(&first, &["push", "-u", "origin", "main"]);
+    commit_file(&client, &second, "b.txt", "dos", "commit divergente");
+
+    let rejected = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::SetUpstreamAndPush {
+                remote_name: "origin".to_owned(),
+                branch_name: "main".to_owned(),
+            },
+            &cancellation,
+        )
+        .expect_err("el push sin integrar debe ser rechazado");
+
+    assert!(
+        matches!(rejected, git_helper::git::GitError::PushRejected { .. }),
+        "un push rechazado debe clasificarse como tal: {rejected:?}"
+    );
+    let action = rejected
+        .recommended_action()
+        .expect("debe recomendar una acción");
+    assert!(action.contains("Fetch"));
+    assert!(action.to_lowercase().contains("no uses push forzado"));
+
+    require_git(&second, &["fetch", "origin"]);
+    require_git(
+        &second,
+        &["branch", "--set-upstream-to", "origin/main", "main"],
+    );
+    let divergent = client
+        .execute_remote(
+            &second,
+            &git_helper::domain::RemoteOperationPlan::PullFastForward,
+            &cancellation,
+        )
+        .expect_err("un pull fast-forward sobre ramas divergentes debe fallar");
+
+    assert!(
+        matches!(
+            divergent,
+            git_helper::git::GitError::DivergentBranches { .. }
+        ),
+        "una divergencia debe clasificarse como tal: {divergent:?}"
+    );
+    assert!(
+        divergent
+            .recommended_action()
+            .expect("debe recomendar una acción")
+            .contains("fuera de Git Helper")
+    );
+    let local_head = run_git(&second, &["rev-parse", "HEAD"]);
+    let commit_message = run_git(&second, &["log", "-1", "--pretty=%s"]);
+    assert!(local_head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&commit_message.stdout).trim(),
+        "commit divergente",
+        "ni el push rechazado ni el pull fallido deben mover la rama local"
+    );
 }

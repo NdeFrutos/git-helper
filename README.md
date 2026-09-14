@@ -23,8 +23,11 @@ sincronizar con remotes y consultar el historial.
 - Consultar ramas locales y referencias remote-tracking, con upstream y contadores ahead/behind.
 - Consultar el historial y los detalles de cada commit.
 - Abrir el repositorio o un archivo en el editor, abrir una terminal en su raíz y mostrarlo en el Explorador.
+- Filtrar los cambios por ruta y buscar en el historial por mensaje, autor o hash (`Ctrl+F`).
 - Restaurar los repositorios abiertos y la vista seleccionada entre sesiones.
 - Proponer un mensaje de commit con Cursor CLI, de forma opcional y siempre editable.
+- Configurar idioma, convención, alcance y longitud del asunto del mensaje, con valores
+  globales y sobrescritura por repositorio, e insertar una plantilla manual editable.
 
 Git Helper usa el Git instalado en el equipo, por lo que respeta sus credenciales, configuración,
 hooks, filtros y atributos. No incluye un motor Git propio.
@@ -83,9 +86,50 @@ aparece en el menú Inicio.
 ## Uso rápido
 
 1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` (`Ctrl+O`) o clónalo con `Clonar repositorio` (`Ctrl+Shift+O`).
-2. Prepara los archivos que quieras incluir desde la vista `Cambios`.
+2. Prepara los archivos que quieras incluir desde la vista `Cambios`. Puedes actuar sobre una
+   fila, sobre un grupo completo o sobre una selección de varias filas.
 3. Escribe el mensaje —o solicita una propuesta a Cursor— y pulsa `Commit`.
 4. Usa `Fetch`, `Pull` o `Push` desde la barra superior cuando necesites sincronizar.
+
+### Seleccionar varios archivos
+
+En la vista `Cambios`, un clic selecciona una fila, `Ctrl+clic` añade o quita filas sueltas,
+`Mayús+clic` selecciona el rango que va desde el ancla hasta la fila del clic y `Ctrl+Mayús+clic`
+suma ese rango a lo que ya estuviera seleccionado. El contador junto a los botones indica cuántas
+filas hay seleccionadas, y `Stage selección` y `Unstage selección` muestran entre paréntesis a
+cuántas rutas van a afectar.
+
+Un archivo staged y modificado de nuevo aparece en dos filas que se seleccionan por separado:
+cada fila controla solo el estado que representa. Los conflictos no son seleccionables porque
+deben resolverse fuera de Git Helper. Si un cambio externo hace desaparecer una fila, esa fila
+sale de la selección sin arrastrarla a la que ocupe su posición; lo mismo ocurre al plegar un
+grupo o al aplicar un filtro de búsqueda.
+
+Git no aplica el lote de forma atómica. Si alguna ruta falla, Git Helper indica cuántas se
+aplicaron, detalla el motivo de cada fallo y vuelve a leer el estado real del repositorio.
+
+### Preferencias del mensaje de commit
+
+Bajo el cuadro de mensaje hay una fila compacta con las preferencias que orientan la propuesta:
+
+| Control | Qué hace |
+|---|---|
+| `Editando: global` / `Editando: este repo` | Elige la capa sobre la que actúan los botones siguientes |
+| `Idioma` | Recorre `según el historial`, `español` e `inglés` |
+| `Formato` | Alterna entre `texto libre` y `conventional` |
+| `alcance opcional` | Solo con `conventional`: recorre `sin alcance`, `alcance opcional` y `alcance obligatorio` |
+| `Asunto ≤N` | Recorre las longitudes orientativas 50, 60, 72 y 100 |
+| `Usar global` | Elimina las sobrescrituras del repositorio activo |
+| `Predeterminados` | Restaura los valores de fábrica globales y del repositorio activo |
+| `Plantilla` | Escribe una plantilla editable acorde a las preferencias efectivas |
+
+Un valor marcado con `·repo` procede del repositorio activo; el resto se hereda del ajuste global.
+Cualquier proveedor de generación recibe exactamente las mismas preferencias normalizadas.
+
+Las convenciones son una guía: el aviso naranja bajo el cuadro señala cuándo el asunto se aleja de
+lo configurado, pero nunca impide crear un commit escrito a mano. `Plantilla` tampoco sustituye un
+borrador con texto sin confirmarlo antes, y una propuesta generada con preferencias distintas a las
+vigentes se descarta en lugar de pisar el borrador.
 
 Atajos disponibles:
 
@@ -102,6 +146,35 @@ Atajos disponibles:
 | `Ctrl+Shift+E` | Abrir el repositorio en el editor |
 | `Ctrl+Shift+T` | Abrir una terminal en la raíz del repositorio |
 | `Ctrl+Shift+X` | Mostrar el repositorio en el Explorador |
+| `Ctrl+Shift+S` / `Ctrl+Shift+U` | Stage / unstage de la selección (solo en `Cambios`) |
+| `Ctrl+F` | Enfocar la búsqueda de la vista activa |
+| `Escape` | Limpiar la consulta mientras la búsqueda tiene el foco |
+
+Con el foco en la lista de cambios, que se marca con un borde de acento:
+
+| Atajo | Acción |
+|---|---|
+| `↑` / `↓` | Mover la fila activa |
+| `Mayús+↑` / `Mayús+↓` | Extender la selección desde el ancla |
+| `Ctrl+Espacio` | Añadir o quitar la fila activa |
+| `Ctrl+A` | Seleccionar todas las filas visibles |
+| `Esc` | Vaciar la selección |
+
+### Buscar y filtrar
+
+Cada vista tiene su propia caja de búsqueda, independiente por repositorio: cambiar de pestaña no
+arrastra ni descarta la consulta de otra.
+
+- En `Cambios` el texto filtra por ruta o nombre de archivo. El archivo conserva sus filas staged y
+  sin preparar por separado, con sus acciones propias. Mientras el filtro está activo se ocultan
+  `Stage todo` y `Unstage todo`, porque actúan sobre el repositorio entero y no sobre lo visible.
+- En `Historial` el texto busca por asunto, autor, correo y prefijo de hash. La búsqueda recorre la
+  referencia seleccionada por páginas, no solo los commits ya cargados; `Buscar más` continúa el
+  recorrido cuando quedan commits por explorar.
+
+La consulta se trata siempre como texto literal: no se interpreta como expresión regular ni llega a
+Git como patrón. Buscar no modifica `HEAD`, el índice ni el directorio de trabajo. Cambiar la
+consulta o la rama descarta los resultados que estuvieran en vuelo.
 
 ## Abrir el editor, la terminal y el Explorador
 
@@ -133,6 +206,19 @@ Para fijar otro editor o añadirle opciones, edita `editor_command` en
 Los argumentos son datos, no una línea de comandos: `"target"` marca dónde se sustituye la ruta que
 se abre y, si no aparece, se añade al final. Cada opción se entrega tal cual al programa.
 
+## Cuando algo falla
+
+La banda de error muestra tres cosas: qué ocurrió, el siguiente paso seguro y los detalles
+técnicos, que se pueden expandir y copiar. Los casos reconocidos —identidad de Git sin configurar,
+`index.lock` bloqueado, hook que rechaza la operación, credenciales rechazadas, rama sin upstream,
+push rechazado, divergencia con el remote y fallos del proveedor de IA— incluyen una recomendación
+concreta. Un error que Git Helper no reconoce conserva su salida íntegra y no se le atribuye una
+causa inventada.
+
+Las recomendaciones nunca reparan nada por su cuenta: Git Helper no borra `index.lock`, no cambia
+tu configuración de identidad, no hace merge, rebase ni stash automático y nunca usa push forzado.
+Las URLs con credenciales embebidas se ocultan antes de mostrar o copiar los detalles.
+
 ## Privacidad y seguridad
 
 - No hay telemetría propia.
@@ -146,6 +232,8 @@ se abre y, si no aparece, se añade al final. Cada opción se entrega tal cual a
 - Descartar cambios requiere confirmación explícita.
 - Cursor solo recibe el contexto staged tras una acción y consentimiento explícitos. El contexto
   está limitado a 200 KiB, excluye binarios y no se guarda ni se registra.
+- Las preferencias del mensaje se guardan en el estado local de la aplicación; no se leen
+  instrucciones del repositorio ni se envía nada más que el contexto staged.
 - La detección básica de posibles secretos antes de usar Cursor es una ayuda, no una garantía.
 
 ## Compilar desde el código fuente
