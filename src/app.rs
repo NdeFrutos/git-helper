@@ -8,7 +8,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{
     actions::{
-        CloneRepository, CloseActiveRepository, CreateCommit, GenerateCommitMessage,
+        CloneRepository, CloseActiveRepository, CreateCommit, FindInView, GenerateCommitMessage,
         MoveRepositoryLeft, MoveRepositoryRight, NextRepository, OpenRepository,
         PreviousRepository, RefreshRepository, ReopenClosedRepository, ShowChanges, ShowHistory,
         ToggleFavoriteRepository,
@@ -62,6 +62,7 @@ pub fn run(startup: AppStartup) {
             KeyBinding::new("ctrl-2", ShowChanges, Some("GitHelper")),
             KeyBinding::new("ctrl-enter", CreateCommit, Some("GitHelper")),
             KeyBinding::new("ctrl-shift-g", GenerateCommitMessage, Some("GitHelper")),
+            KeyBinding::new("ctrl-f", FindInView, Some("GitHelper")),
         ]);
         let persisted_startup = locate_startup_store();
         let bounds = initial_window_bounds(cx, None);

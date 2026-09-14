@@ -4,8 +4,8 @@ use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Rgba, Size, Style, TextRun, UTF16Selection, Window, WrappedLine,
-    actions, div, fill, point, prelude::*, px, relative, rgba, size,
+    PaintQuad, Pixels, Point, Rgba, SharedString, Size, Style, TextRun, UTF16Selection, Window,
+    WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgba, size,
 };
 
 /// Mínimo de líneas visibles cuando el campo está vacío o con poco texto.
@@ -43,15 +43,66 @@ actions!(
         SelectAll,
         Copy,
         Cut,
-        Paste
+        Paste,
+        Dismiss
     ]
 );
 
 /// Evento usado para que la ventana actualice contador y disponibilidad.
 pub struct CommitMessageChanged;
 
+/// Evento emitido al pulsar Escape dentro del campo.
+///
+/// El campo no decide qué significa descartar: el commit lo ignora y la
+/// búsqueda lo usa para limpiar la consulta activa.
+pub struct CommitInputDismissed;
+
+/// Presentación configurable del campo de texto.
+///
+/// Permite reutilizar el mismo editor para el mensaje de commit y para las
+/// cajas de búsqueda sin duplicar el manejo de teclado, selección e IME.
+#[derive(Clone, Debug)]
+pub struct InputAppearance {
+    /// Identificador del elemento GPUI; debe ser único dentro de la ventana.
+    pub element_id: SharedString,
+    /// Texto atenuado que se muestra mientras el campo está vacío.
+    pub placeholder: SharedString,
+    /// Líneas visibles mínimas.
+    pub min_visible_lines: f32,
+    /// Líneas visibles máximas antes de activar scroll interno.
+    pub max_visible_lines: f32,
+}
+
+impl Default for InputAppearance {
+    fn default() -> Self {
+        Self {
+            element_id: SharedString::new_static("commit-input"),
+            placeholder: SharedString::new_static("Escribe el mensaje de commit…"),
+            min_visible_lines: MIN_VISIBLE_LINES,
+            max_visible_lines: MAX_VISIBLE_LINES,
+        }
+    }
+}
+
+impl InputAppearance {
+    /// Campo de una sola línea, pensado para barras de búsqueda.
+    #[must_use]
+    pub fn single_line(
+        element_id: impl Into<SharedString>,
+        placeholder: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            element_id: element_id.into(),
+            placeholder: placeholder.into(),
+            min_visible_lines: 1.0,
+            max_visible_lines: 1.0,
+        }
+    }
+}
+
 /// Editor de commit pequeño, independiente del editor GPL de Zed.
 pub struct CommitInput {
+    appearance: InputAppearance,
     focus_handle: FocusHandle,
     content: String,
     content_version: u64,
@@ -65,10 +116,17 @@ pub struct CommitInput {
 }
 
 impl CommitInput {
-    /// Crea un editor vacío y registra sus atajos locales.
+    /// Crea un editor de mensaje de commit vacío.
     #[must_use]
     pub fn new(cx: &mut Context<Self>) -> Self {
+        Self::with_appearance(InputAppearance::default(), cx)
+    }
+
+    /// Crea un editor vacío con presentación propia.
+    #[must_use]
+    pub fn with_appearance(appearance: InputAppearance, cx: &mut Context<Self>) -> Self {
         Self {
+            appearance,
             focus_handle: cx.focus_handle(),
             content: String::new(),
             content_version: 0,
@@ -109,7 +167,13 @@ impl CommitInput {
             KeyBinding::new("ctrl-c", Copy, Some("CommitInput")),
             KeyBinding::new("ctrl-x", Cut, Some("CommitInput")),
             KeyBinding::new("ctrl-v", Paste, Some("CommitInput")),
+            KeyBinding::new("escape", Dismiss, Some("CommitInput")),
         ]);
+    }
+
+    /// Traslada el foco del teclado a este campo.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus_handle, cx);
     }
 
     /// Devuelve el texto actual sin normalizar sus saltos.
@@ -321,6 +385,14 @@ impl CommitInput {
         }
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "cx.listener impone la firma; descartar no depende del texto actual"
+    )]
+    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(CommitInputDismissed);
+    }
+
     fn replace_selection(&mut self, replacement: &str) {
         self.content
             .replace_range(self.selected_range.clone(), replacement);
@@ -443,6 +515,8 @@ impl CommitInput {
 }
 
 impl gpui::EventEmitter<CommitMessageChanged> for CommitInput {}
+
+impl gpui::EventEmitter<CommitInputDismissed> for CommitInput {}
 
 impl Focusable for CommitInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -574,10 +648,14 @@ impl Render for CommitInput {
         let focus_handle = self.focus_handle.clone();
         let is_focused = focus_handle.is_focused(window);
         let line_height = window.line_height();
-        let min_height = line_height * MIN_VISIBLE_LINES + px(CONTAINER_VERTICAL_PADDING);
-        let max_height = line_height * MAX_VISIBLE_LINES + px(CONTAINER_VERTICAL_PADDING);
+        let min_height =
+            line_height * self.appearance.min_visible_lines + px(CONTAINER_VERTICAL_PADDING);
+        let max_height =
+            line_height * self.appearance.max_visible_lines + px(CONTAINER_VERTICAL_PADDING);
+        let element_id = self.appearance.element_id.clone();
+        let scroll_id = SharedString::from(format!("{element_id}-scroll"));
         div()
-            .id("commit-input")
+            .id(element_id)
             .key_context("CommitInput")
             .track_focus(&focus_handle)
             .relative()
@@ -623,13 +701,14 @@ impl Render for CommitInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::dismiss))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(
                 div()
-                    .id("commit-input-scroll")
+                    .id(scroll_id)
                     .w_full()
                     .overflow_y_scroll()
                     .child(TextElement { input: cx.entity() }),
@@ -815,7 +894,7 @@ fn display_text_for_input(input: &CommitInput) -> (String, Rgba, bool) {
         if input.is_generating {
             "Generando mensaje con Cursor…".to_owned()
         } else {
-            "Escribe el mensaje de commit…".to_owned()
+            input.appearance.placeholder.to_string()
         }
     } else {
         input.content.clone()

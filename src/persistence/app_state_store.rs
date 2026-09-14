@@ -22,7 +22,7 @@ use crate::domain::{
 
 /// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
 /// su brazo en `migrate`; nunca reutilices un número ya publicado por otra rama.
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+const CURRENT_SCHEMA_VERSION: u32 = 6;
 const APPLICATION_DIRECTORY: &str = "GitHelper";
 const STATE_FILE_NAME: &str = "state.json";
 
@@ -151,6 +151,7 @@ impl PersistedAppState {
                     mutation_state: MutationState::default(),
                     status_message: "Preparando repositorio…".to_owned(),
                     error: None,
+                    error_next_step: None,
                     refresh_generation: 0,
                     history_generation: 0,
                     history_loaded: false,
@@ -351,8 +352,12 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
                 state.schema_version = 4;
             }
             4 => {
-                normalize_repository_path_lists(&mut state);
+                normalize_commit_message_preferences(&mut state);
                 state.schema_version = 5;
+            }
+            5 => {
+                normalize_repository_path_lists(&mut state);
+                state.schema_version = 6;
             }
             unknown => {
                 warn!(
@@ -365,12 +370,30 @@ fn migrate(mut state: PersistedAppState) -> PersistedAppState {
     }
     normalize_ssh_clone_mappings(&mut state);
     normalize_commit_drafts(&mut state);
+    normalize_commit_message_preferences(&mut state);
     normalize_repository_path_lists(&mut state);
     state = normalize_periodic_fetch_settings(state);
     state
 }
 
-/// v4 → v5: aparecen favoritos y pestañas cerradas; deja las tres listas de rutas sin
+/// v4 → v5: preferencias de mensaje de commit globales y por repositorio.
+///
+/// Un estado anterior no las trae y adopta los valores predeterminados. Aquí se
+/// acotan longitudes fuera de rango y se descartan claves vacías o sin ninguna
+/// sobrescritura, para que la herencia del valor global sea la única fuente.
+fn normalize_commit_message_preferences(state: &mut PersistedAppState) {
+    state.settings.commit_message_preferences =
+        state.settings.commit_message_preferences.normalized();
+    state
+        .settings
+        .repository_commit_message_preferences
+        .retain(|repository_key, overrides| {
+            *overrides = overrides.normalized();
+            !repository_key.trim().is_empty() && !overrides.is_empty()
+        });
+}
+
+/// v5 → v6: aparecen favoritos y pestañas cerradas; deja las tres listas de rutas sin
 /// duplicados según la identidad canónica y dentro de sus límites.
 fn normalize_repository_path_lists(state: &mut PersistedAppState) {
     deduplicate_repository_paths(&mut state.recent_repositories, MAX_RECENT_REPOSITORIES);
@@ -423,7 +446,11 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::domain::{AppState, RepositorySession, RepositoryView, SshCloneMapping};
+    use crate::domain::{
+        AppState, CommitMessageConvention, CommitMessageLanguage, CommitMessagePreferenceOverrides,
+        CommitMessagePreferences, CommitScopeUsage, RepositorySession, RepositoryView,
+        SshCloneMapping, effective_commit_preferences,
+    };
 
     use super::{AppStateStore, PersistedAppState, WindowPlacement};
 
@@ -695,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v4_state_without_favorites_or_closed_tabs() {
+    fn migrates_v4_state_without_commit_message_preferences_or_favorites() {
         let temporary_directory = tempdir().expect("debe crear el temporal");
         let state_path = temporary_directory.path().join("state.json");
         fs::write(
@@ -721,6 +748,17 @@ mod tests {
             "un estado v4 legítimo debe migrarse, no tratarse como dañado"
         );
         assert_eq!(loaded.state.schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.state.settings.commit_message_preferences,
+            CommitMessagePreferences::default()
+        );
+        assert!(
+            loaded
+                .state
+                .settings
+                .repository_commit_message_preferences
+                .is_empty()
+        );
         assert!(loaded.state.favorite_repositories.is_empty());
         assert!(loaded.state.recently_closed_repositories.is_empty());
         assert_eq!(
@@ -737,7 +775,7 @@ mod tests {
         fs::write(
             &state_path,
             br#"{
-                "schema_version": 5,
+                "schema_version": 6,
                 "repositories": [],
                 "favorite_repositories": ["C:\\repos\\alpha"],
                 "recently_closed_repositories": ["C:\\repos\\beta"],
@@ -748,7 +786,7 @@ mod tests {
                 }
             }"#,
         )
-        .expect("debe escribir el fixture v5");
+        .expect("debe escribir el fixture v6");
         let store = AppStateStore::new(state_path);
 
         let loaded = store.load().expect("debe cargar sin perder datos");
@@ -761,6 +799,100 @@ mod tests {
         assert_eq!(
             loaded.state.recently_closed_repositories,
             vec![PathBuf::from(r"C:\repos\beta")]
+        );
+    }
+
+    #[test]
+    fn normalizes_hand_edited_commit_message_preferences_on_load() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let state_path = temporary_directory.path().join("state.json");
+        fs::write(
+            &state_path,
+            br#"{
+                "schema_version": 4,
+                "settings": {
+                    "theme": "System",
+                    "cursor_context_consent": false,
+                    "commit_message_preferences": {
+                        "language": "English",
+                        "convention": "ConventionalCommits",
+                        "subject_max_length": 0
+                    },
+                    "repository_commit_message_preferences": {
+                        "c:\\repos\\uno": { "subject_max_length": 5000 },
+                        "c:\\repos\\dos": {},
+                        "   ": { "scope": "Required" }
+                    }
+                }
+            }"#,
+        )
+        .expect("debe escribir el fixture editado a mano");
+        let store = AppStateStore::new(state_path);
+
+        let loaded = store.load().expect("debe migrar");
+        let settings = &loaded.state.settings;
+
+        assert!(loaded.corruption_backup.is_none());
+
+        assert_eq!(
+            settings.commit_message_preferences.subject_max_length,
+            crate::domain::DEFAULT_SUBJECT_MAX_LENGTH
+        );
+        assert_eq!(
+            settings.commit_message_preferences.language,
+            CommitMessageLanguage::English
+        );
+        assert_eq!(settings.repository_commit_message_preferences.len(), 1);
+        assert_eq!(
+            settings.repository_commit_message_preferences[r"c:\repos\uno"].subject_max_length,
+            Some(crate::domain::MAX_SUBJECT_MAX_LENGTH)
+        );
+    }
+
+    #[test]
+    fn persists_global_preferences_and_repository_overrides() {
+        let temporary_directory = tempdir().expect("debe crear el temporal");
+        let store = AppStateStore::new(temporary_directory.path().join("state.json"));
+        let mut app_state = AppState::default();
+        app_state.settings.commit_message_preferences = CommitMessagePreferences {
+            language: CommitMessageLanguage::Spanish,
+            convention: CommitMessageConvention::ConventionalCommits,
+            scope: CommitScopeUsage::Required,
+            subject_max_length: 50,
+        };
+        app_state
+            .settings
+            .repository_commit_message_preferences
+            .insert(
+                r"c:\repos\uno".to_owned(),
+                CommitMessagePreferenceOverrides {
+                    language: Some(CommitMessageLanguage::English),
+                    ..CommitMessagePreferenceOverrides::default()
+                },
+            );
+        let persisted = PersistedAppState::from_app_state(&app_state, &HashMap::new(), None);
+
+        store.save(&persisted).expect("debe guardar");
+        let loaded = store.load().expect("debe cargar");
+
+        assert_eq!(
+            loaded.state.settings.commit_message_preferences,
+            app_state.settings.commit_message_preferences
+        );
+        assert_eq!(
+            loaded.state.settings.repository_commit_message_preferences,
+            app_state.settings.repository_commit_message_preferences
+        );
+        let (restored, _) = loaded.state.into_app_state();
+        assert_eq!(
+            effective_commit_preferences(
+                restored.settings.commit_message_preferences,
+                &restored.settings.repository_commit_message_preferences,
+                r"c:\repos\uno",
+            )
+            .values()
+            .language,
+            CommitMessageLanguage::English
         );
     }
 

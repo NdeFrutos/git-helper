@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::{
     BranchReference, ChangeSelection, CommitId, CommitSummary, HeadState, Remote,
     RemoteFreshnessTracker, UpstreamState,
+    commit_preferences::{CommitMessagePreferenceOverrides, CommitMessagePreferences},
     remote_freshness::{DEFAULT_PERIODIC_FETCH_INTERVAL_SECS, normalized_repo_key},
     status::FileChange,
 };
@@ -76,6 +77,8 @@ pub enum RefreshState {
     Failed {
         message: String,
         details: String,
+        /// Siguiente acción segura sugerida, cuando el error está clasificado.
+        next_step: Option<String>,
     },
     Cancelled {
         message: String,
@@ -103,6 +106,8 @@ pub enum MutationState {
         kind: OperationKind,
         message: String,
         details: String,
+        /// Siguiente acción segura sugerida, cuando el error está clasificado.
+        next_step: Option<String>,
     },
 }
 
@@ -235,6 +240,10 @@ pub struct RepositorySession {
     pub mutation_state: MutationState,
     pub status_message: String,
     pub error: Option<String>,
+    /// Acompaña a `error` con la siguiente acción segura. Se escribe siempre
+    /// junto al error mediante `set_error` para que no quede una recomendación
+    /// de un fallo anterior.
+    pub error_next_step: Option<String>,
     pub refresh_generation: u64,
     pub history_generation: u64,
     pub history_loaded: bool,
@@ -264,6 +273,7 @@ impl RepositorySession {
             mutation_state: MutationState::default(),
             status_message: "Preparando repositorio…".to_owned(),
             error: None,
+            error_next_step: None,
             refresh_generation: 0,
             history_generation: 0,
             history_loaded: false,
@@ -273,6 +283,18 @@ impl RepositorySession {
             path_accessible: true,
             remote_freshness: RemoteFreshnessTracker::default(),
         }
+    }
+
+    /// Registra el error visible junto a su siguiente acción segura.
+    pub fn set_error(&mut self, message: impl Into<String>, next_step: Option<String>) {
+        self.error = Some(message.into());
+        self.error_next_step = next_step;
+    }
+
+    /// Limpia el error visible y su recomendación asociada.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+        self.error_next_step = None;
     }
 
     /// Indica si hay una lectura de estado en curso para esta pestaña.
@@ -374,6 +396,7 @@ mod refresh_tests {
             kind: OperationKind::Commit,
             message: "fallo".to_owned(),
             details: "stderr".to_owned(),
+            next_step: None,
         };
 
         assert_ne!(cancelled, failed);
@@ -437,6 +460,12 @@ pub struct AppSettings {
     /// Remote preferido por repositorio cuando existen varios remotes.
     #[serde(default)]
     pub repository_preferred_remotes: HashMap<String, String>,
+    /// Preferencias globales del mensaje de commit compartidas por los proveedores.
+    #[serde(default)]
+    pub commit_message_preferences: CommitMessagePreferences,
+    /// Sobrescrituras por repositorio; los campos ausentes heredan del global.
+    #[serde(default)]
+    pub repository_commit_message_preferences: HashMap<String, CommitMessagePreferenceOverrides>,
 }
 
 impl Default for AppSettings {
@@ -449,6 +478,8 @@ impl Default for AppSettings {
             periodic_fetch_enabled: false,
             periodic_fetch_interval_secs: DEFAULT_PERIODIC_FETCH_INTERVAL_SECS,
             repository_preferred_remotes: HashMap::new(),
+            commit_message_preferences: CommitMessagePreferences::default(),
+            repository_commit_message_preferences: HashMap::new(),
         }
     }
 }

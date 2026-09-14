@@ -17,5 +17,6 @@ actions!(
         ShowChanges,
         CreateCommit,
         GenerateCommitMessage,
+        FindInView,
     ]
 );
