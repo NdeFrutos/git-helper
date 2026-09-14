@@ -14,9 +14,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::domain::{
-    AppSettings, AppState, ChangeCounters, HistorySnapshot, MutationState, RefreshCoordinator,
-    RefreshState, RepositoryId, RepositorySession, RepositoryView, SshCloneMapping,
-    WorkingTreeSnapshot,
+    AppSettings, AppState, ChangeCounters, ChangeSelectionState, HistorySnapshot, MutationState,
+    RefreshCoordinator, RefreshState, RepositoryId, RepositorySession, RepositoryView,
+    SshCloneMapping, WorkingTreeSnapshot,
 };
 
 /// Versión escrita por esta build. Al añadir un paso nuevo, súbela en uno y añade
@@ -128,7 +128,7 @@ impl PersistedAppState {
                     change_counters: ChangeCounters::default(),
                     has_loaded_snapshot: false,
                     selected_view: repository.selected_view,
-                    selected_change: None,
+                    change_selection: ChangeSelectionState::default(),
                     selected_commit: None,
                     refresh_state: RefreshState::default(),
                     mutation_state: MutationState::default(),

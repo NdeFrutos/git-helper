@@ -85,9 +85,27 @@ aparece en el menú Inicio.
 ## Uso rápido
 
 1. Abre Git Helper y selecciona un repositorio con `Abrir repositorio` (`Ctrl+O`) o clónalo con `Clonar repositorio` (`Ctrl+Shift+O`).
-2. Prepara los archivos que quieras incluir desde la vista `Cambios`.
+2. Prepara los archivos que quieras incluir desde la vista `Cambios`. Puedes actuar sobre una
+   fila, sobre un grupo completo o sobre una selección de varias filas.
 3. Escribe el mensaje —o solicita una propuesta a Cursor— y pulsa `Commit`.
 4. Usa `Fetch`, `Pull` o `Push` desde la barra superior cuando necesites sincronizar.
+
+### Seleccionar varios archivos
+
+En la vista `Cambios`, un clic selecciona una fila, `Ctrl+clic` añade o quita filas sueltas,
+`Mayús+clic` selecciona el rango que va desde el ancla hasta la fila del clic y `Ctrl+Mayús+clic`
+suma ese rango a lo que ya estuviera seleccionado. El contador junto a los botones indica cuántas
+filas hay seleccionadas, y `Stage selección` y `Unstage selección` muestran entre paréntesis a
+cuántas rutas van a afectar.
+
+Un archivo staged y modificado de nuevo aparece en dos filas que se seleccionan por separado:
+cada fila controla solo el estado que representa. Los conflictos no son seleccionables porque
+deben resolverse fuera de Git Helper. Si un cambio externo hace desaparecer una fila, esa fila
+sale de la selección sin arrastrarla a la que ocupe su posición; lo mismo ocurre al plegar un
+grupo o al aplicar un filtro de búsqueda.
+
+Git no aplica el lote de forma atómica. Si alguna ruta falla, Git Helper indica cuántas se
+aplicaron, detalla el motivo de cada fallo y vuelve a leer el estado real del repositorio.
 
 ### Preferencias del mensaje de commit
 
@@ -124,8 +142,19 @@ Atajos disponibles:
 | `Ctrl+1` / `Ctrl+2` | Mostrar historial / cambios |
 | `Ctrl+Enter` | Crear el commit |
 | `Ctrl+Shift+G` | Generar un mensaje con Cursor |
+| `Ctrl+Shift+S` / `Ctrl+Shift+U` | Stage / unstage de la selección (solo en `Cambios`) |
 | `Ctrl+F` | Enfocar la búsqueda de la vista activa |
 | `Escape` | Limpiar la consulta mientras la búsqueda tiene el foco |
+
+Con el foco en la lista de cambios, que se marca con un borde de acento:
+
+| Atajo | Acción |
+|---|---|
+| `↑` / `↓` | Mover la fila activa |
+| `Mayús+↑` / `Mayús+↓` | Extender la selección desde el ancla |
+| `Ctrl+Espacio` | Añadir o quitar la fila activa |
+| `Ctrl+A` | Seleccionar todas las filas visibles |
+| `Esc` | Vaciar la selección |
 
 ### Buscar y filtrar
 

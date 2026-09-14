@@ -1,4 +1,5 @@
 mod branch;
+mod change_selection;
 mod commit_preferences;
 mod history;
 mod remote;
@@ -8,6 +9,7 @@ mod search;
 mod status;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
+pub use change_selection::ChangeSelectionState;
 pub use commit_preferences::{
     CommitMessageConvention, CommitMessageLanguage, CommitMessagePreferenceOverrides,
     CommitMessagePreferences, CommitPreferenceField, CommitScopeUsage, DEFAULT_SUBJECT_MAX_LENGTH,
@@ -32,4 +34,6 @@ pub use repository::{
     SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
 };
 pub use search::{SearchQuery, change_matches, commit_matches};
-pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};
+pub use status::{
+    ChangeKind, ChangeRepresentation, ChangeSelection, FileChange, HeadState, StatusSnapshot,
+};
