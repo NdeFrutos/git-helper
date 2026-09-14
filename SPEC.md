@@ -195,6 +195,22 @@ Un mismo archivo puede aparecer tanto en `Cambios staged` como en `Cambios` si t
 
 Seleccionar una fila solo la resalta y habilita sus acciones. El MVP no leerá ni mostrará el contenido ni el diff del archivo.
 
+La vista incluye una caja de filtro por ruta o nombre. El filtro se aplica antes de agrupar, así que un archivo filtrado conserva sus filas staged y de worktree por separado. Mientras hay consulta activa los grupos no ofrecen `Stage todo` ni `Unstage todo`: esas acciones operan sobre el repositorio completo y no sobre el subconjunto visible.
+
+### 4.3.1 Búsqueda en Cambios e Historial
+
+Cada repositorio mantiene una consulta independiente por vista. La caja se enfoca con `Ctrl+F` y `Escape` la limpia sin salir de la vista.
+
+Reglas comunes:
+
+- La consulta es dato literal: no se interpreta como expresión regular ni se pasa a Git como patrón, y nunca se construye una línea de shell con ella.
+- La comparación ignora mayúsculas usando plegado Unicode. En rutas, `\` y `/` se consideran equivalentes; en texto de commit, no.
+- Buscar es solo lectura: no modifica `HEAD`, el índice ni el directorio de trabajo.
+- Se muestran la consulta activa, el número de resultados y un estado vacío explícito cuando no hay coincidencias.
+- Cambiar la consulta o la referencia sube una generación interna; cualquier resultado asíncrono anterior se descarta en lugar de mezclarse.
+
+En `Historial` la búsqueda cubre asunto, nombre y correo del autor y prefijo de hash. El prefijo de hash solo se compara cuando la consulta es hexadecimal, para que una palabra corriente no acierte contra un identificador. El recorrido no se limita a la página cargada: se leen páginas sucesivas de la referencia seleccionada, con el mismo OID fijado que usa la paginación normal, hasta acumular un número razonable de resultados o agotar la referencia. `Buscar más` continúa el recorrido desde la última posición leída.
+
 ### 4.4 Stage y unstage
 
 Comandos requeridos:

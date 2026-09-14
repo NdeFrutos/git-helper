@@ -44,6 +44,12 @@ credenciales ni contenido sensible.
   siguen en la misma línea: las filas tienen altura fija, así que nada debe desbordar hacia la fila
   siguiente.
 - [ ] `Stage` / `Unstage` por archivo y `Stage todo` / `Unstage todo` actualizan la lista.
+- [ ] `Ctrl+F` enfoca el filtro; al escribir, la cabecera muestra la consulta y `n de m archivos`.
+- [ ] Con filtro activo, un archivo modificado en índice y worktree sigue apareciendo en ambos
+  grupos y cada fila hace stage/unstage solo de su estado.
+- [ ] Con filtro activo desaparecen `Stage todo` y `Unstage todo`.
+- [ ] Una consulta sin coincidencias muestra el estado vacío, no una lista en blanco.
+- [ ] `Escape` dentro del filtro y el botón `Limpiar` restauran la lista completa.
 - [ ] `Descartar` muestra confirmación antes de ejecutar.
 - [ ] La barra de rama y los botones Fetch / Pull / Push muestran estados de carga y errores legibles.
 - [ ] Una ruta larga se trunca en la barra inferior sin ocultar el estado ni la versión de Git.
@@ -60,6 +66,15 @@ credenciales ni contenido sensible.
 - [ ] La lista de commits es scrollable y virtualizada (sin tirones con muchos commits).
 - [ ] Al seleccionar un commit se muestran autor, fecha, asunto y cuerpo si existe.
 - [ ] `Cargar más` añade entradas sin duplicar las ya visibles.
+- [ ] `Ctrl+F` enfoca la búsqueda; la cabecera muestra consulta, resultados, commits explorados y si
+  el recorrido sigue en marcha.
+- [ ] Una consulta encuentra commits que todavía no estaban en la página cargada; `Buscar más`
+  continúa el recorrido y `Cargar más` desaparece mientras hay búsqueda activa.
+- [ ] Seleccionar un resultado carga sus detalles aunque no estuviera en el historial visible.
+- [ ] Cambiar de rama con una búsqueda activa reinicia los resultados sobre la rama nueva y no
+  mezcla commits de la anterior.
+- [ ] Escribir deprisa no encadena procesos de Git ni bloquea la ventana; `Escape` limpia la consulta.
+- [ ] Una búsqueda sin coincidencias en toda la referencia muestra el estado vacío.
 
 ## Estados de error y vacío
 
@@ -126,3 +141,24 @@ sesión de escritorio Windows. Procedimiento, por si hay que reproducirlo:
 
 Limitación conocida: el backend X11 de GPUI no es el de Windows, así que estas capturas validan el
 layout (elipsis, altura de fila, overflow) pero no el renderizado ni la escala nativos de Windows.
+
+## Registro de UX-08
+
+Comprobado en Windows 11 durante esta revisión:
+
+- [x] `cargo build --release --locked` completó correctamente (`target/release/git-helper.exe`).
+- [x] `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`
+  y `cargo test --all-targets --locked` en verde.
+- [x] Cobertura automática del comportamiento buscable, sin interfaz: plegado Unicode y de
+  separadores, consultas con caracteres especiales tratadas como literales, prefijo de hash solo
+  para consultas hexadecimales, filtrado de 10.000 cambios, independencia de las filas staged y de
+  worktree, desaparición de las acciones de grupo con filtro activo y descarte de páginas de
+  historial procedentes de otra consulta, otra referencia u otro desplazamiento.
+
+Pendiente de comprobación manual en una sesión de escritorio Windows; el entorno de esta revisión no
+tiene una, así que la lista de `Vista Changes` y `Vista History` de arriba sigue sin marcar:
+
+- [ ] Foco con `Ctrl+F`, limpieza con `Escape` y recorrido con tabulador dentro de la barra.
+- [ ] Latencia percibida al teclear sobre un repositorio con 10.000 cambios y sobre un historial
+  largo paginado.
+- [ ] Renderizado de la barra de búsqueda con escala del sistema al 125 %, 150 % y 200 %.
