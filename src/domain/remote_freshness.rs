@@ -310,7 +310,7 @@ pub fn select_periodic_fetch(
 }
 
 /// Resuelve el remote objetivo del fetch automático sin solicitar selección interactiva.
-fn resolve_periodic_remote(
+pub(crate) fn resolve_periodic_remote(
     repository: &RepositorySession,
     preferred_remote: Option<&String>,
 ) -> Option<String> {
