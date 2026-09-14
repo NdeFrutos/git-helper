@@ -195,6 +195,42 @@ Un mismo archivo puede aparecer tanto en `Cambios staged` como en `Cambios` si t
 
 Seleccionar una fila solo la resalta y habilita sus acciones. El MVP no leerá ni mostrará el contenido ni el diff del archivo.
 
+La vista incluye una caja de filtro por ruta o nombre. El filtro se aplica antes de agrupar, así que un archivo filtrado conserva sus filas staged y de worktree por separado. Mientras hay consulta activa los grupos no ofrecen `Stage todo` ni `Unstage todo`: esas acciones operan sobre el repositorio completo y no sobre el subconjunto visible.
+
+#### Selección múltiple
+
+La vista admite seleccionar varias filas para hacer stage o unstage de un subconjunto:
+
+- Clic: sustituye la selección por la fila pulsada, que pasa a ser el ancla.
+- `Ctrl`+clic: añade o quita esa fila y la convierte en el nuevo ancla.
+- `Mayús`+clic: sustituye la selección por el rango visual entre el ancla y la fila pulsada.
+- `Ctrl`+`Mayús`+clic: añade ese rango a la selección existente en lugar de sustituirla.
+- Equivalentes de teclado con el foco en la lista: `↑`/`↓` mueven la fila activa, `Mayús`+`↑`/`↓` extienden el rango, `Ctrl`+`Espacio` alterna la fila activa, `Ctrl`+`A` selecciona todas las filas visibles y `Esc` vacía la selección. `Ctrl`+`Mayús`+`S` y `Ctrl`+`Mayús`+`U` ejecutan las acciones sobre la selección.
+
+Reglas de la selección:
+
+- Cada fila se identifica por ruta **y** representación. Las filas `staged` y `worktree` de un mismo archivo son independientes y nunca se mezclan.
+- La identidad nunca es posicional: cuando Git deja de reportar una fila, esa fila sale de la selección y las demás la conservan. Una fila nueva que ocupe su posición no queda seleccionada.
+- Las filas que dejan de verse al plegar un grupo o al aplicar un filtro salen de la selección, de modo que el contador describa siempre lo que se ve.
+- Los conflictos no son seleccionables: el MVP no los resuelve.
+- La selección es efímera y no se persiste entre sesiones.
+
+La UI muestra el número de filas seleccionadas y dos acciones, `Stage selección` y `Unstage selección`, cuyo rótulo incluye el número exacto de rutas al que afectarán. `Stage selección` actúa sobre las filas de `Cambios` y `Sin seguimiento`; `Unstage selección` actúa sobre las de `Cambios staged`. El descarte múltiple queda fuera de esta funcionalidad.
+
+### 4.3.1 Búsqueda en Cambios e Historial
+
+Cada repositorio mantiene una consulta independiente por vista. La caja se enfoca con `Ctrl+F` y `Escape` la limpia sin salir de la vista.
+
+Reglas comunes:
+
+- La consulta es dato literal: no se interpreta como expresión regular ni se pasa a Git como patrón, y nunca se construye una línea de shell con ella.
+- La comparación ignora mayúsculas usando plegado Unicode. En rutas, `\` y `/` se consideran equivalentes; en texto de commit, no.
+- Buscar es solo lectura: no modifica `HEAD`, el índice ni el directorio de trabajo.
+- Se muestran la consulta activa, el número de resultados y un estado vacío explícito cuando no hay coincidencias.
+- Cambiar la consulta o la referencia sube una generación interna; cualquier resultado asíncrono anterior se descarta en lugar de mezclarse.
+
+En `Historial` la búsqueda cubre asunto, nombre y correo del autor y prefijo de hash. El prefijo de hash solo se compara cuando la consulta es hexadecimal, para que una palabra corriente no acierte contra un identificador. El recorrido no se limita a la página cargada: se leen páginas sucesivas de la referencia seleccionada, con el mismo OID fijado que usa la paginación normal, hasta acumular un número razonable de resultados o agotar la referencia. `Buscar más` continúa el recorrido desde la última posición leída.
+
 ### 4.4 Stage y unstage
 
 Comandos requeridos:
@@ -214,11 +250,23 @@ git -C <repo> rm --cached -- <ruta>
 
 o el comando equivalente validado por pruebas de integración. No se debe borrar el archivo del working tree.
 
+Para actuar sobre una selección se usan los mismos comandos con varios pathspecs:
+
+```text
+git -C <repo> add -- <ruta> <ruta>…
+git -C <repo> restore --staged -- <ruta> <ruta>…
+git -C <repo> rm --cached -- <ruta> <ruta>…
+```
+
+Todas las rutas se validan como relativas y contenidas en el repositorio **antes** de ejecutar nada: un pathspec inseguro aborta el lote completo sin tocar el repositorio. El lote se reparte en tantas invocaciones como haga falta para no superar el límite de línea de comandos de Windows (`CreateProcessW`, 32 767 unidades UTF-16), manteniendo el orden de las rutas.
+
+Git no ofrece atomicidad entre rutas y la aplicación no debe fingirla. Cuando una invocación falla, el lote se repite ruta a ruta para atribuir el error, y el resultado indica cuántas rutas se aplicaron, cuántas se pidieron y el motivo de cada fallo. Después siempre se reconcilia el estado con Git.
+
 Después de cualquier operación se actualizarán el estado y el historial si el HEAD ha cambiado.
 
 Las acciones:
 
-- Permanecerán deshabilitadas mientras exista otra mutación Git activa para ese repositorio.
+- Permanecerán deshabilitadas mientras exista otra mutación Git activa para ese repositorio, incluidas las de selección: solo hay una mutación activa por repositorio.
 - No bloquearán operaciones de solo lectura en otras pestañas.
 - Mostrarán stderr si fallan.
 - No asumirán que el estado previo sigue vigente después de ejecutar el comando.
@@ -383,6 +431,20 @@ será LRU, acotada y se identificará por el hash del commit; los errores no se 
 | `Ctrl+2` | Abrir vista Cambios |
 | `Ctrl+Enter` | Crear commit cuando el foco esté en el mensaje |
 | `Ctrl+Shift+G` | Generar mensaje de commit con Cursor |
+| `Ctrl+Shift+S` | Stage de la selección, solo en la vista Cambios |
+| `Ctrl+Shift+U` | Unstage de la selección, solo en la vista Cambios |
+
+Con el foco en la lista de cambios:
+
+| Atajo | Acción |
+|---|---|
+| `↑` / `↓` | Mover la fila activa |
+| `Mayús+↑` / `Mayús+↓` | Extender la selección desde el ancla |
+| `Ctrl+Espacio` | Añadir o quitar la fila activa |
+| `Ctrl+A` | Seleccionar todas las filas visibles |
+| `Esc` | Vaciar la selección |
+
+La lista de cambios es un contenedor enfocable con su propio contexto de teclado, de modo que sus atajos no compiten con el editor del mensaje de commit. Debe mostrar un indicador de foco visible.
 
 Los botones deben tener tooltip y las acciones principales deben poder ejecutarse con teclado.
 
@@ -689,6 +751,18 @@ Los errores se mostrarán cerca de la acción que falló y podrán expandirse pa
 - Pull no fast-forward.
 - Cursor CLI no instalado, no autenticado o bloqueado por política.
 - Respuesta inválida o cancelación de Cursor CLI.
+
+Cada error visible se presenta con tres elementos: una explicación breve de qué ocurrió, el
+siguiente paso seguro y el detalle técnico expandible y copiable. La clasificación se apoya en
+señales que Git no traduce (nombres de configuración como `user.email`, rutas como `index.lock`,
+nombres de hook y marcadores como `non-fast-forward`) antes que en frases concretas, para que una
+salida localizada siga reconociéndose. Un error sin clasificar conserva su salida íntegra y no
+recibe una causa atribuida: solo una recomendación genérica de revisar los detalles y reconciliar
+el estado.
+
+El siguiente paso nunca describe una reparación implícita: Git Helper no elimina `index.lock`, no
+modifica `user.name` ni `user.email`, no hace merge, rebase ni stash automático y no usa push
+forzado. Las credenciales embebidas en URLs se ocultan antes de mostrar o copiar los detalles.
 
 No se ocultará stderr ni se mostrará únicamente un mensaje genérico.
 

@@ -1,12 +1,25 @@
 mod branch;
+mod change_selection;
+mod commit_preferences;
 mod history;
 mod remote;
 mod remote_freshness;
 mod repository;
+mod search;
 mod status;
 mod summary;
 
 pub use branch::{BranchKind, BranchReference, BranchUpstream};
+pub use change_selection::ChangeSelectionState;
+pub use commit_preferences::{
+    CommitMessageConvention, CommitMessageLanguage, CommitMessagePreferenceOverrides,
+    CommitMessagePreferences, CommitPreferenceField, CommitScopeUsage, DEFAULT_SUBJECT_MAX_LENGTH,
+    EffectiveCommitPreferences, MAX_SUBJECT_MAX_LENGTH, MIN_SUBJECT_MAX_LENGTH, PreferenceScope,
+    PreferenceSource, ResolvedPreference, SUBJECT_MAX_LENGTH_OPTIONS, TemplateApplication,
+    commit_message_guidance, commit_message_template, commit_preferences_instructions,
+    cycle_commit_preference, effective_commit_preferences, next_subject_max_length,
+    normalize_subject_max_length, plan_commit_template, resolve_commit_preferences,
+};
 pub use history::{CommitDetails, CommitId, CommitSummary, HistoryPage, Reference};
 pub use remote::{Remote, RemoteOperationPlan, UpstreamState};
 pub use remote_freshness::{
@@ -21,7 +34,10 @@ pub use repository::{
     RefreshCoordinator, RefreshState, RepositoryId, RepositorySession, RepositoryView,
     SshCloneMapping, ThemePreference, WorkingTreeSnapshot,
 };
-pub use status::{ChangeKind, ChangeSelection, FileChange, HeadState, StatusSnapshot};
+pub use search::{SearchQuery, change_matches, commit_matches};
+pub use status::{
+    ChangeKind, ChangeRepresentation, ChangeSelection, FileChange, HeadState, StatusSnapshot,
+};
 pub use summary::{
     RepositorySummaryRow, SnapshotPresentation, build_repository_summaries,
     build_repository_summary, format_change_counters, format_sync_counters,
