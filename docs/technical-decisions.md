@@ -82,6 +82,32 @@ aunque no cambien sus nombres ni el número de archivos; los cambios exclusivame
 invalidan. Las respuestas obsoletas, canceladas o de pestañas cerradas se descartan sin tocar el
 texto actual. La generación solo propone texto: nunca hace stage ni commit.
 
+La solicitud también guarda las preferencias efectivas con las que se construyó el prompt. Si el
+usuario cambia idioma, convención, alcance o longitud mientras se genera, la respuesta se descarta
+con un aviso explícito en lugar de escribir en el borrador un texto que ya no corresponde a lo
+configurado.
+
+## Preferencias del mensaje de commit (AI-02)
+
+`src/domain/commit_preferences.rs` concentra el modelo: valores globales
+(`CommitMessagePreferences`), sobrescrituras por repositorio
+(`CommitMessagePreferenceOverrides`) y su resolución campo a campo
+(`resolve_commit_preferences`), que además devuelve el origen de cada valor para poder mostrar en
+la interfaz qué se hereda y qué es propio del repositorio. La clave de un repositorio es la misma
+`normalized_repo_key` que ya usan los remotes preferidos.
+
+La normalización es la frontera del módulo: una longitud de asunto fuera de `[20, 120]` —heredada
+de un estado antiguo o editada a mano— se acota antes de llegar al prompt, a la plantilla o a la
+comparación que invalida respuestas obsoletas. `commit_preferences_instructions` produce el bloque
+de instrucciones que se inserta en el prompt, de modo que Cursor y los proveedores previstos en
+AI-03 y AI-04 reciban exactamente el mismo texto normalizado sin duplicar reglas por proveedor.
+
+Las convenciones orientan la propuesta y no son una validación: `commit_message_guidance` solo
+devuelve un aviso informativo y la condición que habilita `Commit` depende únicamente del estado
+staged, del borrador y de que no haya otra operación en curso. La plantilla manual sigue la misma
+regla: `plan_commit_template` devuelve `ConfirmReplace` cuando el borrador tiene texto, y la
+interfaz pide confirmación antes de sustituirlo.
+
 ## Watcher y prioridad de refresco
 
 El watcher mantiene una cola acotada de 256 eventos. Una ráfaga se agrupa con un debounce trailing
@@ -146,8 +172,11 @@ rama que se estaba mirando siga viva.
 
 ## Persistencia
 
-El esquema actual es la versión 3: v2 incorpora los mapeos de clones SSH y v3 los borradores y la
-geometría de ventana. `state.json` se lee una sola vez en background después de crear la ventana,
+El esquema actual es la versión 5: v2 incorpora los mapeos de clones SSH, v3 los borradores y la
+geometría de ventana, v4 los ajustes de fetch periódico y v5 las preferencias del mensaje de commit
+(globales y por repositorio). Cada paso de `migrate` conoce solo su transición `n → n + 1` y las
+normalizaciones se repiten al final de la escalera, así que un estado ya marcado con la versión
+actual por otra rama también queda acotado. `state.json` se lee una sola vez en background después de crear la ventana,
 para que un almacenamiento lento no bloquee el primer frame. Se escribe mediante un archivo
 temporal sincronizado y reemplazo atómico. Un JSON corrupto se mueve a
 `state.corrupt-<timestamp>.json` y el arranque continúa con estado vacío.
@@ -179,6 +208,36 @@ el estado de otra pestaña para bloquearse ni para mostrar errores. La sesión c
 último `status_message` y el error accionable; los errores globales quedan reservados para fallos
 de la aplicación, como persistencia, selección de carpeta o detección de Git. Una cancelación usa
 un estado distinto de un fallo para que la UI no la presente como error.
+
+## Clasificación de errores y próximos pasos (UX-13)
+
+Todo fallo de un comando Git pasa por `classify_command_failure`, de modo que una lectura, una
+mutación y una operación remota obtienen el mismo error tipado. `classify_remote_failure` es un
+alias conservado para el clonado. La clasificación busca primero señales que Git no traduce
+—`index.lock`, `user.email`, nombres de hook, `--set-upstream`, `non-fast-forward`, `pull.rebase`—
+y solo después frases conocidas en inglés y español, para que una instalación localizada no
+degrade el diagnóstico.
+
+`GitError::user_message` da la explicación breve, `GitError::technical_details` el detalle
+depurado y `GitError::recommended_action` el siguiente paso seguro. `recommended_action` devuelve
+`None` cuando el error no está clasificado: la UI muestra entonces una recomendación genérica de
+revisar los detalles y reconciliar el estado, sin atribuir una causa. `CursorError` expone la
+misma terna para los fallos del proveedor de IA, que además distinguen sesión o permisos por
+códigos (`401`, `403`) en lugar de por el texto del mensaje.
+
+Las recomendaciones describen acciones que ejecuta la persona usuaria, nunca reparaciones
+implícitas de la aplicación: no se borra `index.lock`, no se toca la identidad de Git, no se hace
+merge, rebase ni stash automático y no se usa push forzado. `redact_credentials` oculta
+`usuario:secreto@host` en cualquier detalle antes de mostrarlo o copiarlo, y conserva un
+`git@host` de SSH porque no es un secreto y ayuda al diagnóstico.
+
+Git no marca de ninguna forma propia el fallo de un hook local: solo reenvía su salida. Un hook
+que no se identifica deja el error sin clasificar, con su salida completa, en lugar de recibir una
+causa que no consta.
+
+`RefreshState::Failed`, `MutationState::Failed` y el error de sesión llevan el siguiente paso
+junto al detalle; `RepositorySession::set_error` es el único punto de escritura para que una
+recomendación no sobreviva al fallo que la originó.
 
 ## Canal de instancia única
 

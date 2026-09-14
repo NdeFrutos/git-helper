@@ -26,12 +26,15 @@ use crate::{
     },
     domain::{
         AppState, BranchKind, BranchReference, BranchUpstream, ChangeKind, Clock, CommitDetails,
-        CommitSummary, FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot,
-        MutationState, OperationKind, RefreshState, RemoteOperationPlan, RepositoryId,
+        CommitMessagePreferences, CommitPreferenceField, CommitSummary, EffectiveCommitPreferences,
+        FetchOrigin, FileChange, HeadState, HistoryPage, HistorySnapshot, MutationState,
+        OperationKind, PreferenceScope, RefreshState, RemoteOperationPlan, RepositoryId,
         RepositorySession, RepositoryView, SearchQuery, SshCloneMapping, SystemClock,
-        WorkingTreeSnapshot, change_matches, commit_matches, format_periodic_fetch_interval_label,
-        next_periodic_fetch_interval, normalized_repo_key, periodic_fetch_poll_interval,
-        primary_remote_label, select_periodic_fetch,
+        TemplateApplication, WorkingTreeSnapshot, change_matches, commit_matches,
+        commit_message_guidance, cycle_commit_preference, effective_commit_preferences,
+        format_periodic_fetch_interval_label, next_periodic_fetch_interval, normalized_repo_key,
+        periodic_fetch_poll_interval, plan_commit_template, primary_remote_label,
+        select_periodic_fetch,
     },
     git::{
         CloneDestinationPlan, DiscardPlan, GitClient, GitError, ParsedSshUrl,
@@ -158,6 +161,18 @@ impl HistorySearch {
     }
 }
 
+/// Próximos pasos que no proceden de un error tipado de Git o del proveedor de
+/// IA, sino de una condición que la propia aplicación detecta.
+const PATH_UNAVAILABLE_NEXT_STEP: &str = "Comprueba que la unidad o la carpeta siguen disponibles y pulsa Actualizar; si el repositorio ya no existe, cierra la pestaña.";
+const BUSY_NEXT_STEP: &str = "Espera a que termine la operación en curso y repite la acción; no se ha tocado el repositorio.";
+const STALE_REFERENCE_NEXT_STEP: &str =
+    "Pulsa Actualizar para releer las ramas y vuelve a elegir la que quieras consultar.";
+/// Recomendaciones genéricas para fallos sin causa reconocida: solo describen
+/// lo que la aplicación puede garantizar, sin atribuir un motivo.
+const GENERIC_REFRESH_NEXT_STEP: &str = "Revisa los detalles técnicos y pulsa Actualizar para reintentar; el estado visible puede estar obsoleto.";
+const GENERIC_MUTATION_NEXT_STEP: &str =
+    "Revisa los detalles técnicos y pulsa Actualizar para ver el estado real antes de reintentar.";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryContentState {
     Loading,
@@ -240,14 +255,41 @@ enum RefreshPayload {
 
 enum GenerationPreparationError {
     StagedChanged,
-    Message { message: String, timed_out: bool },
+    Message {
+        failure: GenerationFailure,
+        timed_out: bool,
+    },
+}
+
+/// Fallo de generación tal y como se mostrará: explicación breve y, cuando la
+/// causa está clasificada, la siguiente acción segura.
+#[derive(Clone, Debug)]
+struct GenerationFailure {
+    message: String,
+    next_step: Option<String>,
+}
+
+impl GenerationFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            next_step: None,
+        }
+    }
+
+    fn guided(message: impl Into<String>, next_step: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            next_step,
+        }
+    }
 }
 
 struct GenerationCompletion {
     request: CommitMessageRequest,
     expected_index_identity: Option<Vec<u8>>,
-    result: Result<String, String>,
-    current_index_identity: Option<Result<Vec<u8>, String>>,
+    result: Result<String, GenerationFailure>,
+    current_index_identity: Option<Result<Vec<u8>, GenerationFailure>>,
     was_cancelled: bool,
     /// Clasificado desde el error tipado antes de convertirlo en texto.
     timed_out: bool,
@@ -313,6 +355,8 @@ pub struct MainWindow {
     periodic_fetch_in_flight: HashSet<(RepositoryId, String)>,
     active_fetch_contexts: HashMap<RepositoryId, FetchContext>,
     pending_fetch_refresh: HashMap<RepositoryId, (String, FetchOrigin)>,
+    /// Capa que editan los controles de preferencias; no se persiste.
+    commit_preference_scope: PreferenceScope,
 }
 
 #[allow(
@@ -373,6 +417,7 @@ impl MainWindow {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
     }
 
@@ -454,9 +499,9 @@ impl MainWindow {
                                 repository.status_message =
                                     "Repositorio no disponible; comprueba la ruta o el disco"
                                         .to_owned();
-                                repository.error = Some(
-                                    "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
-                                        .to_owned(),
+                                repository.set_error(
+                                    "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                                    Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
                                 );
                             }
                         }
@@ -652,6 +697,190 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Clave persistente de las sobrescrituras de un repositorio abierto.
+    fn commit_preference_key(&self, repository_id: RepositoryId) -> Option<String> {
+        self.state
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .map(|repository| normalized_repo_key(&repository.root_path))
+    }
+
+    /// Preferencias efectivas del repositorio: global salvo sobrescritura propia.
+    fn commit_preferences(&self, repository_id: RepositoryId) -> EffectiveCommitPreferences {
+        effective_commit_preferences(
+            self.state.settings.commit_message_preferences,
+            &self.state.settings.repository_commit_message_preferences,
+            self.commit_preference_key(repository_id)
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn set_repository_status(&mut self, repository_id: RepositoryId, message: impl Into<String>) {
+        if let Some(repository) = self
+            .state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+        {
+            repository.status_message = message.into();
+        }
+    }
+
+    /// Alterna entre editar el valor global y el del repositorio activo.
+    fn toggle_commit_preference_scope(&mut self, cx: &mut Context<Self>) {
+        self.commit_preference_scope = self.commit_preference_scope.toggled();
+        cx.notify();
+    }
+
+    /// Avanza una preferencia en la capa seleccionada y persiste el resultado.
+    fn cycle_commit_preference_field(
+        &mut self,
+        repository_id: RepositoryId,
+        field: CommitPreferenceField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        let scope = self.commit_preference_scope;
+        let mut global = self.state.settings.commit_message_preferences;
+        let mut overrides = self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .get(&repository_key)
+            .copied()
+            .unwrap_or_default();
+        cycle_commit_preference(field, scope, &mut global, &mut overrides);
+        self.state.settings.commit_message_preferences = global;
+        if overrides.is_empty() {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        } else {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .insert(repository_key, overrides);
+        }
+        let message = match scope {
+            PreferenceScope::Global
+                if self
+                    .commit_preferences(repository_id)
+                    .has_repository_overrides() =>
+            {
+                "Preferencia global actualizada; este repositorio conserva sus propios ajustes"
+            }
+            PreferenceScope::Global => "Preferencias globales del mensaje actualizadas",
+            PreferenceScope::Repository => {
+                "Preferencias del mensaje guardadas para este repositorio"
+            }
+        };
+        self.set_repository_status(repository_id, message);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Devuelve el repositorio a la herencia de las preferencias globales.
+    fn clear_repository_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository_key) = self.commit_preference_key(repository_id) else {
+            return;
+        };
+        if self
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .remove(&repository_key)
+            .is_none()
+        {
+            return;
+        }
+        self.set_repository_status(
+            repository_id,
+            "Este repositorio vuelve a usar las preferencias globales",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Restaura los valores predeterminados globales y quita la sobrescritura activa.
+    fn restore_default_commit_preferences(
+        &mut self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.settings.commit_message_preferences = CommitMessagePreferences::default();
+        if let Some(repository_key) = self.commit_preference_key(repository_id) {
+            self.state
+                .settings
+                .repository_commit_message_preferences
+                .remove(&repository_key);
+        }
+        self.set_repository_status(
+            repository_id,
+            "Preferencias del mensaje restauradas a los valores predeterminados",
+        );
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// Escribe la plantilla manual; un borrador con texto exige confirmación.
+    fn insert_commit_template(
+        &mut self,
+        repository_id: RepositoryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.commit_inputs.get(&repository_id).cloned() else {
+            return;
+        };
+        let preferences = self.commit_preferences(repository_id).values();
+        let draft = input.read(cx).content().to_owned();
+        match plan_commit_template(&draft, preferences) {
+            TemplateApplication::Apply(template) => {
+                input.update(cx, |input, cx| input.set_content(template, cx));
+                self.set_repository_status(
+                    repository_id,
+                    "Plantilla insertada; edítala antes del commit",
+                );
+                cx.notify();
+            }
+            TemplateApplication::ConfirmReplace(template) => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let confirmation = cx.prompt(
+                        PromptLevel::Warning,
+                        "Sustituir el borrador por la plantilla",
+                        Some("El mensaje escrito se perderá."),
+                        &["Sustituir", "Cancelar"],
+                    );
+                    if !matches!(confirmation.await, Ok(0)) {
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        let Some(input) = this.commit_inputs.get(&repository_id).cloned() else {
+                            return;
+                        };
+                        input.update(cx, |input, cx| input.set_content(template, cx));
+                        this.set_repository_status(
+                            repository_id,
+                            "Plantilla insertada; edítala antes del commit",
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
     fn remember_preferred_remote(
         &mut self,
         repository_root: &Path,
@@ -779,7 +1008,7 @@ impl MainWindow {
             .iter_mut()
             .find(|repository| repository.id == repository_id)
         {
-            repository.error = None;
+            repository.clear_error();
             repository.status_message = "Comprobando la ruta del repositorio…".to_owned();
         }
         cx.notify();
@@ -798,14 +1027,14 @@ impl MainWindow {
                 };
                 repository.path_accessible = path_accessible;
                 if path_accessible {
-                    repository.error = None;
+                    repository.clear_error();
                     repository.status_message = "Preparando repositorio…".to_owned();
                     this.pending_refreshes.insert(repository_id);
                     this.refresh_repository(repository_id, cx);
                 } else {
-                    repository.error = Some(
-                        "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
-                            .to_owned(),
+                    repository.set_error(
+                        "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                        Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
                     );
                     repository.status_message =
                         "Repositorio no disponible; comprueba la ruta o el disco".to_owned();
@@ -833,7 +1062,7 @@ impl MainWindow {
                         this.finish_open_repository(discovered_path, None, cx);
                     }
                     Err(error) => {
-                        this.global_error = Some(error.to_string());
+                        this.global_error = Some(guided_error_text(&error));
                         this.global_status_message =
                             "No se pudo abrir el repositorio reciente".to_owned();
                     }
@@ -870,7 +1099,7 @@ impl MainWindow {
                 match result {
                     Ok(root_path) => this.finish_open_repository(root_path, None, cx),
                     Err(error) => {
-                        this.global_error = Some(error.to_string());
+                        this.global_error = Some(guided_error_text(&error));
                         this.global_status_message = "No se pudo abrir el repositorio".to_owned();
                     }
                 }
@@ -1001,7 +1230,7 @@ impl MainWindow {
         let parsed = match parse_ssh_url(&url) {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.global_error = Some(error.user_message());
+                self.global_error = Some(guided_error_text(&error));
                 cx.notify();
                 return;
             }
@@ -1011,7 +1240,7 @@ impl MainWindow {
             match default_clone_destination(&clone_root, &parsed.repository_name) {
                 Ok(destination) => destination,
                 Err(error) => {
-                    self.global_error = Some(error.user_message());
+                    self.global_error = Some(guided_error_text(&error));
                     cx.notify();
                     return;
                 }
@@ -1064,7 +1293,7 @@ impl MainWindow {
                                 Ok(destination) => destination,
                                 Err(error) => {
                                     this.update(cx, |this, cx| {
-                                        this.global_error = Some(error.user_message());
+                                        this.global_error = Some(guided_error_text(&error));
                                         cx.notify();
                                     })
                                     .ok();
@@ -1117,7 +1346,7 @@ impl MainWindow {
                     cx.notify();
                 }
                 Err(error) => {
-                    this.global_error = Some(error.user_message());
+                    this.global_error = Some(guided_error_text(&error));
                     this.global_status_message =
                         "No se pudo preparar el clonado del repositorio".to_owned();
                     cx.notify();
@@ -1209,7 +1438,7 @@ impl MainWindow {
                         this.finish_open_repository(root_path, Some(normalized), cx);
                     }
                     Ok(Err(error)) => {
-                        this.global_error = Some(error.user_message());
+                        this.global_error = Some(guided_error_text(&error));
                         this.global_status_message =
                             "El clon terminó pero no se pudo abrir el repositorio".to_owned();
                     }
@@ -1221,7 +1450,7 @@ impl MainWindow {
                         this.global_error = if cancelled {
                             None
                         } else {
-                            Some(error.user_message())
+                            Some(guided_error_text(&error))
                         };
                         this.global_status_message = if cancelled {
                             "Clonado cancelado".to_owned()
@@ -1270,7 +1499,7 @@ impl MainWindow {
                         this.save_state(cx);
                     }
                     Err(error) => {
-                        this.global_error = Some(error.user_message());
+                        this.global_error = Some(guided_error_text(&error));
                         this.global_status_message = "No se pudo abrir el clon".to_owned();
                     }
                 }
@@ -1569,7 +1798,7 @@ impl MainWindow {
         let generation = repository.refresh_generation;
         repository.refresh_state = RefreshState::Running { generation };
         repository.status_message = "Actualizando estado…".to_owned();
-        repository.error = None;
+        repository.clear_error();
         let include_history =
             repository.selected_view == RepositoryView::History && !repository.history_loaded;
         let history_target = include_history.then(|| {
@@ -1690,9 +1919,12 @@ impl MainWindow {
                             {
                                 repository.status_message =
                                     "Watcher detenido; pulsa F5 para reconciliar".to_owned();
-                                repository.error = Some(
-                                    "La vigilancia falló; el estado visible se conserva y se intentará recuperar tras el próximo refresh."
-                                        .to_owned(),
+                                repository.set_error(
+                                    "La vigilancia falló; el estado visible se conserva y se intentará recuperar tras el próximo refresh.",
+                                    Some(
+                                        "Pulsa Actualizar (F5) para reconciliar el estado con Git cuando vuelvas a este repositorio."
+                                            .to_owned(),
+                                    ),
                                 );
                             }
                         } else if change.refresh_ignored_paths() {
@@ -1759,11 +1991,12 @@ impl MainWindow {
             repository.refresh_state = RefreshState::Failed {
                 message: "Repositorio no disponible".to_owned(),
                 details: "La ruta del repositorio no responde".to_owned(),
+                next_step: Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
             };
             repository.status_message = "Repositorio no disponible".to_owned();
-            repository.error = Some(
-                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña."
-                    .to_owned(),
+            repository.set_error(
+                "La ruta del repositorio no responde. Puedes reintentar o cerrar la pestaña.",
+                Some(PATH_UNAVAILABLE_NEXT_STEP.to_owned()),
             );
             return RefreshOutcome {
                 should_notify: true,
@@ -1827,7 +2060,7 @@ impl MainWindow {
                     message: "Estado actualizado".to_owned(),
                 };
                 repository.status_message = "Estado actualizado".to_owned();
-                repository.error = None;
+                repository.clear_error();
                 (
                     RefreshOutcome {
                         succeeded: true,
@@ -1843,6 +2076,7 @@ impl MainWindow {
             }
             Err(error) => {
                 let details = error.technical_details();
+                let next_step = error.recommended_action();
                 if history_included {
                     repository.history_loading = false;
                 }
@@ -1872,7 +2106,7 @@ impl MainWindow {
                             message: "Actualización cancelada".to_owned(),
                         };
                         repository.status_message = "Actualización cancelada".to_owned();
-                        repository.error = None;
+                        repository.clear_error();
                     }
                     ProcessFailure::TimedOut(timeout) => {
                         repository.refresh_state = RefreshState::Failed {
@@ -1881,17 +2115,19 @@ impl MainWindow {
                                 format_timeout(timeout)
                             ),
                             details: details.clone(),
+                            next_step: next_step.clone(),
                         };
                         repository.status_message = "Tiempo agotado al actualizar".to_owned();
-                        repository.error = Some(details);
+                        repository.set_error(details, next_step);
                     }
                     ProcessFailure::Other => {
                         repository.refresh_state = RefreshState::Failed {
-                            message: error.to_string(),
+                            message: error.user_message(),
                             details: details.clone(),
+                            next_step: next_step.clone(),
                         };
                         repository.status_message = "Error al actualizar".to_owned();
-                        repository.error = Some(details);
+                        repository.set_error(details, next_step);
                     }
                 }
                 (
@@ -2025,7 +2261,7 @@ impl MainWindow {
         let generation = repository.history_generation;
         repository.history_loading = true;
         repository.status_message = "Cargando historial…".to_owned();
-        repository.error = None;
+        repository.clear_error();
         let head = repository.working_tree.head.clone();
         let root_path = repository.root_path.clone();
         let git_client = self.git_client.clone();
@@ -2065,7 +2301,7 @@ impl MainWindow {
                             Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
-                        repository.error = None;
+                        repository.clear_error();
                         if let Some(commit_id) = this.reconcile_selected_commit(repository_id) {
                             this.select_commit(repository_id, commit_id, cx);
                         }
@@ -2076,7 +2312,7 @@ impl MainWindow {
                     }
                     Err(error) => {
                         repository.status_message = "No se pudo cargar el historial".to_owned();
-                        repository.error = Some(error.technical_details());
+                        repository.set_error(error.technical_details(), error.recommended_action());
                     }
                 }
                 cx.notify();
@@ -2161,7 +2397,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
                 return;
@@ -2241,9 +2477,9 @@ impl MainWindow {
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some(
-                    "No hay cambios descartables. Los conflictos y cambios staged sin HEAD deben resolverse o quitarse del stage manualmente."
-                        .to_owned(),
+                repository.set_error(
+                    "No hay cambios descartables. Los conflictos y cambios staged sin HEAD deben resolverse o quitarse del stage manualmente.",
+                    None,
                 );
             }
             cx.notify();
@@ -2353,7 +2589,13 @@ impl MainWindow {
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some("No hay cambios staged para generar un mensaje".to_owned());
+                repository.set_error(
+                    "No hay cambios staged para generar un mensaje",
+                    Some(
+                        "Prepara al menos un cambio en el stage y vuelve a generar el mensaje."
+                            .to_owned(),
+                    ),
+                );
             }
             cx.notify();
             return;
@@ -2370,7 +2612,7 @@ impl MainWindow {
                 .iter_mut()
                 .find(|repository| repository.id == repository_id)
             {
-                repository.error = Some(message.to_owned());
+                repository.set_error(message, Some(BUSY_NEXT_STEP.to_owned()));
             }
             cx.notify();
             return;
@@ -2380,11 +2622,13 @@ impl MainWindow {
             .get(&repository_id)
             .map(|input| input.read(cx).content_version())
             .unwrap_or_default();
+        let preferences = self.commit_preferences(repository_id).values();
         self.next_generation_request_id = self.next_generation_request_id.saturating_add(1);
         let request = CommitMessageRequest {
             session_id: repository_id,
             request_id: self.next_generation_request_id,
             draft_version,
+            preferences,
         };
         self.generation_requests
             .insert(repository_id, request.clone());
@@ -2399,7 +2643,7 @@ impl MainWindow {
                 generation: repository.refresh_generation,
             };
             repository.status_message = "Preparando contexto staged…".to_owned();
-            repository.error = None;
+            repository.clear_error();
         }
         let git_client = self.git_client.clone();
         let cursor_client = self.cursor_client.clone();
@@ -2429,12 +2673,18 @@ impl MainWindow {
                                         classify_git_process_failure(&error),
                                         ProcessFailure::TimedOut(_)
                                     ),
-                                    message: error.to_string(),
+                                    failure: GenerationFailure::guided(
+                                        error.user_message(),
+                                        error.recommended_action(),
+                                    ),
                                 },
                             })?;
-                        build_cursor_context(&data)
+                        build_cursor_context(&data, preferences)
                             .map_err(|error| GenerationPreparationError::Message {
-                                message: error.to_string(),
+                                failure: GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                ),
                                 timed_out: false,
                             })
                             .map(|context| (context, data.index_identity))
@@ -2449,10 +2699,9 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: None,
-                                result: Err(
-                                    "El staging area cambió mientras se preparaba el contexto"
-                                        .to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "El staging area cambió mientras se preparaba el contexto",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: false,
                                 timed_out: false,
@@ -2464,13 +2713,13 @@ impl MainWindow {
                     .ok();
                     return;
                 }
-                Err(GenerationPreparationError::Message { message, timed_out }) => {
+                Err(GenerationPreparationError::Message { failure, timed_out }) => {
                     this.update_in(cx, |this, _, cx| {
                         this.finish_message_generation(
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: None,
-                                result: Err(message),
+                                result: Err(failure),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
                                 timed_out,
@@ -2499,10 +2748,9 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(
-                                    "La propuesta quedó obsoleta porque cambió el staging area"
-                                        .to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "La propuesta quedó obsoleta porque cambió el staging area",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: false,
                                 timed_out: false,
@@ -2524,7 +2772,10 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(error.to_string()),
+                                result: Err(GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: context_cancellation.is_cancelled(),
                                 timed_out,
@@ -2566,9 +2817,9 @@ impl MainWindow {
                             GenerationCompletion {
                                 request: request.clone(),
                                 expected_index_identity: Some(expected_index_identity.clone()),
-                                result: Err(
-                                    "Generación cancelada antes de enviar el contexto".to_owned(),
-                                ),
+                                result: Err(GenerationFailure::new(
+                                    "Generación cancelada antes de enviar el contexto",
+                                )),
                                 current_index_identity: None,
                                 was_cancelled: true,
                                 timed_out: false,
@@ -2591,14 +2842,22 @@ impl MainWindow {
                             context.prompt,
                             &cursor_cancellation,
                         )
-                        .map_err(|error| (error.to_string(), classify_cursor_failure(&error)))
+                        .map_err(|error| {
+                            (
+                                GenerationFailure::guided(
+                                    error.user_message(),
+                                    error.recommended_action(),
+                                ),
+                                classify_cursor_failure(&error),
+                            )
+                        })
                 })
                 .await;
             let timed_out = matches!(
                 result.as_ref().err(),
                 Some((_, ProcessFailure::TimedOut(_)))
             );
-            let result = result.map_err(|(message, _)| message);
+            let result = result.map_err(|(failure, _)| failure);
             let was_cancelled = context_cancellation.is_cancelled();
             let current_index_identity = if result.is_ok() && !was_cancelled {
                 Some(
@@ -2607,9 +2866,14 @@ impl MainWindow {
                         let root_path = root_path.clone();
                         let cancellation = context_cancellation.clone();
                         async move {
-                            git_client
-                                .staged_identity(&root_path, &cancellation)
-                                .map_err(|error| error.to_string())
+                            git_client.staged_identity(&root_path, &cancellation).map_err(
+                                |error| {
+                                    GenerationFailure::guided(
+                                        error.user_message(),
+                                        error.recommended_action(),
+                                    )
+                                },
+                            )
                         }
                     })
                     .await,
@@ -2645,13 +2909,14 @@ impl MainWindow {
         if self.generation_requests.get(&repository_id) != Some(&completion.request) {
             return;
         }
+        let current_preferences = self.commit_preferences(repository_id).values();
         self.active_mutation_cancellations.remove(&repository_id);
         let input = self.commit_inputs.get(&repository_id).cloned();
         if let Some(input) = &input {
             input.update(cx, |input, cx| input.set_generating(false, cx));
         }
         let mut status_message = String::new();
-        let mut error_message = None;
+        let mut failure: Option<GenerationFailure> = None;
         let mut mutation_state = MutationState::Cancelled {
             kind: OperationKind::GenerateCommitMessage,
             message: "Generación cancelada".to_owned(),
@@ -2667,11 +2932,12 @@ impl MainWindow {
                         &completion.request,
                         self.generation_requests.get(&repository_id),
                         input.read(cx).content_version(),
+                        current_preferences,
                         expected,
                         current,
                     ),
                     (_, Some(Err(error)), _) => {
-                        error_message = Some(error.clone());
+                        failure = Some(error.clone());
                         GenerationApplyDecision::IndexChanged
                     }
                     _ => GenerationApplyDecision::IndexChanged,
@@ -2689,13 +2955,32 @@ impl MainWindow {
                     }
                     GenerationApplyDecision::DraftChanged => {
                         status_message = "Propuesta no aplicada; el borrador cambió".to_owned();
-                        error_message = Some(
-                            "Se conserva tu borrador actual. Pulsa «Generar con Cursor» para reintentar."
-                                .to_owned(),
-                        );
+                        failure = Some(GenerationFailure::guided(
+                            "Se conserva tu borrador actual: la propuesta llegó después de editarlo.",
+                            Some(
+                                "Pulsa «Generar con Cursor» cuando el borrador esté como quieres; el repositorio no ha cambiado."
+                                    .to_owned(),
+                            ),
+                        ));
                         mutation_state = MutationState::Cancelled {
                             kind: OperationKind::GenerateCommitMessage,
                             message: "El borrador cambió durante la generación".to_owned(),
+                        };
+                    }
+                    GenerationApplyDecision::PreferencesChanged => {
+                        status_message =
+                            "Propuesta no aplicada; cambiaron las preferencias del mensaje"
+                                .to_owned();
+                        failure = Some(GenerationFailure::guided(
+                            "La respuesta se generó con las preferencias anteriores.",
+                            Some(
+                                "Pulsa «Generar con Cursor» para repetirla con las preferencias actuales."
+                                    .to_owned(),
+                            ),
+                        ));
+                        mutation_state = MutationState::Cancelled {
+                            kind: OperationKind::GenerateCommitMessage,
+                            message: "Las preferencias cambiaron durante la generación".to_owned(),
                         };
                     }
                     GenerationApplyDecision::IndexChanged => completion.staged_changed = true,
@@ -2706,7 +2991,7 @@ impl MainWindow {
                 let timed_out = completion.timed_out;
                 let cancelled = completion.was_cancelled
                     || completion.staged_changed
-                    || (!timed_out && error.to_lowercase().contains("cancel"));
+                    || (!timed_out && error.message.to_lowercase().contains("cancel"));
                 status_message = if cancelled {
                     "Generación cancelada; se conserva el borrador".to_owned()
                 } else if timed_out {
@@ -2714,11 +2999,24 @@ impl MainWindow {
                 } else {
                     "No se pudo generar el mensaje".to_owned()
                 };
-                error_message = Some(if completion.staged_changed {
-                    "El staging area cambió; la propuesta quedó obsoleta. Revisa los cambios y pulsa «Generar con Cursor» para reintentar."
-                        .to_owned()
+                failure = Some(if completion.staged_changed {
+                    GenerationFailure::guided(
+                        "El staging area cambió; la propuesta quedó obsoleta.",
+                        Some(
+                            "Revisa los cambios staged y pulsa «Generar con Cursor» para reintentar; tu borrador se conserva."
+                                .to_owned(),
+                        ),
+                    )
                 } else if timed_out {
-                    format!("{error}; revisa el estado antes de reintentar.")
+                    GenerationFailure::guided(
+                        error.message.clone(),
+                        error.next_step.clone().or_else(|| {
+                            Some(
+                                "Revisa el estado del repositorio antes de reintentar; el borrador se conserva."
+                                    .to_owned(),
+                            )
+                        }),
+                    )
                 } else {
                     error
                 });
@@ -2735,7 +3033,13 @@ impl MainWindow {
                         } else {
                             "No se pudo generar el mensaje".to_owned()
                         },
-                        details: error_message.clone().unwrap_or_default(),
+                        details: failure
+                            .as_ref()
+                            .map(|failure| failure.message.clone())
+                            .unwrap_or_default(),
+                        next_step: failure
+                            .as_ref()
+                            .and_then(|failure| failure.next_step.clone()),
                     }
                 };
             }
@@ -2743,10 +3047,13 @@ impl MainWindow {
         self.generation_requests.remove(&repository_id);
         if completion.staged_changed {
             status_message = "Propuesta obsoleta; revisa el staging area".to_owned();
-            error_message = Some(
-                "El staging area cambió durante la generación. La propuesta no se aplicó; pulsa «Generar con Cursor» para reintentar."
-                    .to_owned(),
-            );
+            failure = Some(GenerationFailure::guided(
+                "El staging area cambió durante la generación y la propuesta no se aplicó.",
+                Some(
+                    "Revisa los cambios staged y pulsa «Generar con Cursor» para reintentar; tu borrador se conserva."
+                        .to_owned(),
+                ),
+            ));
             mutation_state = MutationState::Cancelled {
                 kind: OperationKind::GenerateCommitMessage,
                 message: "El staging area cambió durante la generación".to_owned(),
@@ -2759,7 +3066,10 @@ impl MainWindow {
             .find(|repository| repository.id == repository_id)
         {
             repository.status_message = status_message;
-            repository.error = error_message;
+            match failure {
+                Some(failure) => repository.set_error(failure.message, failure.next_step),
+                None => repository.clear_error(),
+            }
             repository.mutation_state = mutation_state;
         }
         self.refresh_repository(repository_id, cx);
@@ -2889,7 +3199,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
             }
@@ -2968,7 +3278,8 @@ impl MainWindow {
                                 .iter_mut()
                                 .find(|repository| repository.id == repository_id)
                             {
-                                repository.error = Some(error.to_string());
+                                repository
+                                    .set_error(error.user_message(), error.recommended_action());
                             }
                             cx.notify();
                         }
@@ -3032,7 +3343,7 @@ impl MainWindow {
                     .iter_mut()
                     .find(|repository| repository.id == repository_id)
                 {
-                    repository.error = Some(error.to_string());
+                    repository.set_error(error.user_message(), error.recommended_action());
                 }
                 cx.notify();
                 return;
@@ -3089,11 +3400,12 @@ impl MainWindow {
             return;
         };
         if !repository.can_mutate() {
-            repository.error = Some(if repository.is_refreshing() {
-                "Espera a que termine la actualización del repositorio".to_owned()
+            let message = if repository.is_refreshing() {
+                "Espera a que termine la actualización del repositorio"
             } else {
-                "Ya hay otra mutación activa en este repositorio".to_owned()
-            });
+                "Ya hay otra mutación activa en este repositorio"
+            };
+            repository.set_error(message, Some(BUSY_NEXT_STEP.to_owned()));
             cx.notify();
             return;
         }
@@ -3103,7 +3415,7 @@ impl MainWindow {
             generation: repository.refresh_generation,
         };
         repository.status_message = operation_running_message(kind).to_owned();
-        repository.error = None;
+        repository.clear_error();
         let git_client = self.git_client.clone();
         let cancellation = CancellationToken::default();
         self.active_mutation_cancellations
@@ -3144,7 +3456,7 @@ impl MainWindow {
                                 message: operation_success_message(kind).to_owned(),
                             };
                             repository.status_message = operation_success_message(kind).to_owned();
-                            repository.error = None;
+                            repository.clear_error();
                         }
                         if kind_can_move_references(kind) {
                             this.invalidate_history(repository_id);
@@ -3200,6 +3512,7 @@ impl MainWindow {
                             .iter_mut()
                             .find(|repository| repository.id == repository_id)
                         {
+                            let next_step = error.recommended_action();
                             match classify_git_process_failure(&error) {
                                 ProcessFailure::Cancelled => {
                                     repository.mutation_state = MutationState::Cancelled {
@@ -3207,7 +3520,7 @@ impl MainWindow {
                                         message: "Operación cancelada".to_owned(),
                                     };
                                     repository.status_message = "Operación cancelada".to_owned();
-                                    repository.error = None;
+                                    repository.clear_error();
                                 }
                                 ProcessFailure::TimedOut(timeout) => {
                                     repository.mutation_state = MutationState::Failed {
@@ -3217,16 +3530,18 @@ impl MainWindow {
                                             format_timeout(timeout)
                                         ),
                                         details: error.technical_details(),
+                                        next_step: next_step.clone(),
                                     };
                                     repository.status_message =
                                         "Tiempo agotado en la operación".to_owned();
-                                    repository.error = Some(error.technical_details());
+                                    repository.set_error(error.technical_details(), next_step);
                                 }
                                 ProcessFailure::Other => {
                                     repository.mutation_state = MutationState::Failed {
                                         kind,
-                                        message: error.to_string(),
+                                        message: error.user_message(),
                                         details: error.technical_details(),
+                                        next_step: next_step.clone(),
                                     };
                                     repository.status_message = if kind == OperationKind::Fetch
                                         && suppress_error
@@ -3240,12 +3555,11 @@ impl MainWindow {
                                     } else {
                                         "La operación falló".to_owned()
                                     };
-                                    repository.error =
-                                        if kind == OperationKind::Fetch && suppress_error {
-                                            None
-                                        } else {
-                                            Some(error.technical_details())
-                                        };
+                                    if kind == OperationKind::Fetch && suppress_error {
+                                        repository.clear_error();
+                                    } else {
+                                        repository.set_error(error.technical_details(), next_step);
+                                    }
                                 }
                             }
                         }
@@ -3953,7 +4267,13 @@ impl MainWindow {
         let message_is_empty = input
             .as_ref()
             .is_none_or(|input| input.read(cx).content().trim().is_empty());
-        let commit_enabled = staged_count > 0 && !message_is_empty && can_mutate;
+        // Las convenciones orientan la propuesta: el aviso no participa en esta condición.
+        let commit_enabled = can_create_commit(staged_count, message_is_empty, can_mutate);
+        let preferences = self.commit_preferences(repository_id).values();
+        let guidance = input
+            .as_ref()
+            .and_then(|input| commit_message_guidance(input.read(cx).content(), preferences));
+        let preferences_row = self.render_commit_preferences(repository_id, cx);
         let total_changes = repository.working_tree.changes.len();
         let matching_changes = query.as_ref().map_or(total_changes, |query| {
             repository
@@ -4078,6 +4398,10 @@ impl MainWindow {
                     .border_t_1()
                     .border_color(BORDER_COLOR)
                     .when_some(input, gpui::ParentElement::child)
+                    .when_some(guidance, |footer, note| {
+                        footer.child(div().text_xs().text_color(WARNING_COLOR).child(note))
+                    })
+                    .child(preferences_row)
                     .child(
                         div()
                             .flex()
@@ -4112,6 +4436,16 @@ impl MainWindow {
                                                 this.confirm_discard_all(repository_id, window, cx);
                                             }),
                                         ),
+                                    )
+                                    .child(
+                                        action_button("commit-template", "Plantilla", true)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.insert_commit_template(
+                                                    repository_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                     )
                                     .child(
                                         action_button(
@@ -4150,6 +4484,109 @@ impl MainWindow {
                     ),
                     )
                 },
+            )
+            .into_any_element()
+    }
+
+    /// Controles compactos de las preferencias aplicadas a la propuesta.
+    ///
+    /// Cada botón avanza el valor de la capa seleccionada; el sufijo `·repo`
+    /// señala los campos que este repositorio no hereda del ajuste global.
+    fn render_commit_preferences(
+        &self,
+        repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let effective = self.commit_preferences(repository_id);
+        let values = effective.values();
+        let scope = self.commit_preference_scope;
+        let has_repository_overrides = effective.has_repository_overrides();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(
+                div()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .flex_shrink_0()
+                    .child("Mensaje:"),
+            )
+            .child(
+                action_button(
+                    "commit-preference-scope",
+                    format!("Editando: {}", scope.label()),
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_commit_preference_scope(cx);
+                })),
+            )
+            .child(commit_preference_button(
+                "commit-preference-language",
+                format!(
+                    "Idioma: {}{}",
+                    effective.language.value.label(),
+                    effective.language.source.suffix()
+                ),
+                CommitPreferenceField::Language,
+                repository_id,
+                cx,
+            ))
+            .child(commit_preference_button(
+                "commit-preference-convention",
+                format!(
+                    "Formato: {}{}",
+                    effective.convention.value.label(),
+                    effective.convention.source.suffix()
+                ),
+                CommitPreferenceField::Convention,
+                repository_id,
+                cx,
+            ))
+            .when(values.scope_applies(), |row| {
+                row.child(commit_preference_button(
+                    "commit-preference-scope-usage",
+                    format!(
+                        "{}{}",
+                        effective.scope.value.label(),
+                        effective.scope.source.suffix()
+                    ),
+                    CommitPreferenceField::Scope,
+                    repository_id,
+                    cx,
+                ))
+            })
+            .child(commit_preference_button(
+                "commit-preference-length",
+                format!(
+                    "Asunto ≤{}{}",
+                    effective.subject_max_length.value,
+                    effective.subject_max_length.source.suffix()
+                ),
+                CommitPreferenceField::SubjectMaxLength,
+                repository_id,
+                cx,
+            ))
+            .child(
+                action_button(
+                    "commit-preference-inherit",
+                    "Usar global",
+                    has_repository_overrides,
+                )
+                .when(has_repository_overrides, |button| {
+                    button.on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_repository_commit_preferences(repository_id, cx);
+                    }))
+                }),
+            )
+            .child(
+                action_button("commit-preference-defaults", "Predeterminados", true).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.restore_default_commit_preferences(repository_id, cx);
+                    }),
+                ),
             )
             .into_any_element()
     }
@@ -4370,12 +4807,18 @@ impl MainWindow {
             .iter()
             .find(|current| current.full_name == branch.full_name)
         else {
-            repository.error = Some("La rama ya no existe; actualiza el repositorio.".to_owned());
+            repository.set_error(
+                "La rama ya no existe; actualiza el repositorio.",
+                Some(STALE_REFERENCE_NEXT_STEP.to_owned()),
+            );
             cx.notify();
             return;
         };
         if current_branch.oid != branch.oid {
-            repository.error = Some("La rama cambió; actualiza el repositorio.".to_owned());
+            repository.set_error(
+                "La rama cambió; actualiza el repositorio.",
+                Some(STALE_REFERENCE_NEXT_STEP.to_owned()),
+            );
             cx.notify();
             return;
         }
@@ -4393,7 +4836,7 @@ impl MainWindow {
         });
         let Some(expected_oid) = branch.oid else {
             repository.status_message = "La rama no tiene commits".to_owned();
-            repository.error = None;
+            repository.clear_error();
             cx.notify();
             return;
         };
@@ -4402,7 +4845,7 @@ impl MainWindow {
         let branch_name = branch.name;
         let git_client = self.git_client.clone();
         repository.status_message = format!("Cargando historial de {branch_name}…");
-        repository.error = None;
+        repository.clear_error();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -4442,20 +4885,20 @@ impl MainWindow {
                             Arc::new(history_snapshot_from_page(page, INITIAL_HISTORY_LIMIT));
                         repository.history_loaded = true;
                         repository.status_message = "Historial actualizado".to_owned();
-                        repository.error = None;
+                        repository.clear_error();
                     }
                     Ok(_) => {
                         repository.history_loaded = false;
                         repository.status_message = "La rama cambió durante la carga".to_owned();
-                        repository.error = Some(
-                            "Se descartó el resultado obsoleto; vuelve a seleccionar la rama."
-                                .to_owned(),
+                        repository.set_error(
+                            "Se descartó el resultado obsoleto; vuelve a seleccionar la rama.",
+                            None,
                         );
                     }
                     Err(error) => {
                         repository.history_loaded = false;
                         repository.status_message = "No se pudo cargar la rama".to_owned();
-                        repository.error = Some(error.technical_details());
+                        repository.set_error(error.technical_details(), error.recommended_action());
                     }
                 }
                 cx.notify();
@@ -4616,7 +5059,7 @@ impl MainWindow {
             repository.history.history_reference.clone(),
             repository.history.history_oid.clone(),
         ) else {
-            repository.error = Some("No hay una referencia de historial seleccionada".to_owned());
+            repository.set_error("No hay una referencia de historial seleccionada", None);
             cx.notify();
             return;
         };
@@ -4626,7 +5069,7 @@ impl MainWindow {
         let offset = repository.history.commits.len();
         let git_client = self.git_client.clone();
         repository.status_message = "Cargando más commits…".to_owned();
-        repository.error = None;
+        repository.clear_error();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -4663,9 +5106,9 @@ impl MainWindow {
                                 repository.history_loaded = false;
                                 repository.status_message =
                                     "La selección de historial cambió".to_owned();
-                                repository.error = Some(
-                                    "Se descartó el resultado obsoleto; vuelve a seleccionar la rama."
-                                        .to_owned(),
+                                repository.set_error(
+                                    "Se descartó el resultado obsoleto; vuelve a seleccionar la rama.",
+                                    None,
                                 );
                                 cx.notify();
                                 return;
@@ -4681,7 +5124,7 @@ impl MainWindow {
                             repository.history_loaded = true;
                             repository.history_loading = false;
                             repository.status_message = "Historial actualizado".to_owned();
-                            repository.error = None;
+                            repository.clear_error();
                         }
                     }
                     Err(error) => {
@@ -4694,7 +5137,7 @@ impl MainWindow {
                         {
                             repository.history_loading = false;
                             repository.status_message = "No se pudo cargar el historial".to_owned();
-                            repository.error = Some(error.to_string());
+                            repository.set_error(error.user_message(), error.recommended_action());
                         }
                     }
                 }
@@ -5015,7 +5458,12 @@ impl MainWindow {
         repository: &RepositorySession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some((summary, details)) = repository_feedback(repository) else {
+        let Some(RepositoryFeedback {
+            summary,
+            next_step,
+            details,
+        }) = repository_feedback(repository)
+        else {
             return div().into_any_element();
         };
         let repository_id = repository.id;
@@ -5033,6 +5481,14 @@ impl MainWindow {
             .bg(ELEVATED_BACKGROUND_COLOR)
             .text_sm()
             .child(div().text_color(ERROR_COLOR).child(summary))
+            .when_some(next_step, |feedback, next_step| {
+                feedback.child(
+                    div()
+                        .id("error-next-step")
+                        .text_color(PRIMARY_TEXT_COLOR)
+                        .child(format!("Siguiente paso: {next_step}")),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -5492,23 +5948,57 @@ fn repository_content_state(repository: &RepositorySession) -> RepositoryContent
     RepositoryContentState::Changes
 }
 
-fn repository_feedback(repository: &RepositorySession) -> Option<(String, String)> {
+/// Fallo visible de una sesión: qué ocurrió, qué hacer a continuación y el
+/// detalle técnico depurado que se puede expandir o copiar.
+struct RepositoryFeedback {
+    summary: String,
+    next_step: Option<String>,
+    details: String,
+}
+
+/// La banda global no tiene detalle expandible, así que el siguiente paso se
+/// añade al mensaje cuando el error está clasificado.
+fn guided_error_text(error: &GitError) -> String {
+    error.recommended_action().map_or_else(
+        || error.user_message(),
+        |action| format!("{} Siguiente paso: {action}", error.user_message()),
+    )
+}
+
+fn repository_feedback(repository: &RepositorySession) -> Option<RepositoryFeedback> {
     match &repository.refresh_state {
-        RefreshState::Failed { details, .. } => Some((
-            "No se pudo actualizar el estado. Pulsa Actualizar para reintentar.".to_owned(),
-            details.clone(),
-        )),
+        RefreshState::Failed {
+            message,
+            details,
+            next_step,
+        } => Some(RepositoryFeedback {
+            summary: message.clone(),
+            next_step: next_step
+                .clone()
+                .or_else(|| repository.error_next_step.clone())
+                .or_else(|| Some(GENERIC_REFRESH_NEXT_STEP.to_owned())),
+            details: details.clone(),
+        }),
         _ => match &repository.mutation_state {
-            MutationState::Failed { details, .. } => Some((
-                "Git rechazó la operación. Revisa los detalles y vuelve a intentarlo.".to_owned(),
-                details.clone(),
-            )),
-            _ => repository.error.clone().map(|details| {
-                (
+            MutationState::Failed {
+                message,
+                details,
+                next_step,
+                ..
+            } => Some(RepositoryFeedback {
+                summary: message.clone(),
+                next_step: next_step
+                    .clone()
+                    .or_else(|| repository.error_next_step.clone())
+                    .or_else(|| Some(GENERIC_MUTATION_NEXT_STEP.to_owned())),
+                details: details.clone(),
+            }),
+            _ => repository.error.clone().map(|details| RepositoryFeedback {
+                summary:
                     "No se pudo completar la acción. Revisa los detalles y vuelve a intentarlo."
                         .to_owned(),
-                    details,
-                )
+                next_step: repository.error_next_step.clone(),
+                details,
             }),
         },
     }
@@ -6036,6 +6526,25 @@ fn action_button(
         .child(label.into())
 }
 
+/// Botón que avanza una preferencia del mensaje en la capa seleccionada.
+fn commit_preference_button(
+    id: &'static str,
+    label: String,
+    field: CommitPreferenceField,
+    repository_id: RepositoryId,
+    cx: &mut Context<MainWindow>,
+) -> gpui::Stateful<gpui::Div> {
+    action_button(id, label, true).on_click(cx.listener(move |this, _, _, cx| {
+        this.cycle_commit_preference_field(repository_id, field, cx);
+    }))
+}
+
+/// El commit depende solo del estado Git y del borrador: las convenciones
+/// orientan la propuesta y nunca bloquean un mensaje escrito a mano.
+const fn can_create_commit(staged_count: usize, message_is_empty: bool, can_mutate: bool) -> bool {
+    staged_count > 0 && !message_is_empty && can_mutate
+}
+
 fn tab_button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<gpui::SharedString>,
@@ -6161,7 +6670,66 @@ mod tests {
             periodic_fetch_in_flight: HashSet::new(),
             active_fetch_contexts: HashMap::new(),
             pending_fetch_refresh: HashMap::new(),
+            commit_preference_scope: PreferenceScope::default(),
         }
+    }
+
+    #[test]
+    fn repository_overrides_only_affect_their_own_session() {
+        use crate::domain::{
+            CommitMessageLanguage, CommitMessagePreferenceOverrides, CommitMessagePreferences,
+        };
+
+        let overridden = RepositorySession::new(PathBuf::from(r"C:\repos\uno"));
+        let inherited = RepositorySession::new(PathBuf::from(r"C:\repos\dos"));
+        let overridden_id = overridden.id;
+        let inherited_id = inherited.id;
+        let mut window = test_window(GitClient::default(), vec![overridden, inherited]);
+        window.state.settings.commit_message_preferences = CommitMessagePreferences {
+            language: CommitMessageLanguage::Spanish,
+            ..CommitMessagePreferences::default()
+        };
+        window
+            .state
+            .settings
+            .repository_commit_message_preferences
+            .insert(
+                normalized_repo_key(Path::new(r"C:\repos\uno")),
+                CommitMessagePreferenceOverrides {
+                    language: Some(CommitMessageLanguage::English),
+                    ..CommitMessagePreferenceOverrides::default()
+                },
+            );
+
+        let overridden_preferences = window.commit_preferences(overridden_id);
+        let inherited_preferences = window.commit_preferences(inherited_id);
+
+        assert_eq!(
+            overridden_preferences.values().language,
+            CommitMessageLanguage::English
+        );
+        assert!(overridden_preferences.has_repository_overrides());
+        assert_eq!(
+            inherited_preferences.values().language,
+            CommitMessageLanguage::Spanish
+        );
+        assert!(!inherited_preferences.has_repository_overrides());
+    }
+
+    #[test]
+    fn conventions_never_block_a_manual_commit() {
+        use crate::domain::{CommitMessageConvention, CommitMessagePreferences};
+
+        let preferences = CommitMessagePreferences {
+            convention: CommitMessageConvention::ConventionalCommits,
+            subject_max_length: 20,
+            ..CommitMessagePreferences::default()
+        };
+        let message = "Mensaje manual que ignora la convención y la longitud orientativa";
+
+        assert!(commit_message_guidance(message, preferences).is_some());
+        assert!(can_create_commit(1, message.trim().is_empty(), true));
+        assert!(!can_create_commit(0, message.trim().is_empty(), true));
     }
 
     #[test]
@@ -6888,6 +7456,61 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_mutation_shows_the_next_safe_step_next_to_the_technical_detail() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        let error = crate::git::classify_command_failure(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.",
+            Some(128),
+        );
+        repository.mutation_state = MutationState::Failed {
+            kind: OperationKind::Commit,
+            message: error.user_message(),
+            details: error.technical_details(),
+            next_step: error.recommended_action(),
+        };
+        repository.set_error(error.technical_details(), error.recommended_action());
+
+        let feedback = repository_feedback(&repository).expect("debe haber feedback visible");
+
+        assert!(feedback.summary.contains("bloqueado"));
+        assert!(feedback.details.contains("index.lock"));
+        let next_step = feedback.next_step.expect("debe proponer un siguiente paso");
+        assert!(next_step.contains("Git Helper no lo elimina"));
+    }
+
+    #[test]
+    fn an_unclassified_failure_keeps_details_and_a_generic_next_step() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.refresh_state = RefreshState::Failed {
+            message: "Git rechazó la operación".to_owned(),
+            details: "error: algo inesperado".to_owned(),
+            next_step: None,
+        };
+
+        let feedback = repository_feedback(&repository).expect("debe haber feedback visible");
+
+        assert_eq!(feedback.details, "error: algo inesperado");
+        assert_eq!(
+            feedback.next_step.as_deref(),
+            Some(GENERIC_REFRESH_NEXT_STEP)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_operation_shows_no_failure_feedback() {
+        let mut repository = RepositorySession::new(PathBuf::from("repo"));
+        repository.set_error("algo falló", Some("haz esto".to_owned()));
+        repository.clear_error();
+        repository.mutation_state = MutationState::Cancelled {
+            kind: OperationKind::Commit,
+            message: "Operación cancelada".to_owned(),
+        };
+
+        assert!(repository_feedback(&repository).is_none());
+        assert!(repository.error_next_step.is_none());
+    }
+
+    #[test]
     fn repository_content_states_distinguish_loading_clean_stale_and_unborn() {
         let mut repository = RepositorySession::new(PathBuf::from("repo"));
         assert_eq!(
@@ -6898,6 +7521,7 @@ mod tests {
         repository.refresh_state = RefreshState::Failed {
             message: "fallo".to_owned(),
             details: "stderr".to_owned(),
+            next_step: None,
         };
         assert_eq!(
             repository_content_state(&repository),
@@ -6925,6 +7549,7 @@ mod tests {
         repository.refresh_state = RefreshState::Failed {
             message: "fallo".to_owned(),
             details: "stderr".to_owned(),
+            next_step: None,
         };
         assert_eq!(
             repository_content_state(&repository),
@@ -7332,6 +7957,7 @@ mod tests {
                 kind: OperationKind::Commit,
                 message: "La operación agotó el tiempo máximo de 2 s".to_owned(),
                 details: "timeout".to_owned(),
+                next_step: None,
             },
         ] {
             let repository = RepositorySession::new(PathBuf::from("repo"));
