@@ -407,6 +407,11 @@ pub struct MainWindow {
     /// Favoritos cuya última apertura falló, por clave canónica. Se recuerda en memoria
     /// para marcar la lista sin comprobar el disco en cada fotograma.
     unavailable_favorites: HashSet<String>,
+    summary_view_active: bool,
+    summary_focus_index: usize,
+    summary_rows: Arc<Vec<RepositorySummaryRow>>,
+    summary_focus_handle: Option<FocusHandle>,
+    summary_rows_last_rebuild_secs: u64,
     /// Capa que editan los controles de preferencias; no se persiste.
     commit_preference_scope: PreferenceScope,
 }
@@ -501,6 +506,11 @@ impl MainWindow {
             summary_focus_handle: Some(cx.focus_handle()),
             summary_rows_last_rebuild_secs: 0,
             unavailable_favorites: HashSet::new(),
+            summary_view_active: false,
+            summary_focus_index: 0,
+            summary_rows: Arc::new(Vec::new()),
+            summary_focus_handle: Some(cx.focus_handle()),
+            summary_rows_last_rebuild_secs: 0,
             commit_preference_scope: PreferenceScope::default(),
         }
     }
@@ -1951,6 +1961,9 @@ impl MainWindow {
             self.summary_view_active = false;
         }
         self.remember_closed_repository(closed.root_path);
+        if self.state.repositories.len() <= 1 {
+            self.summary_view_active = false;
+        }
         self.commit_inputs.remove(&repository_id);
         self.commit_input_subscriptions.remove(&repository_id);
         self.generation_requests.remove(&repository_id);
@@ -4324,6 +4337,9 @@ impl MainWindow {
         // Una sola pasada por favoritos en lugar de compararlos con cada pestaña:
         // la barra se redibuja en cada fotograma y ambas listas pueden ser largas.
         let favorite_keys = self.favorite_repository_keys();
+        let summary_active = self.summary_view_active;
+        let show_summary_tab = self.state.repositories.len() > 1;
+        let repository_count = self.state.repositories.len();
         div()
             .flex()
             .min_w(px(0.0))
@@ -6821,6 +6837,223 @@ impl MainWindow {
             .into_any_element()
     }
 
+    fn render_summary_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = Arc::clone(&self.summary_rows);
+        let row_count = rows.len();
+        let focus_index = self.summary_focus_index;
+        let summary_view = div()
+            .id("repository-summary-view")
+            .key_context("Summary")
+            .on_action(cx.listener(Self::summary_next_row))
+            .on_action(cx.listener(Self::summary_previous_row))
+            .on_action(cx.listener(Self::summary_activate_row))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(BORDER_COLOR)
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(
+                        "Vista de solo lectura basada en snapshots ya cargados. Las referencias remotas pueden estar desactualizadas hasta el próximo fetch.",
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(BORDER_COLOR)
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(div().w(px(180.0)).child("Repositorio"))
+                    .child(div().w(px(120.0)).child("Rama"))
+                    .child(div().flex_1().min_w(px(0.0)).child("Cambios"))
+                    .child(div().w(px(110.0)).child("Sync"))
+                    .child(div().w(px(120.0)).child("Estado"))
+                    .child(div().flex_1().min_w(px(0.0)).child("Remoto")),
+            )
+            .child(
+                uniform_list(
+                    "repository-summary-list",
+                    row_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let range_start = range.start;
+                        rows[range]
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, row)| {
+                                let index = range_start + offset;
+                                this.render_summary_row(row, index == focus_index, cx)
+                            })
+                            .collect()
+                    }),
+                )
+                .w_full()
+                .flex_1(),
+            );
+        summary_view
+            .when_some(self.summary_focus_handle.as_ref(), |view, handle| {
+                view.track_focus(handle)
+            })
+            .into_any_element()
+    }
+
+    fn render_summary_row(
+        &self,
+        row: &RepositorySummaryRow,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let repository_id = row.id;
+        let path = row.root_path.display().to_string();
+        let changes = format_change_counters(row);
+        let sync = format_sync_counters(row).unwrap_or_else(|| "—".to_owned());
+        let snapshot_label = snapshot_presentation_label(row.snapshot_presentation);
+        let snapshot_color = match row.snapshot_presentation {
+            SnapshotPresentation::Current => SUCCESS_COLOR,
+            SnapshotPresentation::Loading => ACCENT_COLOR,
+            SnapshotPresentation::Stale | SnapshotPresentation::Unknown => WARNING_COLOR,
+            SnapshotPresentation::Inaccessible => ERROR_COLOR,
+        };
+        let operation = row.operation_label.clone();
+        let error = row.error_hint.clone();
+        let remote = row.remote_freshness_label.clone();
+        div()
+            .id(format!("summary-row-{repository_id:?}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(SUMMARY_ROW_HEIGHT_PX.into()))
+            .px_3()
+            .border_b_1()
+            .border_color(BORDER_COLOR)
+            .aria_label(path.clone())
+            .when(is_focused, |row_element| {
+                row_element.bg(SELECTED_BACKGROUND_COLOR)
+            })
+            .hover(|style| style.bg(HOVER_BACKGROUND_COLOR).cursor_pointer())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_repository(repository_id, cx);
+            }))
+            .child(
+                div()
+                    .w(px(180.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .child(row.display_name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(120.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(MUTED_TEXT_COLOR)
+                    .child(row.branch_label.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.conflict_count > 0 {
+                        ERROR_COLOR
+                    } else if row.change_count > 0 {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(changes),
+            )
+            .child(
+                div()
+                    .w(px(110.0))
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.remote_is_stale {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(sync),
+            )
+            .child(
+                div()
+                    .w(px(120.0))
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(snapshot_color)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(snapshot_label),
+                    )
+                    .when_some(operation, |column, label| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(ACCENT_COLOR)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    })
+                    .when_some(error, |column, label| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(ERROR_COLOR)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(if row.remote_is_stale {
+                        WARNING_COLOR
+                    } else {
+                        MUTED_TEXT_COLOR
+                    })
+                    .child(remote.unwrap_or_else(|| "Sin remote conocido".to_owned())),
+            )
+            .into_any_element()
+    }
+
     fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
         // La existencia en disco se comprueba al cargar el estado y al abrir cada clon:
         // repetirla en cada frame de render supondría un acceso a disco por fotograma.
@@ -7984,6 +8217,11 @@ mod tests {
             summary_focus_handle: None,
             summary_rows_last_rebuild_secs: 0,
             unavailable_favorites: HashSet::new(),
+            summary_view_active: false,
+            summary_focus_index: 0,
+            summary_rows: Arc::new(Vec::new()),
+            summary_focus_handle: None,
+            summary_rows_last_rebuild_secs: 0,
             commit_preference_scope: PreferenceScope::default(),
         }
     }
